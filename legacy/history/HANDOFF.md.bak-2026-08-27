@@ -1,0 +1,100 @@
+# Handoff -- siege3, 2026-08-26 (late evening)
+
+## Running right now
+Nothing. The GCC 16.2.0 profiledbootstrap was **cancelled** during stageprofile
+(~56 min in). `~/src/gcc-build/build-gcc-16.2.0` still holds 4.2 GB of dead
+build; the next run deletes it (`rm -rf "$BUILD"`) and restarts from stage 1.
+The source tree and its in-tree GMP/MPFR/MPC/ISL survive, so no re-download.
+`~/opt/gcc-16.2.0` was never created -- nothing blocks a fresh run.
+
+## The one command
+    cd ~/Documents && tmux new -s build
+    KERNEL_SRC=/home/madness/source-opt/kernel/linux-7.2 PY_TARGETS=cpython \
+      ./build_everything.sh --skip=clangenv
+
+`build_everything.sh` is new: it drives whichever sibling scripts are present,
+in dependency order, and resumes rather than restarts (it asks the machine what
+is installed -- does `~/opt/gcc-current/bin/gcc` run? -- rather than keeping
+state). `--dry-run` prints the plan and touches nothing; `--list` shows what is
+installed; `--force=<stage>` rebuilds something that already works.
+Tonight's plan: gcc -> python(cpython) -> dkms -> kernel, roughly 5-9 h.
+
+**Do not edit anything in `~/Documents` while a run is in flight.** Bash reads a
+script lazily by byte offset, so rewriting a file under a running shell makes it
+resume mid-command inside the new content.
+
+## Done today
+- **clang-24-4** built + installed, `clang-current` -> it. 121 MB vs 24-3's 196 MB
+  (the earlier build wrongly inherited LLVM_TARGETS_TO_BUILD=all; now X86 only).
+- **Kernel 7.2.0 installed** -- this was open in the previous handoff and is now
+  done: 326 modules in `/lib/modules/7.2.0`, `build` -> the linux-7.2 tree,
+  `vmlinuz-7.2.0` + `initramfs-7.2.0.img` in /boot (17:02 / 17:28).
+  NOT yet verified: whether that initramfs actually carries amdgpu firmware.
+  Check before trusting it:
+      sudo lsinitrd /boot/initramfs-7.2.0.img | grep -c 'firmware/amdgpu'
+- **build_everything.sh** written and tested (success / resume / failure /
+  "exited 0 but installed nothing" all exercised against stub scripts).
+- **Three fixes to `universal_linux_kernel_build.sh`**; original kept as
+  `universal_linux_kernel_build.sh.orig-before-claude`, so `diff` them:
+  1. `export -n LOCALVERSION` -- kbuild has a variable of the same name and
+     `scripts/setlocalversion` appends `$LOCALVERSION` from the ENVIRONMENT on
+     top of `CONFIG_LOCALVERSION`. The release was coming out `7.2.0-gpu-gpu`.
+  2. `cfg --disable WERROR` -- distro configs set it, and this script
+     deliberately feeds a distro config into a different kernel version, often
+     with a different compiler. Every new warning was fatal, hours in.
+  3. Debug info actually gets disabled now. `cfg --enable DEBUG_INFO_NONE` was a
+     no-op: scripts/config edits in place, so it rewrote the
+     `# CONFIG_DEBUG_INFO_NONE is not set` line that sits directly ABOVE
+     `CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y`, and Kconfig resolves a
+     choice by "last one read wins". Full DWARF stayed on for every module.
+     The DWARF members are now cleared first, and the verify block checks it.
+
+## Five traps on this machine, all the same shape
+Every one is "the script checked one thing and used another":
+1. `python3` on PATH is **PyPy3**, not CPython. Pin `/usr/bin/python3`.
+2. `.bashrc` exports **CC/CXX -> clang-current**. Silently breaks GCC builds:
+   MPFR's LTO probe runs clang bitcode through the system LLVMgold.so
+   (llvm-libs 21) and dies with "Invalid record" in stage 1.
+   `build_gcc_universal.sh` ignores env CC and picks /usr/bin/gcc.
+3. Kernel `.ko` FILES keep hyphens (`virtio-gpu.ko`); only the module NAME uses
+   underscores. 897 of 2424 modules on this box have hyphenated filenames.
+4. **`dnf` exits 1** -- the enabled `oneAPI` repo has an unverifiable GPG key.
+   Any script doing a bare `sudo dnf install -y ...` under `set -e` dies in its
+   first ten seconds, for a reason unrelated to the packages it asked for.
+   Work around with `--disablerepo=oneAPI`. `build_everything.sh` detects this
+   and takes over dependency installation itself.
+5. **`LD_RUN_PATH` is set, and long** -- `ld` copies it into the RPATH of every
+   binary it links, including paths into the root-owned `~/opt/clang-24-2`.
+   Also `gcc` on PATH is GCC 17 trunk and `/usr/local/bin` holds a root-installed
+   LLVM plus a self-built Python 3.14. Non-interactive builds must clear the
+   environment and put `/usr/bin` FIRST.
+
+## Open work
+- **PyPy SSL is broken.** Both `~/opt/pypy2` and `~/opt/pypy3` SEGFAULT (signal 11)
+  on `ssl.SSLContext(PROTOCOL_TLS_CLIENT)`; HTTPS fails entirely. PyPy3 is what
+  answers `python3` on PATH, so anything shelling out to python3 for network work
+  is broken. Likely cffi _ssl bindings built against an older OpenSSL than the
+  loaded 3.5.5. Fix: `TARGETS=pypy3 ~/Documents/build_python_universal.sh`
+  (needs ~8 GB RAM; do not run while GCC has the cores). `PY_TARGETS=cpython`
+  in the command above deliberately does NOT touch this.
+- **`build_python_universal.sh` lists `find` in DNF_PKGS**, which is not a package
+  on any distro (`/usr/bin/find` is in findutils). With a working dnf, that one
+  unmatched argument makes the whole transaction install NOTHING, and the
+  script's `|| warn ... continuing` then walks into a build missing every -devel
+  package. `build_everything.sh` works around it; the typo is still there.
+- **GCC 17** if wanted: `TRACK=snapshot ~/Documents/build_gcc_universal.sh`
+  -> 17-20260823, installs to its own prefix. `~/opt/gcc-17` is the older 20260816.
+- **`.bashrc` hardcodes `~/opt/gcc-17/bin`**, not `~/opt/gcc-current`. So after
+  building GCC 16.2.0, `gcc` in a new shell is still the trunk snapshot.
+- `~/opt/clang-24-2` is **root-owned** from a past run under sudo.
+- `~/code/cxx/satellite`: main has 6 unpushed commits.
+
+## After the kernel stage
+The new kernel does NOT become the default boot entry -- `build_everything.sh`
+records the current default via `grubby` and puts it back, because
+`GRUB_DEFAULT=saved` + BLS otherwise points `saved_entry` at whatever was just
+installed. Pick it from the menu deliberately. Once it has proved itself:
+    sudo grubby --set-default=/boot/vmlinuz-7.2.0-gpu
+Note the kernel stage builds from the AlmaLinux config (2507 modules) rather
+than the hand-tuned tree config (331). Your tuned one is saved on first run to
+`linux-7.2/.config.saved-by-build-everything`.

@@ -1,0 +1,198 @@
+{
+  "os": "AlmaLinux 10.2 (Lavender Lion)",
+  "os_id": "almalinux",
+  "os_like": "rhel centos fedora",
+  "arch": "x86_64",
+  "running": "6.12.0-211.61.1.el10_2.x86_64",
+  "pkg_manager": "dnf",
+  "cpu": {
+    "vendor": "GenuineIntel",
+    "model": "13th Gen Intel(R) Core(TM) i7-13700K",
+    "threads": 24,
+    "simd": [
+      "avx2"
+    ]
+  },
+  "memory": 33410158592,
+  "virt": "none",
+  "pci": [
+    {
+      "addr": "0000:01:00.0",
+      "class": 196608,
+      "vendor": 4318,
+      "device": 8067,
+      "kind": "display",
+      "driver": "nouveau",
+      "name": "NVIDIA Corporation TU117 [GeForce GTX 1630]"
+    }
+  ],
+  "gpu_vendors": [
+    "nvidia"
+  ],
+  "storage": {
+    "rootfs": "xfs",
+    "fstypes": [
+      "vfat",
+      "xfs"
+    ],
+    "layers": [
+      "lvm"
+    ]
+  },
+  "firmware_compression": [
+    "xz"
+  ],
+  "secure_boot": "off",
+  "boot": {
+    "grubby": true,
+    "bls": true,
+    "initramfs": "dracut"
+  },
+  "toolchains": [
+    {
+      "path": "/usr/bin/gcc",
+      "real": "/usr/bin/gcc",
+      "kind": "gcc",
+      "version": "gcc (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)",
+      "numver": [
+        14,
+        3,
+        1
+      ],
+      "system": true,
+      "origin": "system",
+      "usable": "yes",
+      "why": "",
+      "triple": "x86_64-redhat-linux",
+      "installed": "",
+      "experimental": false
+    },
+    {
+      "path": "/usr/bin/clang",
+      "real": "/usr/bin/clang-21",
+      "kind": "clang",
+      "version": "clang version 21.1.8 (AlmaLinux OS Foundation 21.1.8-1.el10.alma.1)",
+      "numver": [
+        21,
+        1,
+        8
+      ],
+      "system": true,
+      "origin": "system",
+      "usable": "yes",
+      "why": "",
+      "triple": "x86_64-redhat-linux-gnu",
+      "installed": "/usr/bin",
+      "experimental": false
+    },
+    {
+      "path": "/opt/rh/gcc-toolset-15/root/usr/bin/gcc",
+      "real": "/opt/rh/gcc-toolset-15/root/usr/bin/gcc",
+      "kind": "gcc",
+      "version": "gcc (GCC) 15.2.1 20260123 (Red Hat 15.2.1-7)",
+      "numver": [
+        15,
+        2,
+        1
+      ],
+      "system": false,
+      "origin": "Red Hat gcc-toolset (vendor-supported)",
+      "usable": "yes",
+      "why": "",
+      "triple": "x86_64-redhat-linux",
+      "installed": "",
+      "experimental": false
+    }
+  ],
+  "cxx": [
+    {
+      "path": "/usr/bin/g++",
+      "real": "/usr/bin/g++",
+      "kind": "gcc",
+      "version": "g++ (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)",
+      "numver": [
+        14,
+        3,
+        1
+      ],
+      "system": true,
+      "origin": "system",
+      "usable": "yes",
+      "why": "",
+      "triple": "x86_64-redhat-linux",
+      "installed": "",
+      "experimental": false
+    },
+    {
+      "path": "/usr/bin/clang++",
+      "real": "/usr/bin/clang-21",
+      "kind": "clang",
+      "version": "clang version 21.1.8 (AlmaLinux OS Foundation 21.1.8-1.el10.alma.1)",
+      "numver": [
+        21,
+        1,
+        8
+      ],
+      "system": true,
+      "origin": "system",
+      "usable": "yes",
+      "why": "",
+      "triple": "x86_64-redhat-linux-gnu",
+      "installed": "/usr/bin",
+      "experimental": false
+    },
+    {
+      "path": "/opt/rh/gcc-toolset-15/root/usr/bin/g++",
+      "real": "/opt/rh/gcc-toolset-15/root/usr/bin/g++",
+      "kind": "gcc",
+      "version": "g++ (GCC) 15.2.1 20260123 (Red Hat 15.2.1-7)",
+      "numver": [
+        15,
+        2,
+        1
+      ],
+      "system": false,
+      "origin": "Red Hat gcc-toolset (vendor-supported)",
+      "usable": "yes",
+      "why": "",
+      "triple": "x86_64-redhat-linux",
+      "installed": "",
+      "experimental": false
+    }
+  ],
+  "binutils": [
+    {
+      "dir": "/usr/bin",
+      "version": "GNU ld version 2.41-63.el10.alma.1",
+      "numver": [
+        2,
+        41
+      ],
+      "system": true
+    },
+    {
+      "dir": "/opt/rh/gcc-toolset-15/root/usr/bin",
+      "version": "GNU ld version 2.44-8.el10",
+      "numver": [
+        2,
+        44
+      ],
+      "system": false
+    }
+  ],
+  "pythons": [
+    {
+      "path": "/usr/bin/python3",
+      "impl": "CPython",
+      "version": "3.12.14",
+      "numver": [
+        3,
+        12,
+        14
+      ],
+      "platform": true
+    }
+  ],
+  "dkms": [],
+  "loaded_modules": 181
+}

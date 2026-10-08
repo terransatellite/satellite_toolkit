@@ -1,0 +1,47 @@
+
+[1m==> Preflight[0m
+  found: 04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 23 WKS-XL [Radeon PRO W6600] [1002:73e3]
+  enabling  : AMD VM/legacy(always)
+  toolchain : gcc (GCC) 17.0.0 20260816 (experimental)
+  source    : /home/madness/src/ulkb-test/linux-7.2.6 (7.2.6)
+  jobs      : 24
+
+[1m==> Previous build attempt[0m
+  recorded  : built (2026-09-18T23:46:13-04:00)
+  keeping   : the previous run finished (built); rebuilding incrementally is correct and far faster
+
+[1m==> Configuring[0m
+  base: /lib/modules/7.2.4-gpu/build/.config
+
+[1m==> Verifying the configuration[0m
+  ok   CONFIG_DEVICE_PRIVATE           = y
+  ok   CONFIG_PCI_P2PDMA               = y
+  ok   CONFIG_DRM_SIMPLEDRM            = m
+  ok   CONFIG_DRM_VIRTIO_GPU           = m
+  ok   CONFIG_DEBUG_INFO_NONE          = y
+  ok   CONFIG_DRM_AMDGPU               = m
+  ok   CONFIG_DRM_AMD_DC               = y
+  ok   CONFIG_DRM_AMDGPU_USERPTR       = y
+  ok   CONFIG_HSA_AMD                  = y
+  ok   CONFIG_HSA_AMD_SVM              = y
+  ok   CONFIG_HSA_AMD_P2P              = y
+  --   CONFIG_DRM_ACCEL_AMDXDNA        CONFIG_DRM_ACCEL_AMDXDNA=m
+  kernel release: 7.2.6-ulkbtest
+
+[1m==> Building -- this takes a while. Use tmux/screen over ssh.[0m
+  logging to: /home/madness/Documents/universal_linux_kernel_script/test-runs/run3.log
+  DESCEND objtool
+  TEST    posttest
+  arch/x86/tools/insn_decoder_test: success: Decoded and checked 6789598 instructions
+  TEST    posttest
+  arch/x86/tools/insn_sanity: success: Decoded and checked 1000000 random instructions with 0 errors (seed:0xace82caa)
+Kernel: arch/x86/boot/bzImage is ready  (#1)
+
+[1m==> Built, not installed.[0m
+  Re-run with INSTALL=1, or install by hand:
+      sudo make -j24 modules_install
+      sudo make -j24 install
+
+real	1m3.652s
+user	2m20.830s
+sys	0m29.163s

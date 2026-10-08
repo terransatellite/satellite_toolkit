@@ -1,0 +1,4027 @@
+#!/usr/bin/python3 -I
+# -*- coding: utf-8 -*-
+"""enterprise_clang_tool.py -- build a COMPLETE LLVM/clang toolchain from source.
+
+Successor to build_clang_local.sh and build_clang_universal.sh.  What it keeps
+from them: PGO + ThinLTO, a versioned prefix that is never installed over, an
+interpreter chosen because it HAS yaml, LD_LIBRARY_PATH out of the way, a
+configure that is verified instead of trusted, link jobs capped by memory.
+
+What is different:
+
+  A real stage3.  The old flow (LLVM's PGO.cmake) installs a compiler that was
+  built by stage1 -- strictly a stage2.  Here:
+
+      host cc -> stage1 -> stage2-instrumented -> training -> stage2 (PGO)
+              -> stage3 = EVERYTHING, built by stage2, PGO + ThinLTO -> bolt -> verify
+
+  Two runs.  Run 1 ("bootstrap") ends with a fast, profiled stage2 compiler.
+  Run 2 ("everything") uses it to build every project, every runtime and every
+  target the source tree declares.  `build` does both; a failure resumes at the
+  stage that failed; `--run 1` / `--run 2` do them separately.  A build
+  directory that holds an earlier run is shown -- stages, times, size, prefix --
+  and asked about: resume it, delete everything and start over, or quit.  Enter
+  resumes; a record started with OTHER options cannot be resumed, so there the
+  choice is delete or quit and Enter deletes.  `--resume` / `--restart` answer
+  without asking; without a terminal nothing is deleted unless --restart says so.
+
+  "Everything" is READ FROM THE TREE (LLVM_ALL_PROJECTS, LLVM_SUPPORTED_RUNTIMES,
+  LLVM_ALL_TARGETS + the experimental ones), so the same tool builds LLVM 17 and
+  trunk.  The short exclusion list below says why for each entry.
+
+  An OPTIONAL component that does not build is dropped -- recorded, with the
+  error that did it -- and the build carries on.  A CORE failure (llvm, clang,
+  lld, compiler-rt, libunwind, libc++abi, libc++) stops.  A build killed for
+  memory is retried with fewer jobs, not blamed on a component.
+
+One file, standard library only, syntax held to Python 3.6 (RHEL 8's platform
+python).  Never run it as root: only --install-deps calls sudo.
+
+Licence: public domain / CC0.  No warranty.
+"""
+
+import sys
+
+if sys.version_info < (3, 6):
+    sys.exit("enterprise_clang_tool.py needs Python 3.6 or newer")
+
+import argparse
+import configparser
+import datetime
+import errno
+import fcntl
+import glob
+import hashlib
+import http.client
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+TOOL = "enterprise_clang_tool"
+VERSION = "0.1.0"
+PLATFORM_PYTHON = "/usr/bin/python3"
+USER_AGENT = TOOL + "/" + VERSION
+GITHUB_API = "https://api.github.com/repos/llvm/llvm-project/releases?per_page=40"
+GITHUB_GIT = "https://github.com/llvm/llvm-project.git"
+TARBALL_URL = ("https://github.com/llvm/llvm-project/releases/download/"
+               "llvmorg-%(v)s/llvm-project-%(v)s.src.tar.xz")
+
+# Built from source into <workdir>/tools when the machine's own are missing or
+# older than the tree asks for.  Pinned: a build tool is not the place for "latest".
+PROVISION = {
+    # sha256 as published by Kitware in cmake-3.31.8-SHA-256.txt
+    "cmake": {"version": "3.31.8",
+              "url": "https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8.tar.gz",
+              "sha256": "e3cde3ca83dc2d3212105326b8f1b565116be808394384007e7ef1c253af6caa"},
+    # ninja publishes no checksum file: this is the tag archive as GitHub served it on 2026-09-20.
+    "ninja": {"version": "1.12.1",
+              "url": "https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz",
+              "sha256": "821bdff48a3f683bc4bb3b6f0b5fe7b2d647cf65d52aeb63328c91a6c6df285a"},
+}
+NINJA_MIN = (1, 8, 2)
+
+# ------------------------------------------------------------------------ output
+
+
+class UI(object):
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    tty = sys.stdout.isatty()
+
+
+def _c(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if UI.color else text
+
+
+def out(text=""):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "replace").decode("ascii"))
+    sys.stdout.flush()
+
+
+def say(msg):
+    out("\n" + _c("1", "==> " + msg))
+
+
+def info(msg):
+    out("  " + msg)
+
+
+def ok(msg):
+    out("  " + _c("32", "ok  ") + " " + msg)
+
+
+def note(msg):
+    out("  --   " + msg)
+
+
+def bad(msg):
+    out("  " + _c("31", "FAIL") + " " + msg)
+
+
+def warn(msg):
+    # stdout, not stderr: redirected to one log the two streams interleave out
+    # of order, and a warning that lands three sections late is worse than none.
+    out(_c("33", "warning:") + " " + msg)
+
+
+class ToolError(Exception):
+    """A failure with a message fit to show the user.  No traceback."""
+
+
+# ----------------------------------------------------------------------- process
+
+# An ALLOW-list.  The machine this was written on exports CC, CXX and LLVM from
+# ~/.bashrc; cmake reads CC/CXX from the environment, so an inherited shell
+# would quietly choose the stage1 compiler.  The proxy and CA variables are the
+# ones an enterprise network needs for `git clone`.
+ENV_KEEP = ("HOME", "USER", "LOGNAME", "TERM", "TMPDIR", "LANG",
+            "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+            "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO")
+SYSTEM_PATH = ["/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin"]
+
+
+def scrubbed_env(extra_path=None, extra=None):
+    """No CC/CXX/CFLAGS/LDFLAGS/CPATH/LIBRARY_PATH/CMAKE_PREFIX_PATH -- and no
+    LD_LIBRARY_PATH: an older install of this same toolchain has the same
+    sonames, and LD_LIBRARY_PATH is searched BEFORE a binary's own RUNPATH."""
+    env = dict((k, os.environ[k]) for k in ENV_KEEP if k in os.environ)
+    env["PATH"] = ":".join(list(extra_path or []) + SYSTEM_PATH)
+    env["LC_ALL"] = "C"
+    env.update(extra or {})
+    return env
+
+
+def env_traps():
+    found = []
+    for var in ("CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "CPATH", "C_INCLUDE_PATH",
+                "CPLUS_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH", "LD_RUN_PATH",
+                "CMAKE_PREFIX_PATH", "CMAKE_GENERATOR", "LLVM", "LLVM_PROFILE_FILE",
+                "PYTHONPATH", "PYTHONHOME", "DESTDIR"):
+        if var in os.environ:
+            val = os.environ[var]
+            found.append("%s=%s" % (var, val if len(val) < 60 else val[:57] + "..."))
+    return found
+
+
+def which(name, path=None):
+    return shutil.which(name, path=path if path is not None else ":".join(SYSTEM_PATH))
+
+
+def run(cmd, cwd=None, env=None, check=True, capture=True, stdin_data=None,
+        interactive=False, timeout=None):
+    """subprocess.run with 3.6-safe arguments; stdin is /dev/null unless asked for."""
+    kw = dict(cwd=cwd, env=env, universal_newlines=True, errors="replace", timeout=timeout)
+    if capture and not interactive:
+        kw["stdout"] = subprocess.PIPE
+        kw["stderr"] = subprocess.STDOUT
+    if stdin_data is not None:
+        kw["input"] = stdin_data
+    elif not interactive:
+        kw["stdin"] = subprocess.DEVNULL
+    try:
+        p = subprocess.run(cmd, **kw)
+    except FileNotFoundError:
+        raise ToolError("command not found: %s" % cmd[0])
+    except subprocess.TimeoutExpired:
+        raise ToolError("timed out: %s" % " ".join(cmd))
+    except OSError as e:
+        # ^C under a root-owned sudo child: the kill is refused with EPERM, and
+        # that must stay a ^C.  An exec refused with EPERM (fapolicyd) is not one.
+        if e.errno == errno.EPERM and isinstance(getattr(e, "__context__", None), KeyboardInterrupt):
+            raise KeyboardInterrupt()
+        raise ToolError("cannot run %s: %s" % (cmd[0], e))
+    if check and p.returncode != 0:
+        raise ToolError("command failed (exit %d): %s\n%s"
+                        % (p.returncode, " ".join(cmd), (p.stdout or "").strip()[-2000:]))
+    return p
+
+
+def read_text(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (OSError, IOError):
+        return default
+
+
+def write_atomic(path, text):
+    """Whole or absent: written beside, synced, renamed over.  The sync matters:
+    without it a power cut can leave the renamed file empty on XFS and ext4."""
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def human(nbytes):
+    for unit in ("B", "K", "M", "G", "T"):
+        if nbytes < 1024 or unit == "T":
+            return "%.1f%s" % (nbytes, unit) if unit != "B" else "%dB" % nbytes
+        nbytes /= 1024.0
+
+
+def hms(seconds):
+    seconds = int(seconds)
+    return "%dh%02dm%02ds" % (seconds // 3600, seconds // 60 % 60, seconds % 60) \
+        if seconds >= 3600 else "%dm%02ds" % (seconds // 60, seconds % 60)
+
+
+def free_gb(path):
+    """Of the nearest EXISTING parent: df cannot measure a path that is not there
+    yet, and on a fresh machine the build directory never is."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / float(1 << 30)
+
+
+def dir_size(path):
+    total = 0
+    for dirpath, _, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, fn)).st_size
+            except OSError:
+                pass
+    return total
+
+
+# ---------------------------------------------------------------------- versions
+
+def numver(text):
+    m = re.search(r"(\d+(?:\.\d+)+|\d+)", text or "")
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def ver_ge(have, need):
+    n = max(len(have), len(need))
+    return tuple(have) + (0,) * (n - len(have)) >= tuple(need) + (0,) * (n - len(need))
+
+
+def vstr(v):
+    return ".".join(str(x) for x in v) if v else "?"
+
+
+# --------------------------------------------------------------------- detection
+
+def parse_os_release(text):
+    d = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            d[k.strip()] = v.strip().strip('"').strip("'")
+    return d
+
+
+PKG_MANAGER_OF = (  # (manager, the ID / ID_LIKE words of /etc/os-release that mean it)
+    ("apt-get", ("debian", "ubuntu")), ("zypper", ("suse", "opensuse", "sles", "sled")),
+    ("pacman", ("arch", "manjaro")), ("dnf", ("fedora", "rhel", "centos", "almalinux", "rocky", "amzn", "ol")),
+    ("yum", ("rhel", "centos", "amzn", "ol")))
+
+
+def preferred_pkg_managers(osr):
+    """The managers that fit this distribution, in order -- a dnf installed on
+    Ubuntu for rpm work is not Ubuntu's package manager."""
+    ids = (osr.get("ID", "") + " " + osr.get("ID_LIKE", "")).lower().split()
+    return [pm for pm, names in PKG_MANAGER_OF if any(i == n or i.startswith(n + "-") for i in ids for n in names)]
+
+
+def find_pkg_manager(osr=None):
+    osr = parse_os_release(read_text("/etc/os-release")) if osr is None else osr
+    for pm in preferred_pkg_managers(osr) + ["dnf", "yum", "apt-get", "zypper", "pacman"]:
+        if which(pm):
+            return pm
+    return ""
+
+
+def meminfo_gb(text=None):
+    text = read_text("/proc/meminfo") if text is None else text
+    vals = dict((m.group(1), int(m.group(2))) for m in re.finditer(r"^(\w+):\s+(\d+) kB", text, re.M))
+    total = vals.get("MemTotal", 8 << 20) / float(1 << 20)
+    avail = vals.get("MemAvailable", vals.get("MemFree", 4 << 20)) / float(1 << 20)
+    return total, avail
+
+
+def compiler_info(cc):
+    """-> {path, kind, version, banner} or None.  The compiler is ASKED; a name
+    like `gcc` says nothing (on some systems it is clang)."""
+    if not cc or not os.access(cc, os.X_OK):
+        return None
+    try:
+        o = run([cc, "--version"], check=False, env=scrubbed_env(), timeout=30).stdout or ""
+    except ToolError:
+        return None
+    banner = (o.strip().splitlines() or [""])[0]
+    if "clang version" in o:
+        kind, ver = "clang", numver(o.split("clang version", 1)[1])
+    elif "Free Software Foundation" in o or re.search(r"\bg(cc|\+\+)\b", banner, re.I):
+        kind = "gcc"
+        d = run([cc, "-dumpfullversion", "-dumpversion"], check=False, env=scrubbed_env()).stdout
+        ver = numver(d) or numver(banner)
+    else:
+        return None
+    return {"path": cc, "kind": kind, "version": ver, "banner": banner}
+
+
+def cxx_partner(cc, kind):
+    """gcc-13 -> g++-13, clang-18 -> clang++-18, in the SAME directory."""
+    d, base = os.path.split(cc)
+    if kind == "gcc":
+        name = re.sub(r"gcc", "g++", base, count=1) if "gcc" in base else "g++"
+    else:
+        name = re.sub(r"clang", "clang++", base, count=1)
+    p = os.path.join(d, name)
+    return p if os.access(p, os.X_OK) else ""
+
+
+PROBE_CXX = ("#include <string_view>\n#include <optional>\n#include <iostream>\n"
+             "static const unsigned char blob[] = {%s};\n"
+             "int main(int argc, char **){std::optional<std::string_view> s(\"ok\");std::cout<<*s<<\"\\n\";"
+             "return (s->size()==2 && blob[argc & 255] == (argc & 255)) ? 0 : 1;}\n"
+             % ",".join(str(i) for i in range(256)))
+
+
+def compiler_works(cxx, flags=(), extra_path=None):
+    """Compile, link and RUN a C++17 program -- in the scrubbed environment the
+    build will have.  Catches the usual fresh-machine state (gcc installed,
+    gcc-c++ / libstdc++-devel not); a private compiler that only runs with the
+    LD_LIBRARY_PATH of its owner's shell; and, through the data blob, a gcc that
+    was built against a NEWER ASSEMBLER than the one it finds: gcc >= 15 writes
+    such data as `.base64`, binutils < 2.43 answers "unknown pseudo-op" -- but
+    only for files that have some, so a hello-world passes and LLVM does not."""
+    d = tempfile.mkdtemp(prefix="ect-cc-")
+    env = scrubbed_env(extra_path)
+    try:
+        src = os.path.join(d, "t.cpp")
+        with open(src, "w") as f:
+            f.write(PROBE_CXX)
+        exe = os.path.join(d, "t")
+        p = run([cxx, "-std=c++17"] + list(flags) + [src, "-o", exe], check=False, env=env, timeout=120)
+        if p.returncode != 0:
+            lines = [l for l in (p.stdout or "").strip().splitlines() if "rror" in l] or \
+                (p.stdout or "").strip().splitlines() or ["compile failed"]
+            return False, lines[0].strip()[:160]
+        try:
+            r = run([exe], check=False, env=env, timeout=30)
+        except ToolError as e:
+            # execve refused: /tmp mounted noexec (CIS / STIG hardening) or fapolicyd.
+            return False, ("a program cannot be run from %s (%s): is that filesystem noexec?  TMPDIR chooses "
+                           "another" % (d, str(e).strip().splitlines()[0][-60:]))
+        return (True, "runs") if r.returncode == 0 else \
+            (False, "its programs do not RUN in a clean environment: " + ((r.stdout or "").strip().splitlines() or ["?"])[-1][:120])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def find_binutils(dirs=None):
+    """Every GNU binutils set: a directory holding both `as` and `ld`."""
+    sets, seen = [], set()
+    dirs = tool_search_dirs() if dirs is None else dirs
+    for d in sorted(dirs, key=lambda x: (os.path.realpath(x) != "/usr/bin", len(x))):
+        a_, l_ = os.path.join(d, "as"), os.path.join(d, "ld")
+        if not (os.access(a_, os.X_OK) and os.access(l_, os.X_OK)) or os.path.realpath(a_) in seen:
+            continue
+        seen.add(os.path.realpath(a_))
+        try:
+            line = ((run([a_, "--version"], check=False, env=scrubbed_env(), timeout=20).stdout or "").splitlines() or [""])[0]
+        except ToolError:
+            continue
+        if "GNU assembler" not in line:
+            continue
+        v = numver(re.sub(r"^.*?(\d+\.\d+)", r"\1", line))
+        prefix = os.path.dirname(os.path.realpath(d))
+        if any(x["banner"] == line.strip() and (os.path.realpath(d).startswith(os.path.dirname(os.path.realpath(x["dir"])) + os.sep)
+                                                or os.path.realpath(x["dir"]).startswith(prefix + os.sep)) for x in sets):
+            continue                 # <prefix>/<triple>/bin is the same set as <prefix>/bin
+        sets.append({"dir": d, "version": v, "banner": line.strip(), "system": os.path.realpath(d) == "/usr/bin"})
+    return sets
+
+
+def host_flags(c):
+    return ["-Wl,-rpath," + c["rpath"]] if c.get("rpath") else []
+
+
+def host_path(c, binutils_dir=""):
+    """What goes in front of the system PATH for this stage0 compiler."""
+    return ([binutils_dir] if binutils_dir else []) + ([] if c.get("system") else [os.path.dirname(c["path"])])
+
+
+def pick_binutils(c, sets, asked="auto"):
+    """-> (binutils dir or '', works?, why).  '' means: whatever the compiler finds.
+
+    A compiler is not complete without the assembler it was BUILT AGAINST.  clang
+    assembles by itself; the system's gcc matches the system's as; a toolset gcc
+    has its own beside it.  A private gcc may have been configured against a
+    private, newer binutils that only its owner's PATH knows about -- so when it
+    does not work as found, the newer sets on this machine are tried, newest
+    first, and the first that makes it work is the one it needs."""
+    if asked not in ("", "auto"):
+        d = os.path.abspath(os.path.expanduser(asked))
+        if not all(os.access(os.path.join(d, t), os.X_OK) for t in ("as", "ld")):
+            raise ToolError("--host-binutils %s: no `as` and `ld` there" % d)
+        works, why = compiler_works(c["cxx"], host_flags(c), host_path(c, d))
+        return d, works, why
+    works, why = compiler_works(c["cxx"], host_flags(c), host_path(c))
+    if works or c["kind"] != "gcc":
+        return "", works, why
+    for b in sorted([x for x in sets if not x["system"]], key=lambda x: [-n for n in x["version"]]):
+        w2, _ = compiler_works(c["cxx"], host_flags(c), host_path(c, b["dir"]))
+        if w2:
+            return b["dir"], True, "runs, with the binutils in %s" % b["dir"]
+    return "", False, why
+
+
+# Where compilers and interpreters are looked for.  /usr/bin first, so a system
+# tool is met under its plain name before any alias of it; then the caller's
+# PATH, in their order; then the usual homes of private and vendor toolchains.
+TOOL_GLOBS = ["~/opt/*/bin", "~/.local/bin", "/usr/local/bin", "/usr/local/*/bin", "/opt/*/bin",
+              "/opt/rh/*/root/usr/bin", "/usr/lib/llvm*/bin", "/usr/lib64/llvm*/bin"]
+COMPILER_NAME = re.compile(r"^(gcc|clang)(-\d+(\.\d+)*)?$")
+PYTHON_NAME = re.compile(r"^python3(\.\d+)?$")
+SYSTEM_LIBDIRS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")
+
+
+def tool_search_dirs(home=None, path_env=None):
+    home = os.path.expanduser("~") if home is None else home
+    path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    dirs = ["/usr/bin"] + [d for d in path_env.split(":") if d]
+    for pat in TOOL_GLOBS:
+        dirs.extend(sorted(glob.glob(home + pat[1:] if pat.startswith("~") else pat)))
+    seen, res = set(), []
+    for d in dirs:
+        real = os.path.realpath(d)
+        if real not in seen and os.path.isdir(d):
+            seen.add(real)
+            res.append(d)
+    return res
+
+
+def scan_names(dirs, pattern):
+    """Executable FILES whose names match, one per real file.  (A PATH entry like
+    ~/opt/gcc-17/lib holds a DIRECTORY named gcc: the isfile() is not decoration.)"""
+    seen, found = set(), []
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d), key=lambda n: (len(n), n))      # 'clang' before 'clang-21'
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            if not pattern.match(name) or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                found.append(path)
+    return found
+
+
+def origin_of(path):
+    d, name = os.path.split(path)
+    if d in ("/usr/bin", "/bin"):
+        return "system" if name in ("gcc", "clang", "python3") else "system, versioned"
+    if d.startswith("/opt/rh/"):
+        return "toolset"
+    if re.match(r"^/usr/lib(64)?/llvm", d):
+        return "distro LLVM package"
+    return "private"
+
+
+def gcc_install_dir(cxx):
+    """Where this gcc keeps crtbegin.o and its C++ headers -- the `install:` line
+    of -print-search-dirs -- or ''.  Asked of the compiler itself, so a symlink
+    or a ccache directory in front of it changes nothing."""
+    try:
+        o = run([cxx, "-print-search-dirs"], check=False, env=scrubbed_env(), timeout=30).stdout or ""
+    except ToolError:
+        return ""
+    m = re.search(r"^install:\s*(\S+)", o, re.M)
+    d = os.path.normpath(m.group(1)) if m else ""
+    return d if d and os.path.isdir(d) else ""
+
+
+def gcc_runtime(cxx):
+    """-> (gcc prefix for clang's --gcc-toolchain, rpath directory).
+
+    A clang built BY a gcc is linked against that gcc's libstdc++, and a clang
+    that then builds the next stage must use the same one.  The system's: nothing
+    to do.  A Red Hat toolset's: its libstdc++.so is a linker SCRIPT onto the
+    system library plus a static remainder, so headers yes, rpath no.  A private
+    gcc: a real, newer libstdc++.so.6 somewhere under $HOME -- every binary of
+    every stage needs an rpath to it, or it dies in a clean environment with
+    "GLIBCXX_3.4.xx not found" an hour after a test program 'worked'."""
+    d = os.path.dirname(cxx)
+    prefix = "" if d in ("/usr/bin", "/bin") else os.path.dirname(d)
+    m = re.match(r"^(.*)/lib(?:32|64|x32)?/gcc(?:-cross)?/", gcc_install_dir(cxx) + "/")
+    if m:                                    # from the installation, not from where a symlink to it was found
+        prefix = "" if m.group(1) in ("/usr", "") else m.group(1)
+    try:
+        so = run([cxx, "-print-file-name=libstdc++.so"], check=False, env=scrubbed_env(), timeout=30).stdout.strip()
+    except ToolError:
+        return prefix, ""
+    if not os.path.isabs(so) or not os.path.exists(so):
+        return prefix, ""
+    real = os.path.realpath(so)
+    try:
+        with open(real, "rb") as f:
+            is_elf = f.read(4) == b"\x7fELF"
+    except OSError:
+        return prefix, ""
+    rdir = os.path.dirname(real)
+    system = any(rdir == x or rdir.startswith(x + "/") for x in SYSTEM_LIBDIRS)
+    return prefix, (rdir if is_elf and not system else "")
+
+
+def describe_host(cc, ci):
+    """Fill in what a stage0 candidate brings with it."""
+    ci["cxx"] = cxx_partner(cc, ci["kind"])
+    ci["origin"] = origin_of(cc)
+    ci["system"] = ci["origin"] == "system"
+    ci["gcc_prefix"], ci["rpath"] = gcc_runtime(ci["cxx"]) if ci["kind"] == "gcc" and ci["cxx"] else ("", "")
+    ci["gcc_install"] = gcc_install_dir(ci["cxx"]) if ci["kind"] == "gcc" and ci["cxx"] else ""
+    ci["lld"] = os.access(os.path.join(os.path.dirname(os.path.realpath(cc)), "ld.lld"), os.X_OK) or \
+        os.access(os.path.join(os.path.dirname(cc), "ld.lld"), os.X_OK) or bool(which("ld.lld"))
+    return ci
+
+
+def find_host_compilers(dirs=None):
+    """Every gcc and clang on this machine that could be stage0: the system's,
+    versioned ones, toolsets, distro LLVM packages, and private builds under
+    ~/opt, /opt and /usr/local.  LISTED so they can be chosen -- the default
+    stays the system's, which is what makes a build repeatable."""
+    found = []
+    for cc in scan_names(tool_search_dirs() if dirs is None else dirs, COMPILER_NAME):
+        ci = compiler_info(cc)
+        if ci:
+            found.append(describe_host(cc, ci))
+    return found
+
+
+def pick_host_compiler(cands, mins, forced="", forced_cxx=""):
+    """The system's clang (it builds LLVM faster and in less memory), else the
+    system's gcc, else a toolset, else anything else -- and only one that meets
+    the TREE's own minimum and has a C++ partner.  --host-cc overrides."""
+    if forced:
+        forced = os.path.abspath(os.path.expanduser(forced)) if os.sep in forced else (which(forced) or forced)
+        ci = compiler_info(forced)
+        if not ci:
+            raise ToolError("--host-cc %s is not a working gcc or clang" % forced)
+        describe_host(forced, ci)
+        if forced_cxx:
+            ci["cxx"] = os.path.abspath(os.path.expanduser(forced_cxx))
+            if not os.access(ci["cxx"], os.X_OK):
+                raise ToolError("--host-cxx %s is not executable" % ci["cxx"])
+        if not ci["cxx"]:
+            raise ToolError("no C++ partner next to %s -- name it with --host-cxx" % forced)
+        if not ver_ge(ci["version"], mins.get(ci["kind"], ())):
+            raise ToolError("%s is %s %s; this tree needs >= %s"
+                            % (forced, ci["kind"], vstr(ci["version"]), vstr(mins.get(ci["kind"], ()))))
+        return ci
+    good = ranked_host_compilers(cands, mins)
+    return good[0] if good else None
+
+
+def ranked_host_compilers(cands, mins):
+    """The usable candidates, best first: the system's clang, the system's gcc,
+    a toolset, a distro LLVM package, a private build."""
+    rank = {"system": 0, "system, versioned": 1, "toolset": 2, "distro LLVM package": 3, "private": 4}
+    good = [c for c in cands if c["cxx"] and ver_ge(c["version"], mins.get(c["kind"], ())) and not c.get("rpath")]
+    good.sort(key=lambda c: (rank.get(c["origin"], 9), c["kind"] != "clang", [-x for x in c["version"]]))
+    return good
+
+
+PROBE_PY = ("import sys,sysconfig,os\n"
+            "print('%d.%d.%d' % sys.version_info[:3])\n"
+            "print(getattr(sys.implementation,'name','?'))\n"
+            "print(int(os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h'))))\n"
+            "try:\n import yaml; print(1)\nexcept Exception:\n print(0)\n")
+
+
+def probe_python(p):
+    """-> {path, version, impl, origin, devel, yaml} or None."""
+    # -E, not -I: the build sees user site-packages too.  cwd=/ so that no yaml.py
+    # in the directory the tool was started from is taken for the real thing.
+    o = run([p, "-E", "-c", PROBE_PY], cwd="/", check=False, env=scrubbed_env(), timeout=30)
+    lines = (o.stdout or "").split()
+    if o.returncode != 0 or len(lines) < 4:
+        return None
+    return {"path": p, "version": numver(lines[0]), "impl": lines[1], "origin": origin_of(p),
+            "devel": lines[2] == "1", "yaml": lines[3] == "1"}
+
+
+def find_pythons(dirs=None):
+    found = []
+    for p in scan_names(tool_search_dirs() if dirs is None else dirs, PYTHON_NAME):
+        try:
+            info_ = probe_python(p)
+        except ToolError:
+            info_ = None
+        if info_:
+            found.append(info_)
+    return found
+
+
+def pick_python(pythons, minimum, forced=""):
+    """CPython >= the tree's minimum; one that HAS yaml first (PATH commonly leads
+    to a PyPy or pyenv shim without it, and cmake would not have asked PATH
+    anyway); then the platform's own; then the newest.  --python overrides."""
+    if forced:
+        forced = os.path.abspath(os.path.expanduser(forced)) if os.sep in forced else (which(forced) or forced)
+        p = probe_python(forced) if os.access(forced, os.X_OK) else None
+        if not p:
+            raise ToolError("--python %s is not a working python3" % forced)
+        if not ver_ge(p["version"], minimum):
+            raise ToolError("%s is %s; this tree's build needs >= %s" % (forced, vstr(p["version"]), vstr(minimum)))
+        return p
+    good = [p for p in pythons if p["impl"] == "cpython" and ver_ge(p["version"], minimum)]
+    good.sort(key=lambda p: (not p["yaml"], p["path"] != PLATFORM_PYTHON, [-x for x in p["version"]]))
+    return good[0] if good else None
+
+
+def tool_version(path, args=("--version",)):
+    if not path:
+        return ()
+    try:
+        return numver(run([path] + list(args), check=False, env=scrubbed_env(), timeout=30).stdout or "")
+    except ToolError:
+        return ()
+
+
+def find_tool(names, tools_bin, minimum, forced=""):
+    """-> (path, version, provisioned?) of the first candidate that is new enough."""
+    if forced:
+        forced = os.path.abspath(os.path.expanduser(forced))
+        v = tool_version(forced) if os.access(forced, os.X_OK) else ()
+        if not v:
+            raise ToolError("%s is not a working %s" % (forced, names[0]))
+        if not ver_ge(v, minimum):
+            raise ToolError("%s is %s %s; this tree needs >= %s" % (forced, names[0], vstr(v), vstr(minimum)))
+        return forced, v, False
+    for d in [tools_bin] + SYSTEM_PATH:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.access(p, os.X_OK):
+                v = tool_version(p)
+                if v and ver_ge(v, minimum):
+                    return p, v, d == tools_bin
+    return "", (), False
+
+
+def have_header(rel):
+    for base in ["/usr/include", "/usr/local/include"] + glob.glob("/usr/include/*-linux-gnu*"):
+        if os.path.exists(os.path.join(base, rel)):
+            return True
+    return False
+
+
+# (key, what, test, {package manager: packages}, what it is for)
+OPTIONAL_DEPS = [
+    ("yaml", "PyYAML for the build's python", None,
+     {"dnf": "python3-pyyaml", "yum": "python3-pyyaml", "apt-get": "python3-yaml",
+      "zypper": "python3-PyYAML", "pacman": "python-yaml"},
+     "LLVM libc's header generator -- without it the libc runtime is skipped"),
+    ("zlib", "zlib headers", "zlib.h",
+     {"dnf": "zlib-devel", "yum": "zlib-devel", "apt-get": "zlib1g-dev", "zypper": "zlib-devel", "pacman": "zlib"},
+     "compressed debug sections, compressed PCH"),
+    ("zstd", "zstd headers", "zstd.h",
+     {"dnf": "libzstd-devel", "yum": "libzstd-devel", "apt-get": "libzstd-dev", "zypper": "libzstd-devel", "pacman": "zstd"},
+     "zstd-compressed sections and ThinLTO cache"),
+    ("libxml2", "libxml2 headers", "libxml2/libxml/parser.h",
+     {"dnf": "libxml2-devel", "yum": "libxml2-devel", "apt-get": "libxml2-dev", "zypper": "libxml2-devel", "pacman": "libxml2"},
+     "lldb (target XML), llvm-mt, c-index-test"),
+    ("libedit", "libedit headers", "histedit.h",
+     {"dnf": "libedit-devel", "yum": "libedit-devel", "apt-get": "libedit-dev", "zypper": "libedit-devel", "pacman": "libedit"},
+     "line editing in lldb and clang-repl"),
+    ("ncurses", "ncurses headers", "curses.h",
+     {"dnf": "ncurses-devel", "yum": "ncurses-devel", "apt-get": "libncurses-dev", "zypper": "ncurses-devel", "pacman": "ncurses"},
+     "lldb's curses UI"),
+    ("lzma", "liblzma headers", "lzma.h",
+     {"dnf": "xz-devel", "yum": "xz-devel", "apt-get": "liblzma-dev", "zypper": "xz-devel", "pacman": "xz"},
+     "lldb reading MiniDebugInfo"),
+    ("binutils", "binutils plugin-api.h", "plugin-api.h",
+     {"dnf": "binutils-devel", "yum": "binutils-devel", "apt-get": "binutils-dev", "zypper": "binutils-devel", "pacman": "binutils"},
+     "LLVMgold.so -- clang -flto with GNU ld / gold"),
+    ("libffi", "libffi headers", "ffi.h",
+     {"dnf": "libffi-devel", "yum": "libffi-devel", "apt-get": "libffi-dev", "zypper": "libffi-devel", "pacman": "libffi"},
+     "offload's host plugin"),
+    ("swig", "swig 4 or newer", None,
+     {"dnf": "swig", "yum": "swig", "apt-get": "swig", "zypper": "swig", "pacman": "swig"},
+     "lldb's Python scripting"),
+    ("pydevel", "Python.h for the build's python", None,
+     {"dnf": "python3-devel", "yum": "python3-devel", "apt-get": "python3-dev", "zypper": "python3-devel", "pacman": "python"},
+     "lldb's Python scripting"),
+]
+REQUIRED_PKGS = {
+    "compiler": {"dnf": "gcc gcc-c++", "yum": "gcc gcc-c++", "apt-get": "g++", "zypper": "gcc gcc-c++", "pacman": "gcc"},
+    "cmake": {"dnf": "cmake", "yum": "cmake", "apt-get": "cmake", "zypper": "cmake", "pacman": "cmake"},
+    "ninja": {"dnf": "ninja-build", "yum": "ninja-build", "apt-get": "ninja-build", "zypper": "ninja", "pacman": "ninja"},
+    "make": {"dnf": "make", "yum": "make", "apt-get": "make", "zypper": "make", "pacman": "make"},
+    "git": {"dnf": "git", "yum": "git", "apt-get": "git", "zypper": "git", "pacman": "git"},
+    "tar": {"dnf": "tar xz", "yum": "tar xz", "apt-get": "tar xz-utils", "zypper": "tar xz", "pacman": "tar xz"},
+    "python": {"dnf": "python3.12", "yum": "python3.11", "apt-get": "python3", "zypper": "python311", "pacman": "python"},
+}
+
+
+def python_pkg(name, python, pm):
+    """The package that serves the BUILD's python: python3-pyyaml is for the
+    distribution's default python3, which on RHEL 8 or Leap 15 is the 3.6 the
+    tree refused; the build's python3.12 wants python3.12-pyyaml (dnf) or
+    python312-PyYAML (zypper)."""
+    base = os.path.basename((python or {}).get("path", ""))
+    m = re.match(r"^python3\.(\d+)$", base)
+    if not m or not name.startswith("python3"):
+        return name
+    if pm in ("dnf", "yum"):
+        return "python3.%s%s" % (m.group(1), name[len("python3"):])
+    if pm == "zypper":
+        return "python3%s%s" % (m.group(1), name[len("python3"):])
+    return name
+
+
+def crb_hint(machine):
+    """How the repository with ninja-build and the -devel packages is enabled on
+    Enterprise Linux: it is called crb (EL 9+), powertools (EL 8) or, on RHEL
+    itself, a subscription-manager channel.  '' where there is no such thing."""
+    osid, like = machine.get("os_id", ""), machine.get("os_like", "")
+    major = (re.match(r"\d+", machine.get("os_version", "") or "") or re.match(r"", "")).group(0)
+    if osid == "rhel":
+        return "sudo subscription-manager repos --enable codeready-builder-for-rhel-%s-%s-rpms" % (major or "9", machine.get("arch", "x86_64"))
+    if osid in ("almalinux", "rocky", "centos") or (osid != "fedora" and "rhel" in like.split()):
+        return "sudo dnf config-manager --set-enabled %s" % ("powertools" if major == "8" else "crb")
+    return ""
+
+
+def detect_machine():
+    osr = parse_os_release(read_text("/etc/os-release"))
+    total, avail = meminfo_gb()
+    cpu = cpu_info()
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    swig = which("swig") or which("swig4.0") or ""
+    swig_version = tool_version(swig) if swig else ()
+    m = {"os": "%s %s" % (osr.get("NAME", "Linux"), osr.get("VERSION_ID", "")),
+         "os_id": osr.get("ID", ""), "os_like": osr.get("ID_LIKE", ""), "os_version": osr.get("VERSION_ID", ""),
+         "arch": os.uname().machine, "cpus": cpus,
+         "cpu_model": cpu["model"], "cpu_flags": cpu["flags"],
+         "mem_total_gb": total, "mem_avail_gb": avail,
+         "pkg_manager": find_pkg_manager(osr),
+         "host_compilers": find_host_compilers(), "pythons": find_pythons(), "binutils": find_binutils(),
+         "git": which("git") or "", "tar": which("tar") or "", "xz": which("xz") or "",
+         "make": which("make") or "",
+         "swig": swig if ver_ge(swig_version, (4,)) else "",            # LLDB's scripting needs SWIG >= 4
+         "swig_found": vstr(swig_version) if swig and not ver_ge(swig_version, (4,)) else "",
+         "headers": dict((k, have_header(h)) for k, _, h, _, _ in OPTIONAL_DEPS if h)}
+    return m
+
+
+# ---------------------------------------------------------------- the source tree
+
+def cmake_set(text, var):
+    """The value list of `set(VAR ...)`: quoted, ;-separated or one per line."""
+    m = re.search(r"^[ \t]*set\(\s*%s\b(.*?)\)" % re.escape(var), text, re.S | re.M)
+    if not m:
+        return None
+    body = re.split(r"\b(?:CACHE|PARENT_SCOPE)\b", m.group(1))[0]
+    items = []
+    for quoted, bare in re.findall(r'"([^"]*)"|([^\s"]+)', body):
+        items += [p for p in (quoted or bare).split(";") if p and not p.startswith("$")]
+    return items
+
+
+class Tree(object):
+    """What THIS source tree says about itself.  Nothing about LLVM's layout is
+    assumed beyond llvm/CMakeLists.txt: the project, runtime and target lists,
+    and the tool minimums, are read -- so an older release is not asked for
+    libsycl, and trunk is not denied it."""
+
+    def __init__(self, src):
+        self.src = os.path.abspath(src)
+        top = read_text(os.path.join(self.src, "llvm", "CMakeLists.txt"))
+        if not top:
+            raise ToolError("%s is not an llvm-project tree (no llvm/CMakeLists.txt)" % src)
+        vtext = read_text(os.path.join(self.src, "cmake", "Modules", "LLVMVersion.cmake")) + top
+        parts = [re.search(r"set\(LLVM_VERSION_%s (\w*)\)" % k, vtext) for k in ("MAJOR", "MINOR", "PATCH", "SUFFIX")]
+        if not all(parts[:3]):
+            raise ToolError("cannot read LLVM_VERSION_* from %s" % self.src)
+        self.version = "%s.%s.%s%s" % tuple(p.group(1) if p else "" for p in parts)
+        self.major = int(parts[0].group(1))
+        rt = read_text(os.path.join(self.src, "runtimes", "CMakeLists.txt"))
+        projects = (cmake_set(top, "LLVM_ALL_PROJECTS") or []) + \
+            [p for p in (cmake_set(top, "LLVM_EXTRA_PROJECTS") or []) if p == "flang"]
+        runtimes = cmake_set(top, "LLVM_SUPPORTED_RUNTIMES") or cmake_set(top, "LLVM_ALL_RUNTIMES") or \
+            cmake_set(rt, "LLVM_SUPPORTED_RUNTIMES") or cmake_set(rt, "LLVM_ALL_RUNTIMES") or []
+        isdir = lambda n: os.path.isfile(os.path.join(self.src, n, "CMakeLists.txt"))
+        self.runtimes = [r for r in runtimes if isdir(r)]
+        # Releases 17-22 still list compiler-rt, openmp, libc, pstl among the
+        # projects: named in both lists, a runtime is built twice and the
+        # configure dies on the duplicate `builtins` target.  Runtimes are runtimes.
+        self.projects = [p for p in projects if isdir(p) and p not in self.runtimes]
+        # A libclc that refuses the host triple is a device library even where
+        # the tree ships no libclc/cmake/caches/all-targets.cmake yet (23.1.x).
+        self.libclc_device_only = "Unknown libclc target architecture" in \
+            read_text(os.path.join(self.src, "libclc", "CMakeLists.txt"))
+        self.targets = cmake_set(top, "LLVM_ALL_TARGETS") or []
+        tdir = os.path.join(self.src, "llvm", "lib", "Target")
+        on_disk = sorted(d for d in os.listdir(tdir)
+                         if os.path.isfile(os.path.join(tdir, d, "CMakeLists.txt"))) if os.path.isdir(tdir) else []
+        declared = cmake_set(top, "LLVM_ALL_EXPERIMENTAL_TARGETS")
+        self.experimental = declared if declared is not None else [t for t in on_disk if t not in self.targets]
+        m = re.search(r"cmake_minimum_required\(VERSION ([\d.]+)", top)
+        self.cmake_min = numver(m.group(1)) if m else (3, 13, 4)
+        pys = [numver(x) for x in re.findall(r"set\(LLVM_MINIMUM_PYTHON_VERSION ([\d.]+)\)", top)]
+        self.python_min = max(pys) if pys else (3, 6)
+        chk = read_text(os.path.join(self.src, "llvm", "cmake", "modules", "CheckCompilerVersion.cmake"))
+        g, c = re.search(r"set\(GCC_MIN ([\d.]+)\)", chk), re.search(r"set\(CLANG_MIN ([\d.]+)\)", chk)
+        self.cc_min = {"gcc": numver(g.group(1)) if g else (7, 4), "clang": numver(c.group(1)) if c else (5, 0)}
+        self.needs_yaml_for_libc = os.path.isdir(os.path.join(self.src, "libc", "utils", "hdrgen"))
+        self.rev = ""
+        if os.path.exists(os.path.join(self.src, ".git")) and which("git"):
+            p = run(["git", "-C", self.src, "rev-parse", "--short=12", "HEAD"], check=False, env=scrubbed_env())
+            self.rev = (p.stdout or "").strip() if p.returncode == 0 else ""
+
+    def ident(self):
+        return self.version + ("-" + self.rev if self.rev else "")
+
+
+# What "everything" leaves out, and why.  Short on purpose.
+EXCLUDED = {
+    "llvm-libgcc": "replaces the system's libgcc; upstream makes it an explicit opt-in and it cannot "
+                   "share a prefix with compiler-rt + libunwind",
+    "cross-project-tests": "tests only -- nothing to install (added by --check)",
+}
+CORE = ("llvm", "clang", "lld", "compiler-rt", "libunwind", "libcxxabi", "libcxx")
+# name -> what else must go when it goes
+DEPENDENTS = {"clang": ["clang-tools-extra", "lldb", "flang", "libclc"], "mlir": ["flang"],
+              "flang": ["flang-rt"], "openmp": ["offload"], "offload": ["libsycl"]}
+BOLT_ARCHES = ("x86_64", "aarch64", "riscv64")
+OFFLOAD_ARCHES = ("x86_64", "aarch64", "ppc64le", "riscv64")
+BOLT_TARGETS = ("clang", "lld")      # what the bolt stage rewrites: the two executables every build runs
+# CMAKE_PROJECT_INCLUDE runs this right after project(); the two targets exist only
+# once every directory is in, so the work waits for the end of the top-level one.
+# Only THESE keep their relocations: --emit-relocs on every executable would give
+# each of the 180 other tools a relocation table the size of its code.
+BOLT_HOOK = """# written by %s -- the executables BOLT rewrites are linked with their relocations kept
+function(ect_bolt_relocs)
+  foreach(t %s)
+    if(TARGET ${t})
+      set_property(TARGET ${t} APPEND PROPERTY LINK_OPTIONS "LINKER:--emit-relocs" "LINKER:-z,now")
+    endif()
+  endforeach()
+endfunction()
+get_property(ect_bolt_hooked GLOBAL PROPERTY ECT_BOLT_HOOKED)
+if(NOT ect_bolt_hooked)
+  set_property(GLOBAL PROPERTY ECT_BOLT_HOOKED 1)
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL ect_bolt_relocs)
+endif()
+"""
+
+
+def bolt_possible(opts, machine):
+    """-> (yes, why not).  BOLT rewrites ONE executable: with the tools linked
+    against libLLVM.so there is nothing in `clang` worth laying out."""
+    if not opts["bolt"]:
+        return False, "--no-bolt"
+    if machine["arch"] not in BOLT_ARCHES:
+        return False, "BOLT runs on %s hosts, this is %s" % ("/".join(BOLT_ARCHES), machine["arch"])
+    if "bolt" in opts["without"].split(",") or (opts["projects"] != "all" and "bolt" not in opts["projects"].split(",")):
+        return False, "the bolt project is not being built"
+    if opts["link"] != "static":
+        return False, "needs the tools linked static: BOLT rewrites one executable, not a shared library"
+    return True, ""
+
+
+def with_dependents(names):
+    todo, result = list(names), []
+    while todo:
+        n = todo.pop(0)
+        if n not in result:
+            result.append(n)
+            todo += DEPENDENTS.get(n, [])
+    return result
+
+
+def select_components(tree, machine, python, opts, dropped=None):
+    """-> (projects, runtimes, targets, experimental, skipped[(name, why)]).
+    Default: everything the tree declares, less what THIS machine cannot build."""
+    skipped = []
+
+    def wanted(name, explicit):
+        if explicit not in (None, "all"):
+            return name in explicit
+        return True
+
+    want_p = None if opts["projects"] == "all" else [x for x in opts["projects"].split(",") if x]
+    want_r = None if opts["runtimes"] == "all" else [x for x in opts["runtimes"].split(",") if x]
+    for kind, asked, known in (("project", want_p, tree.projects), ("runtime", want_r, tree.runtimes)):
+        for n in asked or []:
+            if n not in known:
+                raise ToolError("%s is not a %s of this tree (it has: %s)" % (n, kind, ", ".join(known)))
+    without = [x for x in opts["without"].split(",") if x]
+    projects = [p for p in tree.projects if wanted(p, want_p)]
+    runtimes = [r for r in tree.runtimes if wanted(r, want_r)]
+
+    def drop(name, why):
+        for n in with_dependents([name]):
+            for lst in (projects, runtimes):
+                if n in lst:
+                    lst.remove(n)
+                    skipped.append((n, why if n == name else "needs %s (%s)" % (name, why)))
+
+    for n in ("clang", "lld"):
+        if n not in projects:
+            raise ToolError("%s cannot be left out: the next stage is built with it" % n)
+    for n in list(projects) + list(runtimes):
+        if n in EXCLUDED and not (n == "cross-project-tests" and opts["check"]) \
+                and not (want_p and n in want_p) and not (want_r and n in want_r):
+            drop(n, EXCLUDED[n])
+    for n in without:
+        if n in CORE:
+            raise ToolError("--without %s: that is a core component" % n)
+        drop(n, "--without")
+    if "bolt" in projects and machine["arch"] not in BOLT_ARCHES:
+        drop("bolt", "BOLT supports %s hosts, this is %s" % ("/".join(BOLT_ARCHES), machine["arch"]))
+    if "flang" in projects and "mlir" not in projects:
+        drop("flang", "needs mlir")
+    if "flang" in projects and machine["mem_total_gb"] < 7:
+        drop("flang", "needs about 4 GB per compile job; this machine has %.0f GB" % machine["mem_total_gb"])
+    if "flang-rt" in runtimes and "flang" not in projects:
+        drop("flang-rt", "needs flang")
+    if "offload" in runtimes and "openmp" not in runtimes:
+        drop("offload", "needs openmp")
+    if "offload" in runtimes and machine["arch"] not in OFFLOAD_ARCHES:
+        drop("offload", "not supported on %s" % machine["arch"])
+    if "libc" in runtimes and tree.needs_yaml_for_libc and not (python and python["yaml"]):
+        drop("libc", "its header generator needs PyYAML, and %s has none"
+             % (python["path"] if python else "the build's python"))
+    for name, why in sorted((dropped or {}).items()):
+        if not name.startswith("target:"):
+            drop(name, "dropped earlier in this build: " + why)
+
+    if opts["targets"] == "all":
+        targets, experimental = "all", list(tree.experimental) if opts["experimental_targets"] else []
+    elif opts["targets"] in ("host", "native"):
+        targets, experimental = "Native", []
+    else:
+        asked = [x for x in opts["targets"].split(",") if x]
+        known = dict((t.lower(), t) for t in tree.targets + tree.experimental)
+        for t in asked:
+            if t.lower() not in known:
+                raise ToolError("unknown target %s (this tree has: %s)"
+                                % (t, ", ".join(tree.targets + tree.experimental)))
+        asked = [known[t.lower()] for t in asked]
+        targets = ";".join(t for t in asked if t in tree.targets) or "Native"
+        experimental = [t for t in asked if t in tree.experimental]
+    for name, why in sorted((dropped or {}).items()):
+        if name.startswith("target:") and name[7:] in experimental:
+            experimental.remove(name[7:])
+            skipped.append((name, "dropped earlier in this build: " + why))
+    return projects, runtimes, targets, experimental, skipped
+
+
+# ------------------------------------------------------------------------ fetching
+
+def http_get(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                               "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
+        raise ToolError("cannot fetch %s: %s" % (url, e))
+
+
+def parse_releases(raw):
+    """-> [{version, tag, url, sha256}] newest first; release candidates left out."""
+    try:
+        data = json.loads(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
+    except ValueError:
+        raise ToolError("the GitHub releases list is not JSON (a proxy's block page?)")
+    rels = []
+    for r in data if isinstance(data, list) else []:
+        m = re.match(r"^llvmorg-(\d+\.\d+\.\d+)$", r.get("tag_name") or "")
+        if not m or r.get("prerelease") or r.get("draft"):
+            continue
+        v = m.group(1)
+        want = "llvm-project-%s.src.tar.xz" % v
+        asset = next((a for a in r.get("assets") or [] if a.get("name") == want), None)
+        digest = (asset or {}).get("digest") or ""
+        rels.append({"version": v, "tag": r["tag_name"],
+                     "url": (asset or {}).get("browser_download_url") or TARBALL_URL % {"v": v},
+                     "sha256": digest[7:] if digest.startswith("sha256:") else ""})
+    rels.sort(key=lambda r: numver(r["version"]), reverse=True)
+    return rels
+
+
+def get_releases():
+    try:
+        return parse_releases(http_get(GITHUB_API))
+    except ToolError as e:
+        if not which("git"):
+            raise
+        note("GitHub's API did not answer (%s) -- asking git for the tags" % str(e).splitlines()[0][:80])
+        p = run(["git", "ls-remote", "--tags", "--refs", GITHUB_GIT, "llvmorg-*"], check=False,
+                env=scrubbed_env(), timeout=120)
+        vs = sorted(set(re.findall(r"refs/tags/llvmorg-(\d+\.\d+\.\d+)$", p.stdout or "", re.M)),
+                    key=numver, reverse=True)
+        if not vs:
+            raise ToolError("cannot list LLVM releases (no API, no git tags): pass --version X.Y.Z, "
+                            "--ref, or --source")
+        return [{"version": v, "tag": "llvmorg-" + v, "url": TARBALL_URL % {"v": v}, "sha256": ""} for v in vs]
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def download(url, dest, sha256=""):
+    """To dest.part, checked, then renamed: a file with the final name is whole."""
+    if os.path.isfile(dest) and (not sha256 or sha256_file(dest) == sha256):
+        ok("already here: %s" % dest)
+        return
+    part = dest + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    started, got, shown = time.time(), 0, 0.0
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            while True:
+                block = r.read(1 << 20)
+                if not block:
+                    break
+                f.write(block)
+                got += len(block)
+                if UI.tty and time.time() - shown > 0.2:
+                    shown = time.time()
+                    sys.stdout.write("\r\033[K  %s / %s" % (human(got), human(total) if total else "?"))
+                    sys.stdout.flush()
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        raise ToolError("download failed: %s\n  %s" % (url, e))
+    finally:
+        if UI.tty:
+            sys.stdout.write("\r\033[K")
+    if total and got != total:
+        raise ToolError("download was cut short: %s of %s from %s" % (human(got), human(total), url))
+    if sha256:
+        have = sha256_file(part)
+        if have != sha256:
+            os.unlink(part)
+            raise ToolError("checksum mismatch for %s\n  expected %s\n  got      %s" % (url, sha256, have))
+        ok("sha256 matches")
+    else:
+        note("no published checksum for this file: integrity rests on TLS alone")
+    os.replace(part, dest)
+    ok("downloaded %s in %s" % (human(got), hms(time.time() - started)))
+
+
+def extract(tarball, dest_dir):
+    """Into a temp dir beside the destination, then renamed: a tree with the final
+    name is complete.  GNU tar, not tarfile: before Python 3.12 tarfile has no
+    member filter."""
+    parent = os.path.dirname(dest_dir)
+    os.makedirs(parent, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".extract-", dir=parent)
+    try:
+        run(["tar", "-xf", tarball, "-C", tmp, "--no-same-owner"], env=scrubbed_env(), timeout=3600)
+        tops = os.listdir(tmp)
+        if len(tops) != 1 or not os.path.isdir(os.path.join(tmp, tops[0])):
+            raise ToolError("%s does not hold exactly one directory" % tarball)
+        os.rename(os.path.join(tmp, tops[0]), dest_dir)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def resolve_source(opts, workdir):
+    """-> {kind, dir, label, fetch()}.  Nothing is downloaded here."""
+    srcroot = os.path.join(workdir, "src")
+    if opts["source"]:
+        d = os.path.abspath(os.path.expanduser(opts["source"]))
+        return {"kind": "local", "dir": d, "label": "%s  (yours; used read-only)" % d, "fetch": None}
+    if opts["ref"]:
+        ref = opts["ref"]
+        d = os.path.join(srcroot, "llvm-project-" + re.sub(r"[^\w.+-]", "_", ref))
+
+        def fetch_git():
+            if not which("git"):
+                raise ToolError("--ref needs git")
+            os.makedirs(srcroot, exist_ok=True)
+            tmp = d + ".cloning"
+            shutil.rmtree(tmp, ignore_errors=True)
+            info("git clone --depth 1 --branch %s  (several hundred MB)" % ref)
+            run(["git", "clone", "--depth", "1", "--branch", ref, GITHUB_GIT, tmp],
+                env=scrubbed_env(), capture=False, interactive=True, timeout=7200)
+            os.rename(tmp, d)
+        return {"kind": "git", "dir": d, "label": "git %s -> %s" % (ref, d), "fetch": fetch_git}
+    v = opts["version"]
+    rel = None
+    if v in ("latest", "release", "stable"):
+        try:
+            rel = get_releases()[0]
+            v = rel["version"]
+        except ToolError as e:
+            here = sorted((numver(os.path.basename(p)[len("llvm-project-"):-len(".src")]), p)
+                          for p in glob.glob(os.path.join(srcroot, "llvm-project-*.src"))
+                          if os.path.isdir(os.path.join(p, "llvm")))
+            if not here:
+                raise
+            v = vstr(here[-1][0])                             # offline: the newest release already on disk
+            note("the release list cannot be fetched (%s): using %s, the newest source already here"
+                 % (str(e).splitlines()[0][:70], v))
+    elif not re.match(r"^\d+\.\d+\.\d+$", v):
+        raise ToolError("--version wants X.Y.Z or 'latest' (for a branch or tag use --ref)")
+    d = os.path.join(srcroot, "llvm-project-%s.src" % v)
+
+    def fetch_tarball():
+        r = rel or next((x for x in get_releases() if x["version"] == v),
+                        {"version": v, "url": TARBALL_URL % {"v": v}, "sha256": ""})
+        os.makedirs(srcroot, exist_ok=True)
+        tb = os.path.join(srcroot, "llvm-project-%s.src.tar.xz" % v)
+        info("downloading %s" % r["url"])
+        download(r["url"], tb, r["sha256"])
+        info("extracting (about 2 GB)")
+        extract(tb, d)
+    return {"kind": "tarball", "dir": d, "label": "release %s -> %s" % (v, d), "fetch": fetch_tarball}
+
+
+# -------------------------------------------------------------- tool provisioning
+
+def provision(name, tools_dir, host, jobs):
+    """Build cmake or ninja from source into <workdir>/tools.  Both bootstrap from
+    nothing but a C++ compiler (cmake also wants make), which is why they can be
+    promised on a machine whose package set is frozen."""
+    spec = PROVISION[name]
+    os.makedirs(tools_dir, exist_ok=True)
+    tb = os.path.join(tools_dir, os.path.basename(spec["url"]))
+    info("%s %s: downloading the source" % (name, spec["version"]))
+    download(spec["url"], tb, spec["sha256"])
+    work = tempfile.mkdtemp(prefix="build-%s-" % name, dir=tools_dir)
+    env = scrubbed_env(host_path(host, host.get("binutils_dir", "")), extra={"CC": host["path"], "CXX": host["cxx"]})
+    if host.get("rpath"):
+        env["LDFLAGS"] = "-Wl,-rpath," + host["rpath"]          # the private gcc's libstdc++, found at run time
+    try:
+        run(["tar", "-xf", tb, "-C", work], env=env, timeout=1800)
+        src = os.path.join(work, os.listdir(work)[0])
+        os.makedirs(os.path.join(tools_dir, "bin"), exist_ok=True)
+        info("%s %s: building (log: %s)" % (name, spec["version"], os.path.join(tools_dir, name + ".log")))
+        if name == "ninja":
+            p = run([PLATFORM_PYTHON, "configure.py", "--bootstrap"], cwd=src, env=env, check=False, timeout=3600)
+            write_atomic(os.path.join(tools_dir, "ninja.log"), p.stdout or "")
+            if p.returncode != 0:
+                raise ToolError("building ninja failed -- see %s" % os.path.join(tools_dir, "ninja.log"))
+            shutil.copy2(os.path.join(src, "ninja"), os.path.join(tools_dir, "bin", "ninja"))
+        else:
+            if not which("make"):
+                raise ToolError("building cmake from source needs make")
+            script = ("./bootstrap --prefix=%s --parallel=%d -- -DCMAKE_USE_OPENSSL=OFF "
+                      "-DBUILD_TESTING=OFF && make -j%d && make install"
+                      % (shlex.quote(tools_dir), jobs, jobs))
+            p = run(["sh", "-c", script], cwd=src, env=env, check=False, timeout=4 * 3600)
+            write_atomic(os.path.join(tools_dir, "cmake.log"), p.stdout or "")
+            if p.returncode != 0:
+                raise ToolError("building cmake failed -- see %s" % os.path.join(tools_dir, "cmake.log"))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    ok("%s %s is in %s" % (name, spec["version"], os.path.join(tools_dir, "bin")))
+
+
+# ------------------------------------------------------------------------- state
+
+class State(object):
+    """<build root>/state.json, written whole and atomically on every change."""
+
+    def __init__(self, path, fresh=False):
+        """fresh: an empty record, whatever the file holds -- for a build that is
+        about to start over; nothing is written until save()."""
+        self.path = path
+        try:
+            self.d = {} if fresh else json.loads(read_text(path) or "{}")
+        except ValueError:
+            warn("%s is unreadable -- starting a fresh record" % path)
+            self.d = {}
+        if not isinstance(self.d, dict):
+            self.d = {}
+        self.d.setdefault("stages", {})
+        self.d.setdefault("dropped", {})
+
+    def save(self):
+        write_atomic(self.path, json.dumps(self.d, indent=1, sort_keys=True) + "\n")
+
+    def stage(self, name):
+        return self.d["stages"].get(name, {})
+
+    def set_stage(self, name, **kv):
+        self.d["stages"].setdefault(name, {}).update(kv)
+        self.save()
+
+    def done(self, name):
+        return self.stage(name).get("status") == "done"
+
+
+_LOCKS = []
+
+
+def lock_dir(path):
+    os.makedirs(path, exist_ok=True)
+    f = open(os.path.join(path, ".lock"), "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError) as e:
+        f.close()
+        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+            raise ToolError("another %s is working in %s right now" % (TOOL, path))
+        raise ToolError("cannot lock %s: %s  (a filesystem without locking -- NFS without lockd?)" % (path, e))
+    _LOCKS.append(f)
+
+
+def lock_is_held(path):
+    """Whether some process holds the directory's lock -- a record that says
+    `running` while nobody does belongs to a run that was killed."""
+    try:
+        f = open(os.path.join(path, ".lock"), "r")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        return True
+    finally:
+        f.close()                                            # releases the lock this test took
+    return False
+
+
+class locked(object):
+    """A lock held for one operation, and waited for: two instances fetching the
+    same source would otherwise write the same file."""
+
+    def __init__(self, path):
+        self.path, self.f = path, None
+
+    def __enter__(self):
+        os.makedirs(self.path, exist_ok=True)
+        self.f = open(os.path.join(self.path, ".lock"), "a")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError):
+            note("another %s is fetching into %s: waiting for it" % (TOOL, self.path))
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+# ------------------------------------------------------------------ running ninja
+
+STEP = re.compile(r"^\[(\d+)/(\d+)\] (.*)")
+ERRORISH = re.compile(r"(^FAILED: |\berror:|\bfatal error:|^CMake Error|^ninja: error|LLVM ERROR|"
+                      r"undefined reference|undefined symbol|internal compiler error|\bKilled\b)")
+OOMISH = re.compile(r"(Killed signal|\bKilled\b|signal 9|[Oo]ut of memory|std::bad_alloc|"
+                    r"Cannot allocate memory|virtual memory exhausted|cannot allocate)")
+
+
+def fit_line(text, cols=None):
+    cols = cols or shutil.get_terminal_size((100, 24)).columns
+    return text[:max(cols - 1, 20)]
+
+
+def error_summary(log_path, limit=14):
+    """The FIRST real errors: the tail of a -j24 build is twenty-three other jobs."""
+    hits, follow = [], 0
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                if ERRORISH.search(line) and "warning:" not in line:
+                    hits.append("%7d: %s" % (n, line.rstrip()[:300]))
+                    follow = 3 if line.startswith("CMake Error") else 0     # its message is on the lines below
+                    if len(hits) >= limit:
+                        break
+                elif follow and line.strip():
+                    hits.append("%7s  %s" % ("", line.strip()[:300]))
+                    follow -= 1
+    except OSError:
+        pass
+    return hits
+
+
+def run_logged(cmd, cwd, env, log_path, label, verbose=False):
+    """Run cmd; everything goes to the log; the console gets a one-line status
+    (a TTY) or a heartbeat every five minutes (a log file), plus every error line."""
+    if os.path.exists(log_path):
+        os.replace(log_path, log_path + ".prev")
+    started = time.time()
+    done = total = shown_err = 0
+    last, beat, drawn = "", started, 0.0
+    # Its own session: a SIGHUP from a closing terminal reaches the tool (which
+    # under nohup ignores it) and not ninja, which would stop the build; a ^C
+    # still reaches ninja -- through the terminate() below.
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, universal_newlines=True, errors="replace", bufsize=1,
+                            start_new_session=True)
+
+    def status():
+        pct = " (%d%%)" % (100 * done // total) if total else ""
+        return fit_line("  [%s] %s %d/%d%s  %s" % (hms(time.time() - started), label, done, total, pct, last))
+    try:
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+            log.write("# %s\n# cwd: %s\n" % (" ".join(shlex.quote(c) for c in cmd), cwd))
+            for line in proc.stdout:
+                log.write(line)
+                text = line.rstrip("\n")
+                m = STEP.match(text)
+                if m:
+                    done, total, last = int(m.group(1)), int(m.group(2)), m.group(3)
+                if verbose:
+                    out(text)
+                    continue
+                important = bool(ERRORISH.search(text)) and "warning:" not in text
+                if important:
+                    shown_err += 1
+                    if shown_err > 40:
+                        important = False
+                    if UI.tty:
+                        sys.stdout.write("\r\033[K")
+                    if important:
+                        out("    " + text[:300])
+                if UI.tty:
+                    if important or time.time() - drawn >= 0.1:
+                        drawn = time.time()
+                        sys.stdout.write("\r\033[K" + status())
+                        sys.stdout.flush()
+                elif time.time() - beat >= 300:
+                    beat = time.time()
+                    out(status())
+        rc = proc.wait()
+    except BaseException:
+        # The whole group, not ninja alone: ninja hands a signal to its ordinary jobs
+        # but not to a console-pool one (the runtimes sub-build), which would run on.
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=60)
+        except (subprocess.TimeoutExpired, ValueError):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+        raise
+    finally:
+        if UI.tty:
+            sys.stdout.write("\r\033[K")
+    return rc, {"seconds": int(time.time() - started), "steps": done}
+
+
+# ------------------------------------------------------ who broke the build?
+
+def failed_blocks(text):
+    """ninja's failure reports: [(outputs, command, body, exit code or None)].
+    ninja 1.12 writes the code as `FAILED: [code=137] ...`; older ones write none."""
+    blocks, cur = [], None
+    for line in text.splitlines():
+        if line.startswith("FAILED: "):
+            m = re.match(r"^\[code=(-?\d+)\]\s*(.*)$", line[8:].strip())
+            cur = [m.group(2) if m else line[8:].strip(), "", [], int(m.group(1)) if m else None]
+            blocks.append(cur)
+        elif cur is not None:
+            if STEP.match(line) or line.startswith("ninja: build stopped"):
+                cur = None
+            elif not cur[1]:
+                cur[1] = line
+            else:
+                cur[2].append(line)
+    return [(o, c, "\n".join(b), code) for o, c, b, code in blocks]
+
+
+DISKFULL = re.compile(r"(No space left on device|Disk quota exceeded|\bENOSPC\b)")
+
+
+def disk_full(log_text):
+    """A full disk fails whatever happens to be compiling: not a component's fault,
+    and not something to drop."""
+    return bool(DISKFULL.search(log_text))
+
+
+def component_of(text, runtimes):
+    """Which component a build path belongs to, or ''."""
+    if re.search(r"(?:^|[\s/])tools/clang/tools/extra/", text):
+        return "clang-tools-extra"
+    m = re.search(r"(?:^|[\s/])tools/(flang|mlir|lldb|polly|bolt|lld|clang)/", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:^|[\s/])lib/Target/([A-Za-z0-9]+)/", text)
+    if m:
+        return "target:" + m.group(1)
+    if runtimes:
+        m = re.search(r"(?:^|[\s/])(%s)/" % "|".join(re.escape(r) for r in sorted(runtimes, key=len, reverse=True)), text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+STAMP = re.compile(r"(runtimes|builtins)[\w.-]*-stamps/|/CMakeFiles/(runtimes|builtins)[\w.-]*-(build|configure)")
+
+
+def blame(log_text, src, runtimes, optional=()):
+    """-> ({component: first error}, oom?).  Component 'llvm' means: core, stop.
+
+    A failure inside the runtimes sub-build shows up twice: the inner ninja's
+    FAILED line (which names the runtime) and the outer one for the stamp file
+    (which names nothing).  The stamp is a consequence, not a culprit -- unless
+    it is all there is, as when the runtimes' CONFIGURE step fails: then the
+    `CMake Error at <path>` lines say whose CMakeLists.txt it was."""
+    blamed, stamps = {}, 0
+    blocks = failed_blocks(log_text)
+    # A clang that runs cc1 in-process (the default) dies without a word when the
+    # kernel kills it: the FAILED block holds the command and nothing else, and
+    # ninja 1.12 adds exit code 137.  A real compile error always prints something.
+    # The outer block of a runtimes sub-build is silent too (console pool), and is
+    # not a kill; nor is a silent block ninja gave an ordinary exit code to.
+    oom = any(OOMISH.search(c + "\n" + b) or code in (137, -9)
+              or (code is None and c.strip() and not b.strip() and not STAMP.search(o))
+              for o, c, b, code in blocks)
+    for outs, cmdline, body, _ in blocks:
+        if STAMP.search(outs):
+            stamps += 1
+            continue
+        comp = component_of(outs, runtimes) or component_of(cmdline, runtimes) or "llvm"
+        err = next((l.strip() for l in body.splitlines() if re.search(r"\berror\b|undefined", l)), outs)
+        blamed.setdefault(comp, err[:240])
+    for m in re.finditer(r"^CMake Error at (\S+?):(\d+)", log_text, re.M):
+        # The error's own location first, then its call stack: a find_package()
+        # that fails inside cmake's modules was still CALLED from somebody's
+        # CMakeLists.txt, and that somebody is the component to blame.
+        chunk = log_text[m.end():m.end() + 1500]
+        chunk = chunk.split("\nCMake Error", 1)[0]
+        paths = [m.group(1)] + re.findall(r"^\s+(\S+?):\d+ \(", chunk, re.M)
+        tops = []
+        for path in paths:
+            if not os.path.isabs(path):
+                continue                      # relative = inside llvm/ (or runtimes/) itself
+            rel = os.path.relpath(path, src)
+            if not rel.startswith(".."):
+                tops.append(rel.split(os.sep)[0])
+        # chunk starts mid-line, at " (message):" -- the message is on the lines below it.
+        why = next((l.strip() for l in chunk.splitlines()[1:] if l.strip()), "cmake error")[:240]
+        comp = next((t for t in tops if t in optional), None) or \
+            next((t for t in tops if t not in ("cmake", "runtimes", "third-party", "utils", "llvm")), None) or "llvm"
+        blamed.setdefault(comp, why)
+    if not blamed and (stamps or blocks):
+        blamed["llvm"] = "a failure this tool cannot attribute to one component"
+    return blamed, oom
+
+
+# ------------------------------------------------------------------------ the plan
+
+STAGES = [  # (name, run, what)
+    ("source", 1, "fetch the source tree"),
+    ("tools", 1, "cmake and ninja new enough for this tree"),
+    ("stage1", 1, "host compiler -> clang + lld + profile runtime (native target, no LTO)"),
+    ("stage2-instrumented", 1, "stage1 -> an INSTRUMENTED clang + lld"),
+    ("train", 1, "the instrumented compiler builds LLVM; its profile is recorded"),
+    ("stage2", 1, "stage1 + profile -> a fast clang + lld to build the rest with"),
+    ("stage3", 2, "stage2 -> EVERYTHING: all projects, runtimes and targets, PGO + LTO"),
+    ("bolt", 2, "llvm-bolt instruments stage3's clang and lld; they build LLVM; the layout follows what ran"),
+    ("install", 2, "into the prefix, all at once"),
+    ("verify", 2, "compile, link and run with what was installed"),
+]
+NEEDS = {"stage2-instrumented": ["stage1"], "train": ["stage1", "stage2-instrumented"],
+         "stage2": ["stage1", "train"], "stage3": ["stage2", "train"], "bolt": ["stage3"],
+         "install": ["stage3", "bolt"], "verify": ["install"]}
+
+
+def stages_to_run(pipeline, selected, is_done, has_product):
+    """The selected stages that are not done -- plus any EARLIER stage one of them
+    needs whose product is gone.  Intermediate trees are removed once used (stage1
+    after stage2, the instrumented tree after training), so 'done' alone cannot
+    answer "can stage3 run?": the stage2 compiler has to actually be there."""
+    todo = [n for n in selected if not is_done(n)]
+    changed = True
+    while changed:
+        changed = False
+        for n in list(todo):
+            for dep in NEEDS.get(n, []):
+                if dep in pipeline and dep not in todo and not has_product(dep):
+                    todo.append(dep)
+                    changed = True
+    return [n for n in pipeline if n in todo]
+
+
+def with_profile_users(todo, selected, pipeline):
+    """A training that runs makes stage2 and stage3 stale -- they are built from
+    its profile -- so those of them that are selected run too, done or not."""
+    if "train" not in todo:
+        return todo
+    return [n for n in pipeline if n in todo or (n in selected and n in ("stage2", "stage3"))]
+
+
+def plan_jobs(opts, machine, host_kind):
+    """Compile and link jobs from the memory that is AVAILABLE, not installed: the
+    OOM killer takes the largest process, and on a shared machine that is
+    somebody else's job, not ours."""
+    cpus, avail = machine["cpus"], max(machine["mem_avail_gb"], 2.0)
+    jobs = opts["jobs"] or cpus
+    per = 1.6 if host_kind == "gcc" else 1.0
+    j = {"jobs": jobs,
+         "stage1_compile": max(1, min(jobs, int(avail / per))),
+         "compile": max(1, min(jobs, int(avail / 1.0))),
+         "link": max(1, min(jobs, int(avail / 4))),
+         "lto_link": max(1, min(jobs, int(avail / 15))),
+         "flang": max(1, min(jobs, int(avail / 4)))}
+    if opts["link_jobs"]:
+        j["link"] = j["lto_link"] = opts["link_jobs"]
+    return j
+
+
+# The x86-64 microarchitecture levels, by the CPUID feature bits the kernel lists
+# in /proc/cpuinfo -- the bits glibc's own x86-64-v2/v3/v4 checks read.  "abm" is
+# the kernel's name for LZCNT.  Each level requires the one below it.
+X86_LEVELS = (
+    ("x86-64-v2", ("cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3")),
+    ("x86-64-v3", ("avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave")),
+    ("x86-64-v4", ("avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl")),
+)
+
+
+def cpu_info(text=None):
+    text = read_text("/proc/cpuinfo") if text is None else text
+    m = re.search(r"^model name\s*:\s*(.+)$", text, re.M)
+    f = re.search(r"^flags\s*:\s*(.+)$", text, re.M)
+    return {"model": m.group(1).strip() if m else "", "flags": f.group(1).split() if f else []}
+
+
+def cpu_level(flags):
+    """-> the highest x86-64 level these CPU flags satisfy ('' below v2)."""
+    have, level = set(flags), ""
+    for name, need in X86_LEVELS:
+        if not all(f in have for f in need):
+            break
+        level = name
+    return level
+
+
+def native_cpu_name(c):
+    """What the stage0 compiler calls this CPU -- -march=native, resolved -- or ''.
+    Asked, not looked up: the compiler's table of CPU names is the one that counts."""
+    if not c:
+        return ""
+    try:
+        if c["kind"] == "clang":
+            o = run([c["path"], "-###", "-march=native", "-x", "c", "-c", os.devnull], check=False,
+                    env=scrubbed_env(), timeout=30).stdout or ""
+            m = re.search(r'"-target-cpu" "([^"]+)"', o)
+        else:
+            o = run([c["path"], "-march=native", "-Q", "--help=target"], check=False,
+                    env=scrubbed_env(), timeout=30).stdout or ""
+            m = re.search(r"-mtune=\s*(\S+)", o)
+    except ToolError:
+        return ""
+    name = m.group(1) if m else ""
+    return "" if name in ("native", "generic", "x86-64") else name
+
+
+def tree_knows_cpu(src, name):
+    """Whether the tree's own X86 table has this CPU name: a stage0 newer than
+    the tree may call the CPU something its clang would refuse in -mtune."""
+    if not name:
+        return True
+    for rel in ("llvm/lib/TargetParser/X86TargetParser.cpp", "llvm/lib/Support/X86TargetParser.cpp"):
+        text = read_text(os.path.join(src, rel))
+        if text:
+            return ('"%s"' % name) in text
+    return True
+
+
+def auto_tune(machine):
+    """-> (flags, why).  The level this CPU has, tuned for this CPU: the binaries
+    run on any machine of that level and are laid out for this one.  A LEVEL, not
+    the CPU's name: -march=haswell also licenses AES, RDRND, PCLMUL and INVPCID,
+    which no v3 check verifies.  Off x86-64, or below v2: portable."""
+    if machine.get("arch") != "x86_64":
+        return [], "no level scheme for %s here: portable (no -march)" % machine.get("arch", "?")
+    level = cpu_level(machine.get("cpu_flags", []))
+    if not level:
+        return [], "this CPU is below x86-64-v2: portable (no -march)"
+    tune = machine.get("cpu_tune") or "native"
+    return ["-march=" + level, "-mtune=" + tune], "%s is %s%s" % (
+        machine.get("cpu_model") or "this CPU", level, ", which the compiler calls " + tune if tune != "native" else "")
+
+
+def tune_flags(tune, host, machine=None):
+    """auto (default): the x86-64 level this CPU has, -mtune for this CPU.
+    portable: no -march, runs on any machine of this architecture."""
+    flags = []
+    if tune in ("", "auto"):
+        flags = auto_tune(machine or {})[0]
+    elif tune in ("portable", "generic"):
+        pass
+    elif tune == "native":
+        flags = ["-march=native"]
+    elif tune.startswith("-"):
+        flags = shlex.split(tune)
+    else:
+        flags = ["-march=" + tune]
+    # Stage1's clang was linked against THIS gcc's libstdc++; what it builds must
+    # use the same one -- not the newest installation clang finds by itself, which
+    # on Ubuntu may be a gcc-NN that a kernel package pulled in without libstdc++.
+    if host.get("gcc_install"):
+        flags.append("--gcc-install-dir=" + host["gcc_install"])
+    elif host.get("gcc_prefix"):
+        flags.append("--gcc-toolchain=" + host["gcc_prefix"])
+    return flags
+
+
+class Ctx(object):
+    """Everything a stage needs, resolved once."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    def d(self, stage):
+        return os.path.join(self.root, stage)
+
+    def log(self, name):
+        return os.path.join(self.root, "logs", name + ".log")
+
+    def env(self, extra=None):
+        return scrubbed_env([os.path.join(self.tools_dir, "bin")] + host_path(self.host, self.host.get("binutils_dir", "")), extra)
+
+    def base_args(self, cc, cxx, compile_jobs, link_jobs, bootstrapped):
+        a = ["-G", "Ninja", "-DCMAKE_MAKE_PROGRAM=" + self.ninja,
+             "-DCMAKE_BUILD_TYPE=Release", "-DLLVM_ENABLE_ASSERTIONS=OFF",
+             "-DCMAKE_C_COMPILER=" + cc, "-DCMAKE_CXX_COMPILER=" + cxx,
+             "-DPython3_EXECUTABLE=" + self.python["path"],
+             "-DLLVM_INCLUDE_BENCHMARKS=OFF", "-DLLVM_INCLUDE_EXAMPLES=OFF",
+             "-DLLVM_ENABLE_BINDINGS=OFF",
+             "-DLLVM_PARALLEL_COMPILE_JOBS=%d" % compile_jobs,
+             "-DLLVM_PARALLEL_LINK_JOBS=%d" % link_jobs]
+        if self.host.get("rpath"):
+            # A private gcc's libstdc++: every binary of every stage has to find it.
+            rp = "-Wl,-rpath," + self.host["rpath"]
+            a += ["-DCMAKE_EXE_LINKER_FLAGS=" + rp, "-DCMAKE_SHARED_LINKER_FLAGS=" + rp,
+                  "-DCMAKE_MODULE_LINKER_FLAGS=" + rp]
+        if bootstrapped:
+            b = os.path.dirname(cc)
+            a += ["-DLLVM_USE_LINKER=lld", "-DCMAKE_AR=" + os.path.join(b, "llvm-ar"),
+                  "-DCMAKE_RANLIB=" + os.path.join(b, "llvm-ranlib")]
+            if self.flags:
+                a += ["-DCMAKE_C_FLAGS=" + " ".join(self.flags), "-DCMAKE_CXX_FLAGS=" + " ".join(self.flags)]
+        return a
+
+    def compilers(self, stage):
+        b = os.path.join(self.d(stage), "bin")
+        return os.path.join(b, "clang"), os.path.join(b, "clang++")
+
+
+MINIMAL = ["-DLLVM_ENABLE_PROJECTS=clang;lld", "-DLLVM_TARGETS_TO_BUILD=Native",
+           "-DLLVM_INCLUDE_TESTS=OFF", "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
+           "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_ENABLE_LTO=OFF"]
+
+
+def minimal_args(tree):
+    """The bootstrap stages: clang and lld, nothing else.  LLVM 17-20 refuse
+    CLANG_ENABLE_STATIC_ANALYZER=OFF while ARCMT is on ("Cannot disable static
+    analyzer while enabling ARCMT"), so there ARCMT goes off with it; from 21
+    the variable is a deprecated alias that only warns, and is left alone."""
+    return MINIMAL + (["-DCLANG_ENABLE_ARCMT=OFF"] if tree.major <= 20 else [])
+
+
+def args_stage1(ctx):
+    h = ctx.host
+    a = ctx.base_args(h["path"], h["cxx"], ctx.jobs["stage1_compile"], ctx.jobs["link"], False) + minimal_args(ctx.tree)
+    # compiler-rt for ONE thing: libclang_rt.profile, which the instrumented
+    # stage2 links against.  Sanitizers, xray, fuzzer: stage3 builds those.
+    a += ["-DLLVM_ENABLE_RUNTIMES=compiler-rt" if ctx.pgo else "-DLLVM_ENABLE_RUNTIMES=",
+          "-DCOMPILER_RT_BUILD_SANITIZERS=OFF", "-DCOMPILER_RT_BUILD_XRAY=OFF",
+          "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF", "-DCOMPILER_RT_BUILD_MEMPROF=OFF",
+          "-DCOMPILER_RT_BUILD_ORC=OFF", "-DCOMPILER_RT_BUILD_GWP_ASAN=OFF",
+          "-DCOMPILER_RT_BUILD_CTX_PROFILE=OFF"]
+    linker = ctx.opts["host_linker"]
+    if linker == "default":
+        linker = "lld" if h["kind"] == "clang" and h.get("lld") else ""
+    if linker:
+        a.append("-DLLVM_USE_LINKER=" + linker)
+    return a
+
+
+VP_COUNTERS = ["-Xclang", "-mllvm", "-Xclang", "-vp-counters-per-site=6"]
+
+
+def args_stage2i(ctx):
+    cc, cxx = ctx.compilers("stage1")
+    a = ctx.base_args(cc, cxx, ctx.jobs["compile"], ctx.jobs["link"], True) + minimal_args(ctx.tree) + [
+        "-DLLVM_BUILD_INSTRUMENTED=IR", "-DLLVM_BUILD_RUNTIME=OFF",
+        "-DLLVM_PROFILE_DATA_DIR=" + os.path.join(ctx.root, "profiles-build")]
+    # The default (1.5 value-profile counters per site) runs out while clang compiles
+    # LLVM -- "Unable to track new values: Running out of static counters", 12,806
+    # times in one training run -- and what is lost is the indirect-call profile,
+    # which is what PGO devirtualises with.  LLVM has an option for this,
+    # LLVM_VP_COUNTERS_PER_SITE, but applies it ONLY under LLVM_LINK_LLVM_DYLIB and
+    # ignores it silently otherwise (found by setting it and counting the warnings
+    # again).  So the flag goes in directly -- and verify_configure() looks for it.
+    flags = " ".join(ctx.flags + VP_COUNTERS)
+    a = [x for x in a if not x.startswith(("-DCMAKE_C_FLAGS=", "-DCMAKE_CXX_FLAGS="))]
+    return a + ["-DCMAKE_C_FLAGS=" + flags, "-DCMAKE_CXX_FLAGS=" + flags]
+
+
+def args_stage2(ctx):
+    cc, cxx = ctx.compilers("stage1")
+    a = ctx.base_args(cc, cxx, ctx.jobs["compile"], ctx.jobs["link"], True) + minimal_args(ctx.tree)
+    if ctx.pgo:
+        a.append("-DLLVM_PROFDATA_FILE=" + ctx.profdata)
+    return a
+
+
+DEVICE_BACKEND = {"amdgcn": "AMDGPU", "nvptx": "NVPTX", "nvptx64": "NVPTX", "spirv": "SPIRV", "spirv32": "SPIRV",
+                  "spirv64": "SPIRV"}
+# libclc for every device target, as trunk's libclc/cmake/caches/all-targets.cmake
+# lists them -- for a release whose libclc is device-only but ships no such cache.
+DEVICE_FALLBACK = """set(LLVM_RUNTIME_TARGETS
+  amdgcn-amd-amdhsa-llvm
+  nvptx64-nvidia-cuda
+  spirv32-unknown-unknown
+  spirv64-unknown-unknown
+  spirv32-unknown-vulkan
+  spirv64-unknown-vulkan
+  CACHE STRING "")
+set(RUNTIMES_amdgcn-amd-amdhsa-llvm_LLVM_ENABLE_RUNTIMES "libclc" CACHE STRING "")
+set(RUNTIMES_nvptx64-nvidia-cuda_LLVM_ENABLE_RUNTIMES "libclc" CACHE STRING "")
+set(RUNTIMES_spirv64-unknown-unknown_LIBCLC_USE_SPIRV_BACKEND ON CACHE BOOL "")
+set(RUNTIMES_spirv32-unknown-unknown_LIBCLC_USE_SPIRV_BACKEND ON CACHE BOOL "")
+set(RUNTIMES_spirv32-unknown-unknown_LLVM_ENABLE_RUNTIMES "libclc" CACHE STRING "")
+set(RUNTIMES_spirv64-unknown-unknown_LLVM_ENABLE_RUNTIMES "libclc" CACHE STRING "")
+set(RUNTIMES_spirv32-unknown-vulkan_LLVM_ENABLE_RUNTIMES "libclc" CACHE STRING "")
+set(RUNTIMES_spirv64-unknown-vulkan_LLVM_ENABLE_RUNTIMES "libclc" CACHE STRING "")
+"""
+
+
+def device_runtimes(tree, runtimes, targets, all_targets):
+    """-> (host runtimes, cmake args, triples).
+
+    libclc is a DEVICE library: OpenCL's C library for GPUs and SPIR-V.  It has
+    no x86_64 (or aarch64...) variant, so in a trunk tree it cannot sit in the
+    host's LLVM_ENABLE_RUNTIMES -- "Unknown libclc target architecture: x86_64"
+    -- it is built once per device triple through LLVM_RUNTIME_TARGETS, with
+    RUNTIMES_<triple>_LLVM_ENABLE_RUNTIMES=libclc.  Which triples, and which
+    per-triple settings, the tree says itself: libclc/cmake/caches/all-targets.cmake.
+    (A tree without that file is an older one, where libclc builds as found.)"""
+    text = read_text(os.path.join(tree.src, "libclc", "cmake", "caches", "all-targets.cmake"))
+    if not text and getattr(tree, "libclc_device_only", False):
+        text = DEVICE_FALLBACK
+    if not text:
+        return list(runtimes), [], []
+    if "libclc" not in runtimes:
+        # Said explicitly: an earlier attempt's list of triples is otherwise still in the cache.
+        return list(runtimes), ["-DLLVM_RUNTIME_TARGETS=default"], []
+    built = list(all_targets) if targets == "all" else [] if targets == "Native" else targets.split(";")
+    triples = [t for t in (cmake_set(text, "LLVM_RUNTIME_TARGETS") or [])
+               if DEVICE_BACKEND.get(t.split("-")[0]) in built]
+    host = [r for r in runtimes if r != "libclc"]
+    if not triples:
+        return host, ["-DLLVM_RUNTIME_TARGETS=default"], []
+    args = ["-DLLVM_RUNTIME_TARGETS=default;" + ";".join(triples)]
+    for m in re.finditer(r"^[ \t]*set\(\s*(RUNTIMES_\S+)\s+\"?([^\"\s)]+)\"?", text, re.M):
+        var, value = m.group(1), m.group(2)
+        if any(var.startswith("RUNTIMES_%s_" % t) for t in triples):
+            args.append("-D%s=%s" % (var, value))
+    return host, args, triples
+
+
+def args_stage3(ctx, projects, runtimes, targets, experimental):
+    cc, cxx = ctx.compilers("stage2")
+    lto = ctx.lto != "off"
+    a = ctx.base_args(cc, cxx, ctx.jobs["compile"], ctx.jobs["lto_link" if lto else "link"], True)
+    host_runtimes, device_args, _ = device_runtimes(ctx.tree, runtimes, targets, ctx.tree.targets)
+    a += device_args
+    a += ["-DLLVM_ENABLE_PROJECTS=" + ";".join(projects),
+          "-DLLVM_ENABLE_RUNTIMES=" + ";".join(host_runtimes),
+          "-DLLVM_TARGETS_TO_BUILD=" + targets,
+          "-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=" + ";".join(experimental),
+          "-DCMAKE_INSTALL_PREFIX=" + ctx.prefix,
+          "-DLLVM_ENABLE_LTO=" + {"thin": "Thin", "full": "Full", "off": "OFF"}[ctx.lto],
+          "-DLLVM_INSTALL_UTILS=ON", "-DLLVM_BUILD_LLVM_DYLIB=ON",
+          "-DLLVM_INCLUDE_TESTS=" + ("ON" if ctx.check else "OFF")]
+    if ctx.link == "dylib":
+        a += ["-DLLVM_LINK_LLVM_DYLIB=ON", "-DCLANG_LINK_CLANG_DYLIB=ON"]
+    else:
+        a += ["-DLLVM_LINK_LLVM_DYLIB=OFF", "-DCLANG_LINK_CLANG_DYLIB=OFF"]
+    if ctx.pgo:
+        a.append("-DLLVM_PROFDATA_FILE=" + ctx.profdata)
+    if ctx.rtti:
+        a.append("-DLLVM_ENABLE_RTTI=ON")
+    if ctx.bolt:
+        hook = os.path.join(ctx.root, "bolt-relocs.cmake")
+        write_atomic(hook, BOLT_HOOK % (TOOL, " ".join(BOLT_TARGETS)))
+        a.append("-DCMAKE_PROJECT_INCLUDE=" + hook)
+    if ctx.machine["headers"].get("binutils"):
+        a.append("-DLLVM_BINUTILS_INCDIR=/usr/include")
+    if "flang" in projects:
+        a.append("-DFLANG_PARALLEL_COMPILE_JOBS=%d" % ctx.jobs["flang"])
+    return a
+
+
+def configure(ctx, stage, args, src_subdir="llvm", build_dir=None):
+    bdir = build_dir or ctx.d(stage)
+    os.makedirs(bdir, exist_ok=True)
+    os.makedirs(os.path.join(ctx.root, "logs"), exist_ok=True)
+    log = ctx.log(os.path.basename(bdir) + ".configure")
+    cmd = [ctx.cmake] + args + [os.path.join(ctx.tree.src, src_subdir)]
+    rc, _ = run_logged(cmd, bdir, ctx.env(), log, "configure", ctx.verbose)
+    return rc, log
+
+
+def verify_configure(bdir, wants):
+    """Each of these can fail SILENTLY and cost the whole build: a profile that was
+    not picked up gives an ordinary compiler after hours of work.  So the proof
+    is looked for where it matters -- in the commands ninja is about to run."""
+    left = dict(wants)
+    # The Ninja generator keeps the COMPILER in CMakeFiles/rules.ninja (the rules)
+    # and the FLAGS in build.ninja (one set per edge): both are "what ninja will run".
+    for name in (os.path.join("CMakeFiles", "rules.ninja"), "build.ninja"):
+        try:
+            with open(os.path.join(bdir, name), "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    for label in [l for l, needle in left.items() if needle in line]:
+                        ok("configured : %s" % label)
+                        del left[label]
+                    if not left:
+                        break
+        except OSError:
+            pass
+    for label in sorted(left):
+        bad("configured : %s  -- NOT in what ninja will run (looked for %s)" % (label, left[label]))
+    return not left
+
+
+def ninja(ctx, stage, targets, jobs, keep_going=False, build_dir=None, extra_env=None, tag="build"):
+    bdir = build_dir or ctx.d(stage)
+    log = ctx.log(os.path.basename(bdir) + "." + tag)
+    cmd = [ctx.ninja, "-j", str(jobs)] + (["-k", "0"] if keep_going else []) + list(targets)
+    rc, stats = run_logged(cmd, bdir, ctx.env(extra_env), log, stage, ctx.verbose)
+    return rc, stats, log
+
+
+def fail(stage, log, what="the build", resumes=True):
+    bad("%s of %s failed.  First errors in the log:" % (what, stage))
+    for h in error_summary(log):
+        out("  " + h)
+    raise ToolError("%s failed -- full log: %s\n  %s" % (stage, log,
+                    "Re-running `build` continues from this stage, incrementally." if resumes else
+                    "Re-running `build` does this stage again from the start."))
+
+
+def ninja_with_retries(ctx, stage, targets, jobs, build_dir=None, extra_env=None, resumes=True):
+    """ninja, and again with half the jobs when a job was killed for memory; a full
+    disk stops at once, blamed on nobody."""
+    for attempt in (1, 2, 3):
+        rc, stats, log = ninja(ctx, stage, targets, jobs, build_dir=build_dir, extra_env=extra_env)
+        if rc == 0:
+            return stats
+        text = read_text(log)
+        if disk_full(text):
+            raise ToolError("the disk is full where %s builds (%s).  Nothing was dropped: make room and run "
+                            "`build` again." % (stage, build_dir or ctx.d(stage)))
+        _, oom = blame(text, ctx.tree.src, [])
+        if not oom or jobs == 1 or attempt == 3:
+            fail(stage, log, resumes=resumes)
+        jobs = max(1, jobs // 2)
+        warn("%s: a job was killed for memory -- retrying with -j%d" % (stage, jobs))
+
+
+def simple_stage(ctx, stage, args, wants=None):
+    rc, clog = configure(ctx, stage, args)
+    if rc != 0:
+        fail(stage, clog, "the configure")
+    if wants and not verify_configure(ctx.d(stage), wants):
+        raise ToolError("the configure of %s degraded silently -- see %s" % (stage, clog))
+    return ninja_with_retries(ctx, stage, ["all"], ctx.jobs["jobs"])
+
+
+# ------------------------------------------------------------------------ stages
+
+def do_stage1(ctx):
+    simple_stage(ctx, "stage1", args_stage1(ctx))
+    cc, _ = ctx.compilers("stage1")
+    banner = run([cc, "--version"], env=ctx.env()).stdout.splitlines()[0]
+    ok("stage1: %s" % banner)
+    if ctx.pgo and not glob.glob(os.path.join(ctx.d("stage1"), "lib", "clang", "*", "lib", "*", "libclang_rt.profile*")):
+        raise ToolError("stage1 has no libclang_rt.profile -- the instrumented stage cannot link without it")
+
+
+def do_stage2i(ctx):
+    simple_stage(ctx, "stage2-instrumented", args_stage2i(ctx),
+                 {"built by stage1's clang": ctx.compilers("stage1")[1], "instrumented": "-fprofile-generate",
+                  "6 value-profile counters per site": "-vp-counters-per-site=6"})
+    # The instrumented tablegen ran during that build and left ITS profile behind.
+    shutil.rmtree(os.path.join(ctx.root, "profiles-build"), ignore_errors=True)
+    ok("stage2-instrumented: built; the build's own profile data discarded")
+
+
+def do_train(ctx):
+    """The workload is LLVM itself: heavy, real C++, present on every machine this
+    runs on, and built with the instrumented clang AND linked with the
+    instrumented lld.  A second, small -O0 -g pass covers the debug-info paths a
+    Release build never touches."""
+    cc, cxx = ctx.compilers("stage2-instrumented")
+    prof = os.path.join(ctx.root, "profiles")
+    shutil.rmtree(prof, ignore_errors=True)
+    os.makedirs(prof)
+    penv = {"LLVM_PROFILE_FILE": os.path.join(prof, "train-%6m.profraw")}
+    common = ["-G", "Ninja", "-DCMAKE_MAKE_PROGRAM=" + ctx.ninja, "-DCMAKE_C_COMPILER=" + cc,
+              "-DCMAKE_CXX_COMPILER=" + cxx, "-DLLVM_USE_LINKER=lld",
+              "-DPython3_EXECUTABLE=" + ctx.python["path"], "-DLLVM_TARGETS_TO_BUILD=Native",
+              "-DLLVM_INCLUDE_TESTS=OFF", "-DLLVM_INCLUDE_BENCHMARKS=OFF", "-DLLVM_INCLUDE_EXAMPLES=OFF",
+              "-DLLVM_ENABLE_BINDINGS=OFF", "-DLLVM_ENABLE_ZSTD=OFF", "-DLLVM_ENABLE_LIBXML2=OFF",
+              "-DLLVM_PARALLEL_LINK_JOBS=%d" % ctx.jobs["link"]]
+    for name, btype, targets in (("train-release", "Release", ["all"]),
+                                 ("train-debug", "Debug", ["LLVMSupport", "LLVMDemangle", "llvm-tblgen"])):
+        bdir = ctx.d(name)
+        shutil.rmtree(bdir, ignore_errors=True)
+        os.makedirs(bdir)
+        log = ctx.log(name + ".configure")
+        rc, _ = run_logged([ctx.cmake] + common + ["-DCMAKE_BUILD_TYPE=" + btype,
+                                                   os.path.join(ctx.tree.src, "llvm")],
+                           bdir, ctx.env(penv), log, "configure", ctx.verbose)
+        if rc != 0:
+            fail(name, log, "the configure", resumes=False)
+        stats = ninja_with_retries(ctx, name, targets, ctx.jobs["compile"], build_dir=bdir, extra_env=penv, resumes=False)
+        ok("%s: %d steps in %s" % (name, stats["steps"], hms(stats["seconds"])))
+    raws = glob.glob(os.path.join(prof, "*.profraw"))
+    if not raws:
+        raise ToolError("training produced no .profraw in %s -- the compiler was not instrumented?" % prof)
+    profdata_tool = os.path.join(ctx.d("stage1"), "bin", "llvm-profdata")
+    run([profdata_tool, "merge", "-output=" + ctx.profdata + ".tmp"] + raws, env=ctx.env(), timeout=7200)
+    os.replace(ctx.profdata + ".tmp", ctx.profdata)
+    show = run([profdata_tool, "show", ctx.profdata], check=False, env=ctx.env()).stdout or ""
+    funcs = re.search(r"Total functions: (\d+)", show)
+    ok("profile: %s from %d raw files, %s functions"
+       % (human(os.path.getsize(ctx.profdata)), len(raws), funcs.group(1) if funcs else "?"))
+    if os.path.getsize(ctx.profdata) < 100 * 1024:
+        raise ToolError("the merged profile is implausibly small: %s" % ctx.profdata)
+    for stale in ("stage2", "stage3"):
+        # Trained again (--from train): every object in these was compiled with the
+        # profile that was just replaced, and ninja would not know to recompile them.
+        if os.path.isdir(ctx.d(stale)):
+            shutil.rmtree(ctx.d(stale), ignore_errors=True)
+            note("removed the %s tree: its objects were compiled with the previous profile" % stale)
+    for n in ("stage2", "stage3", "bolt", "install", "verify"):
+        if ctx.state.done(n):                                # whatever was made from the old profile is to be made again
+            ctx.state.set_stage(n, status="pending")
+    if not ctx.keep_stages:
+        for name in ("stage2-instrumented", "train-release", "train-debug", "profiles"):
+            shutil.rmtree(ctx.d(name), ignore_errors=True)
+        note("removed the instrumented and training build directories (--keep-stages keeps them)")
+
+
+def do_stage2(ctx):
+    wants = {"built by stage1's clang": ctx.compilers("stage1")[1]}
+    if ctx.pgo:
+        wants["uses the recorded profile"] = os.path.basename(ctx.profdata)
+    simple_stage(ctx, "stage2", args_stage2(ctx), wants)
+    cc, _ = ctx.compilers("stage2")
+    ok("stage2: %s" % run([cc, "--version"], env=ctx.env()).stdout.splitlines()[0])
+    if not ctx.keep_stages:
+        shutil.rmtree(ctx.d("stage1"), ignore_errors=True)
+        note("removed stage1 (--keep-stages keeps it)")
+
+
+def do_stage3(ctx):
+    """EVERYTHING -- and the one stage that is allowed to lose a component."""
+    jobs = ctx.jobs["jobs"]
+    for attempt in range(1, 16):
+        projects, runtimes, targets, experimental, skipped = select_components(
+            ctx.tree, ctx.machine, ctx.python, ctx.opts, ctx.state.d["dropped"])
+        say("stage3, attempt %d: %d projects, %d runtimes, targets %s%s"
+            % (attempt, len(projects), len(runtimes), targets,
+               " + " + ",".join(experimental) if experimental else ""))
+        info("projects : " + " ".join(projects))
+        info("runtimes : " + " ".join(runtimes))
+        triples = device_runtimes(ctx.tree, runtimes, targets, ctx.tree.targets)[2]
+        if triples:
+            info("libclc   : per device target -- " + " ".join(triples))
+        rc, clog = configure(ctx, "stage3", args_stage3(ctx, projects, runtimes, targets, experimental))
+        log = clog
+        if rc == 0:
+            wants = {"built by stage2's clang": ctx.compilers("stage2")[1]}
+            if ctx.pgo:
+                wants["uses the recorded profile"] = os.path.basename(ctx.profdata)
+            if ctx.lto != "off":
+                wants["LTO (%s)" % ctx.lto] = "-flto=%s" % ctx.lto if ctx.lto == "thin" else "-flto"
+            if ctx.bolt:
+                wants["relocations kept for BOLT (clang, lld)"] = "--emit-relocs"
+            if not verify_configure(ctx.d("stage3"), wants):
+                raise ToolError("the configure of stage3 degraded silently -- see %s" % clog)
+        if rc == 0:
+            rc, stats, log = ninja(ctx, "stage3", ["all"], jobs, keep_going=True)
+            if rc == 0:
+                host_runtimes = device_runtimes(ctx.tree, runtimes, targets, ctx.tree.targets)[0]
+                ctx.state.d["built"] = {"projects": projects,
+                                        "runtimes": [r for r in runtimes if r != "libclc" or triples or r in host_runtimes],
+                                        "targets": targets, "experimental": experimental, "device_triples": triples}
+                ctx.state.save()
+                return
+        text = read_text(log)
+        if disk_full(text):
+            raise ToolError("the disk is full where stage3 builds (%s).  Nothing was dropped: make room and run "
+                            "`build` again." % ctx.d("stage3"))
+        blamed, oom = blame(text, ctx.tree.src, ctx.tree.runtimes,
+                            [c for c in projects + runtimes if c not in CORE])
+        if oom and jobs > 1:
+            jobs = max(1, jobs // 2)
+            ctx.jobs["compile"] = max(1, ctx.jobs["compile"] // 2)
+            ctx.jobs["flang"] = max(1, ctx.jobs["flang"] // 2)
+            ctx.jobs["lto_link"] = ctx.jobs["link"] = 1
+            warn("stage3: a job was killed for memory -- retrying with -j%d, one link at a time" % jobs)
+            continue
+        fatal = [c for c in blamed if c in CORE or
+                 (c.startswith("target:") and c[7:] not in ctx.tree.experimental)
+                 or (not c.startswith("target:") and c not in projects and c not in runtimes)]
+        if fatal or not blamed:
+            fail("stage3", log)
+        for comp, why in sorted(blamed.items()):
+            for n in with_dependents([comp]):
+                if n in projects or n in runtimes or n.startswith("target:"):
+                    ctx.state.d["dropped"][n] = why if n == comp else "needs %s" % comp
+                    warn("dropping %s: %s" % (n, ctx.state.d["dropped"][n]))
+        ctx.state.save()
+    raise ToolError("stage3 did not settle after 15 attempts -- see %s" % ctx.log("stage3.build"))
+
+
+# --------------------------------------------------------------------------- bolt
+
+BOLT_INSTRUMENT = ["-instrument", "--instrumentation-file-append-pid"]
+# lld leaves through _Exit() -- "no memory cleanup on exit", lld/tools/lld/lld.cpp --
+# which skips the hook BOLT's runtime writes its profile from.  For lld a watcher
+# process writes the counters every second instead, and once more when lld is gone
+# (that last write happens only with no-counters-clear: bolt/runtime/instr.cpp).
+BOLT_INSTRUMENT_EXTRA = {"lld": ["--instrumentation-sleep-time=1", "--instrumentation-no-counters-clear"]}
+# What decides the layout: block order within a function, function order in the
+# binary, cold code split away -- exactly the set clang's own CLANG_BOLT machinery
+# applies (clang/utils/perf-training/perf-helper.py).
+BOLT_OPTIMISE = ["-reorder-blocks=ext-tsp", "-reorder-functions=cdsort", "-split-functions", "-split-all-cold",
+                 "-split-eh", "-dyno-stats", "-use-gnu-stack", "-update-debug-sections"]
+# The workload: LLVM again, for the PGO training's reasons, but only as far as
+# llvm-dis (Support, Core, the readers: ~450 files).  A layout profile needs far
+# fewer runs than PGO, and each instrumented compile writes ~90 MB of profile that
+# the merger folds as it goes.  Then the same through a ThinLTO link: lld's
+# heaviest path, the one every PGO + LTO build (this tool's own stage3, a `make`
+# with -flto=thin) sends it down.
+BOLT_TRAINING = (  # (directory, extra cmake arguments, ninja targets)
+    ("bolt-train-release", [], ["llvm-dis"]),
+    ("bolt-train-lto", ["-DLLVM_ENABLE_LTO=Thin"], ["llvm-dis"]),
+)
+# A heavy file the training tree has the generated headers for (LLVMCore is in llvm-dis).
+BOLT_BENCH_TU = "lib/IR/CMakeFiles/LLVMCore.dir/Verifier.cpp.o"
+
+
+def elf_sections(path, readelf):
+    if not os.path.isfile(path) or not os.access(readelf, os.X_OK):
+        return ""
+    try:
+        p = run([readelf, "--sections", path], check=False, env=scrubbed_env(), timeout=120)
+    except ToolError:
+        return ""
+    return (p.stdout or "") if p.returncode == 0 else ""
+
+
+BOLT_MARKS = (".note.bolt_info", ".bolt.org.text")
+
+
+def has_bolt_mark(path, readelf):
+    """BOLT leaves two marks in every binary it writes: a .note.bolt_info section,
+    which llvm-strip removes (--strip does), and the original code renamed to
+    .bolt.org.text, which stays."""
+    secs = elf_sections(path, readelf)
+    return any(m in secs for m in BOLT_MARKS)
+
+
+def has_relocs(path, readelf):
+    secs = elf_sections(path, readelf)
+    return ".rela.text" in secs or ".rel.text" in secs
+
+
+def bolt_binaries(bindir):
+    """{clang: <bindir>/clang-24, lld: <bindir>/lld}: the FILES behind the names."""
+    found = {}
+    for name in BOLT_TARGETS:
+        real = os.path.realpath(os.path.join(bindir, name))
+        if os.path.isfile(real) and os.path.dirname(real) == os.path.realpath(bindir):
+            found[name] = real
+    return found
+
+
+def bolt_applied(ctx):
+    """The product of the bolt stage, read from the binaries themselves: a stage3
+    that relinked clang (--retry-dropped) has silently undone it."""
+    bindir = os.path.join(ctx.d("stage3"), "bin")
+    bins = bolt_binaries(bindir)
+    return len(bins) == len(BOLT_TARGETS) and \
+        all(has_bolt_mark(p, os.path.join(bindir, "llvm-readelf")) for p in bins.values())
+
+
+def bolt_stats(log_text):
+    m = re.search(r"BOLT-INFO: (\d+) out of (\d+) functions in the binary \(([\d.]+)%\) have non-empty "
+                  r"execution profile", log_text)
+    return "%s of %s functions profiled (%s%%)" % (m.group(1), m.group(2), m.group(3)) if m else ""
+
+
+def bolt_summary(ctx):
+    rec = ctx.state.d.get("bolt") or {}
+    if not ctx.bolt:
+        return "off (%s)" % ctx.bolt_why
+    if rec.get("skipped"):
+        return "skipped -- " + rec["skipped"]
+    if not rec.get("optimised"):
+        return "not run"
+    parts = ["%s (%s)" % (n, s) if s else n for n, s in sorted(rec["optimised"].items())]
+    return "post-link layout by llvm-bolt: %s%s" % ("; ".join(parts),
+                                                     "; " + rec["benchmark"] if rec.get("benchmark") else "")
+
+
+class FdataMerger(object):
+    """Folds BOLT's instrumentation output into one file WHILE the training runs.
+
+    Every instrumented process writes its own <name>.<pid>.fdata when it exits --
+    tens of MB each, a couple of thousand processes in a training build: left
+    until the end that is tens of GB.  So every minute a thread merges the ones
+    that are finished -- untouched for 30 s; the runtime writes a file in one go
+    at exit -- and the last round runs after ninja, when no process is left."""
+
+    SETTLED, BATCH = 30, 200
+
+    def __init__(self, merge_tool, raw_dir, out_dir, names, env):
+        self.tool, self.raw, self.env = merge_tool, raw_dir, env
+        self.merged = dict((n, os.path.join(out_dir, n + ".fdata")) for n in names)
+        self.counts = dict((n, 0) for n in names)
+        self.errors = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop)
+        self._thread.daemon = True
+
+    def fold(self, final=False):
+        for name, out_path in sorted(self.merged.items()):
+            files = sorted(glob.glob(os.path.join(self.raw, name + ".*.fdata")))
+            if not final:
+                cutoff, settled = time.time() - self.SETTLED, []
+                for f in files:
+                    try:
+                        if os.path.getmtime(f) < cutoff:
+                            settled.append(f)
+                    except OSError:
+                        pass
+                files = settled
+            for i in range(0, len(files), self.BATCH):
+                self._merge(name, out_path, files[i:i + self.BATCH])
+
+    def _merge(self, name, out_path, batch):
+        inputs = ([out_path] if os.path.exists(out_path) else []) + batch
+        tmp = out_path + ".tmp"
+        with open(tmp, "wb") as f:                          # merge-fdata writes the result to stdout
+            p = subprocess.run([self.tool] + inputs, stdout=f, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                               env=self.env, universal_newlines=True, errors="replace")
+        if p.returncode != 0:
+            os.unlink(tmp)
+            if len(self.errors) < 20:
+                self.errors.append("merge-fdata (%s): %s" % (name, (p.stderr or "").strip()[-300:]))
+            return
+        os.replace(tmp, out_path)
+        for f in batch:
+            os.unlink(f)
+        self.counts[name] += len(batch)
+
+    def _loop(self):
+        while not self._stop.wait(60):
+            try:
+                self.fold()
+            except Exception as e:                            # the thread must not die quietly
+                if len(self.errors) < 20:
+                    self.errors.append(str(e))
+
+    def start(self):
+        self._thread.start()
+
+    def finish(self):
+        self._stop.set()
+        self._thread.join()
+        self.fold(final=True)
+
+    def abort(self):
+        """Stop folding; what is left in the raw directory stays there."""
+        self._stop.set()
+        self._thread.join()
+
+
+def bolt_benchmark(ctx, train_dir, before, after, env):
+    """Best of two compiles of one heavy LLVM file with the command the training
+    build used -- the same flags, only the compiler swapped.  -> text, or ''."""
+    try:
+        p = run([ctx.ninja, "-C", train_dir, "-t", "commands", BOLT_BENCH_TU], env=env, check=False, timeout=600)
+        lines = [l for l in (p.stdout or "").splitlines() if BOLT_BENCH_TU in l]
+        if p.returncode != 0 or not lines:
+            return ""
+        words = shlex.split(lines[-1])
+        while words and words[0] in (":", "&&"):
+            words.pop(0)
+        while words and words[-1] in (":", "&&"):
+            words.pop()
+        if len(words) < 2:
+            return ""
+        d = tempfile.mkdtemp(prefix="ect-bench-")
+        try:
+            for flag in ("-o", "-MF"):
+                if flag in words:
+                    words[words.index(flag) + 1] = os.path.join(d, flag[1:] + ".out")
+            took = {}
+            for label, cc in (("before", before), ("after", after)):
+                best = None
+                for _ in (1, 2):
+                    t0 = time.time()
+                    if run(cc + words[1:], cwd=train_dir, env=env, check=False, timeout=1800).returncode != 0:
+                        return ""
+                    best = min(best or 1e9, time.time() - t0)
+                took[label] = best
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return "%.2fx -- %s compiles in %.1f s, was %.1f s" % (
+            took["before"] / max(took["after"], 1e-6), os.path.basename(BOLT_BENCH_TU)[:-2], took["after"], took["before"])
+    except (ToolError, OSError, ValueError):
+        return ""
+
+
+def bolt_smoke_test(bindir, env, scratch=None):
+    """-> '' when clang + lld build and run a C program, else what went wrong."""
+    d = tempfile.mkdtemp(prefix="ect-bolt-", dir=scratch)
+    try:
+        src, exe = os.path.join(d, "h.c"), os.path.join(d, "h")
+        with open(src, "w") as f:
+            f.write(C_HELLO)
+        p = run([os.path.join(bindir, "clang"), "-fuse-ld=lld", src, "-o", exe], env=env, check=False, timeout=600)
+        if p.returncode != 0:
+            return (p.stdout or "").strip()[-1500:] or "compile/link failed"
+        o = run([exe], env=env, check=False, timeout=60).stdout or ""
+        return "" if "ok-c" in o else "the program printed %r" % o[:80]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def bolt_restore(bins, names):
+    for name in names:
+        if os.path.exists(bins[name] + ".prebolt"):
+            os.replace(bins[name] + ".prebolt", bins[name])
+
+
+def do_bolt(ctx):
+    """The two executables every build runs, clang and lld, laid out by llvm-bolt
+    -- the one stage3 just built.  Each is INSTRUMENTED, the pair builds LLVM
+    (lld once more through a ThinLTO link), and the originals are rewritten by
+    what ran: hot code together, cold code split away.  PGO and LTO decided what
+    the code IS; this decides where it SITS.  The originals stay beside the result
+    as <name>.prebolt, and the mark BOLT leaves -- a .note.bolt_info section -- is
+    what `verify` and a resumed build look for."""
+    s3 = ctx.d("stage3")
+    bindir = os.path.join(s3, "bin")
+    tools = dict((n, os.path.join(bindir, n)) for n in ("llvm-bolt", "merge-fdata", "llvm-readelf"))
+    missing = sorted(n for n, p in tools.items() if not os.access(p, os.X_OK))
+    if missing:
+        why = "stage3 has no %s -- the bolt project was not built" % ", ".join(missing)
+        ctx.state.d["bolt"] = {"skipped": why}
+        ctx.state.save()
+        note("bolt: skipped -- " + why)
+        return
+    rt = glob.glob(os.path.join(s3, "lib", "libbolt_rt_instr.a")) or \
+        glob.glob(os.path.join(s3, "tools", "bolt", "**", "libbolt_rt_instr.a"), recursive=True)
+    if not rt:
+        raise ToolError("stage3 has llvm-bolt but no libbolt_rt_instr.a: it cannot instrument anything")
+    bins = bolt_binaries(bindir)
+    for name in BOLT_TARGETS:
+        if name not in bins:
+            raise ToolError("stage3 has no %s to optimise" % name)
+    todo = [n for n in BOLT_TARGETS if not has_bolt_mark(bins[n], tools["llvm-readelf"])]
+    if not todo:
+        ok("bolt: %s already carry BOLT's mark -- nothing to do" % " and ".join(BOLT_TARGETS))
+        return
+    if "bolt-relocs.cmake" not in read_text(os.path.join(s3, "CMakeCache.txt")):
+        note("stage3 was configured before this stage existed: reconfiguring it, which relinks clang and lld "
+             "with their relocations kept (minutes)")
+        do_stage3(ctx)
+        bins = bolt_binaries(bindir)
+    for n in todo:
+        if not has_relocs(bins[n], tools["llvm-readelf"]):
+            raise ToolError("%s was linked without its relocations, which BOLT needs: the --emit-relocs hook of "
+                            "the stage3 configure did not take (see %s)" % (bins[n], ctx.log("stage3.configure")))
+    root = os.path.join(ctx.root, "bolt")
+    inst, raw = os.path.join(root, "inst"), os.path.join(root, "raw")
+    os.makedirs(os.path.join(ctx.root, "logs"), exist_ok=True)
+    for d in (inst, raw):
+        shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.join(inst, "bin"))
+    os.makedirs(raw)
+    # clang finds its headers in <its own directory>/../lib/clang/<ver> and ld.lld
+    # beside itself: the instrumented pair gets a bin/ of its own, with stage3's lib/.
+    os.symlink(os.path.join(s3, "lib"), os.path.join(inst, "lib"))
+    for name in BOLT_TARGETS:
+        real = bins[name]
+        inst_real = os.path.join(inst, "bin", os.path.basename(real))
+        if name in todo:
+            log = ctx.log("bolt.instrument-" + name)
+            rc, _ = run_logged([tools["llvm-bolt"], real, "-o", inst_real,
+                                "--instrumentation-file=" + os.path.join(raw, name),
+                                "--runtime-instrumentation-lib=" + rt[0]] + BOLT_INSTRUMENT
+                               + BOLT_INSTRUMENT_EXTRA.get(name, []),
+                               s3, ctx.env(), log, "bolt: instrumenting " + name, ctx.verbose)
+            if rc != 0:
+                fail("bolt", log, "the instrumentation of " + name, resumes=False)
+            ok("%s instrumented" % name)
+        else:
+            # Already laid out: used as it is, but as a file HERE -- clang resolves
+            # itself through /proc/self/exe and looks for ld.lld beside that.
+            try:
+                os.link(real, inst_real)
+            except OSError:
+                shutil.copy2(real, inst_real)
+        for entry in os.listdir(bindir):                      # every name that leads to it: clang++, ld.lld...
+            p = os.path.join(bindir, entry)
+            if os.path.islink(p) and os.path.realpath(p) == real:
+                os.symlink(os.path.basename(real), os.path.join(inst, "bin", entry))
+    cc, cxx = os.path.join(inst, "bin", "clang"), os.path.join(inst, "bin", "clang++")
+    for p in (cc, cxx, os.path.join(inst, "bin", "ld.lld")):
+        if not os.path.exists(p):
+            raise ToolError("the instrumented tree lacks %s" % p)
+    common = ["-G", "Ninja", "-DCMAKE_MAKE_PROGRAM=" + ctx.ninja, "-DCMAKE_BUILD_TYPE=Release",
+              "-DCMAKE_C_COMPILER=" + cc, "-DCMAKE_CXX_COMPILER=" + cxx, "-DLLVM_USE_LINKER=lld",
+              "-DCMAKE_AR=" + os.path.join(bindir, "llvm-ar"), "-DCMAKE_RANLIB=" + os.path.join(bindir, "llvm-ranlib"),
+              "-DPython3_EXECUTABLE=" + ctx.python["path"], "-DLLVM_TARGETS_TO_BUILD=Native",
+              "-DLLVM_INCLUDE_TESTS=OFF", "-DLLVM_INCLUDE_BENCHMARKS=OFF", "-DLLVM_INCLUDE_EXAMPLES=OFF",
+              "-DLLVM_ENABLE_BINDINGS=OFF", "-DLLVM_ENABLE_ZSTD=OFF", "-DLLVM_ENABLE_LIBXML2=OFF",
+              "-DLLVM_PARALLEL_LINK_JOBS=%d" % ctx.jobs["link"]]
+    merger = FdataMerger(tools["merge-fdata"], raw, root, BOLT_TARGETS, ctx.env())
+    for name in todo:
+        if os.path.exists(merger.merged[name]):
+            os.unlink(merger.merged[name])                    # an earlier attempt's: not this binary's
+    merger.start()
+    try:
+        for name, extra, targets in BOLT_TRAINING:
+            bdir = os.path.join(root, name)
+            shutil.rmtree(bdir, ignore_errors=True)
+            os.makedirs(bdir)
+            log = ctx.log(name + ".configure")
+            rc, _ = run_logged([ctx.cmake] + common + extra + [os.path.join(ctx.tree.src, "llvm")],
+                               bdir, ctx.env(), log, "configure", ctx.verbose)
+            if rc != 0:
+                fail(name, log, "the configure", resumes=False)
+            stats = ninja_with_retries(ctx, name, targets, ctx.jobs["compile"], build_dir=bdir, resumes=False)
+            ok("%s: %d steps in %s" % (name, stats["steps"], hms(stats["seconds"])))
+    except BaseException:
+        merger.abort()                                        # not the final merge: the training is incomplete
+        raise
+    merger.finish()
+    for e in merger.errors[:5]:
+        warn(e)
+    for name in todo:
+        merged = merger.merged[name]
+        if merger.counts[name] == 0 or not os.path.exists(merged) or os.path.getsize(merged) < 64 * 1024:
+            raise ToolError("the training left no usable profile for %s (%d processes recorded) -- see %s"
+                            % (name, merger.counts[name], ctx.log(BOLT_TRAINING[0][0] + ".build")))
+        info("%s: profile from %d processes, %s" % (name, merger.counts[name], human(os.path.getsize(merged))))
+    record = ctx.state.d.get("bolt") or {}
+    record.pop("skipped", None)
+    record.setdefault("optimised", {})
+    record.setdefault("training", {}).update(dict((n, merger.counts[n]) for n in todo))
+    swapped = []
+    try:
+        for name in todo:
+            real = bins[name]
+            out_bin = os.path.join(root, os.path.basename(real) + ".bolt")
+            log = ctx.log("bolt.optimise-" + name)
+            rc, _ = run_logged([tools["llvm-bolt"], real, "-o", out_bin, "-data=" + merger.merged[name]] + BOLT_OPTIMISE,
+                               s3, ctx.env(), log, "bolt: laying out " + name, ctx.verbose)
+            if rc != 0 or not os.path.exists(out_bin):
+                fail("bolt", log, "the optimisation of " + name, resumes=False)
+            if not has_bolt_mark(out_bin, tools["llvm-readelf"]):
+                raise ToolError("llvm-bolt wrote %s without its .note.bolt_info mark -- see %s" % (out_bin, log))
+            swapped.append(name)                              # from here on, restore puts the original back
+            os.replace(real, real + ".prebolt")
+            os.replace(out_bin, real)
+            os.chmod(real, 0o755)
+            record["optimised"][name] = bolt_stats(read_text(log))
+            ctx.state.d["bolt"] = record                      # the record follows each swap: a ^C must not lose it
+            ctx.state.save()
+            ok("%s: %s" % (name, record["optimised"][name] or "laid out"))
+        # The pair must still work together before anything else is built with them.
+        trouble = bolt_smoke_test(bindir, ctx.env(), root)
+    except BaseException:
+        bolt_restore(bins, swapped)                           # a failure on lld must not leave a laid-out clang alone
+        raise
+    if trouble:
+        bolt_restore(bins, todo)
+        raise ToolError("the BOLT-optimised clang + lld cannot build and run a C program -- the originals are "
+                        "back in place:\n%s" % trouble)
+    ok("the optimised clang and lld compile, link and run a program")
+    if "clang" in todo:
+        bench = bolt_benchmark(ctx, os.path.join(root, BOLT_TRAINING[0][0]),
+                               [bins["clang"] + ".prebolt", "--driver-mode=g++"], [os.path.join(bindir, "clang++")],
+                               ctx.env())
+        record["benchmark"] = bench
+        if bench:
+            ok("clang: " + bench)
+        else:
+            note("the before/after timing could not be run -- not a failure")
+    ctx.state.d["bolt"] = record
+    ctx.state.save()
+    if not ctx.keep_stages:
+        for name in ["inst", "raw"] + [n for n, _, _ in BOLT_TRAINING]:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+        note("removed the instrumented pair and the training trees (--keep-stages keeps them); the profiles stay in %s"
+             % root)
+
+
+def install_errors(log_text, runtimes):
+    """-> {component: what went wrong}, from an install log whose ninja exited 0.
+
+    LLVM installs the runtimes by running their cmake_install.cmake through
+    execute_process(), and does not look at the result: a runtime whose install
+    script dies -- trunk 3c2eaf39's orc-rt lists a header as `CoreTyspe.h` --
+    prints "CMake Error", installs a fragment of itself, and `ninja install`
+    still exits 0.  The exit code is not the truth; the log is."""
+    found = {}
+    for m in re.finditer(r"^CMake Error at (\S+?):\d+[^\n]*\n((?:[ \t]+[^\n]*\n?)*)", log_text, re.M):
+        why = " ".join(l.strip() for l in m.group(2).splitlines() if l.strip())
+        found.setdefault(component_of(m.group(1), runtimes) or "llvm", why[:240] or "cmake error")
+    return found
+
+
+def do_install(ctx):
+    """Through DESTDIR into a staging directory BESIDE the prefix, then one rename:
+    the prefix is either complete or not there.  A component whose INSTALL fails
+    is treated as one whose build failed: optional -> dropped, stage3 re-run (a
+    reconfigure, minutes), installed again without it; core -> stop."""
+    if os.path.exists(ctx.prefix):
+        raise ToolError("%s already exists.  Never install over a prefix in use -- "
+                        "pass --prefix for a new one." % ctx.prefix)
+    m = re.search(r"^CMAKE_INSTALL_PREFIX:PATH=(.*)$", read_text(os.path.join(ctx.d("stage3"), "CMakeCache.txt")), re.M)
+    if m and os.path.normpath(m.group(1).strip()) != os.path.normpath(ctx.prefix):
+        # --prefix NEW after stage3 was configured for the old one: the install
+        # rules carry the prefix, so stage3 is reconfigured (llvm-config, which
+        # has the prefix compiled in, is relinked; nothing else changes).
+        note("stage3 was configured to install into %s: reconfiguring it for %s" % (m.group(1).strip(), ctx.prefix))
+        do_stage3(ctx)
+        if ctx.bolt:
+            do_bolt(ctx)
+    parent = os.path.dirname(ctx.prefix)
+    os.makedirs(parent, exist_ok=True)
+    staging = os.path.join(parent, ".%s-staging-%s" % (TOOL, os.path.basename(ctx.prefix)))
+    target = "install/strip" if ctx.strip else "install"
+    for attempt in (1, 2, 3, 4):
+        shutil.rmtree(staging, ignore_errors=True)
+        rc, stats, log = ninja(ctx, "stage3", [target], ctx.jobs["jobs"], extra_env={"DESTDIR": staging}, tag="install")
+        if rc != 0:
+            shutil.rmtree(staging, ignore_errors=True)
+            fail("install", log, "the install")
+        errs = install_errors(read_text(log), ctx.tree.runtimes)
+        if not errs:
+            break
+        shutil.rmtree(staging, ignore_errors=True)          # a fragment of a component is not an install
+        built = ctx.state.d.get("built", {})
+        optional = [c for c in errs if c not in CORE and c in built.get("projects", []) + built.get("runtimes", [])]
+        if len(optional) != len(errs) or attempt == 4:
+            for comp, why in sorted(errs.items()):
+                bad("install of %s: %s" % (comp, why))
+            raise ToolError("the install reported errors although ninja exited 0 -- see %s" % log)
+        for comp in optional:
+            for n in with_dependents([comp]):
+                if n in built.get("projects", []) + built.get("runtimes", []):
+                    ctx.state.d["dropped"][n] = ("did not INSTALL: " + errs[comp]) if n == comp else "needs %s" % comp
+                    warn("dropping %s: %s" % (n, ctx.state.d["dropped"][n]))
+        ctx.state.save()
+        do_stage3(ctx)                                       # the same tree, reconfigured without them
+        if ctx.bolt:
+            do_bolt(ctx)                                     # idempotent: only a relinked binary is done again
+    if not os.path.isdir(staging + ctx.prefix):
+        raise ToolError("the install put nothing under %s%s -- see %s" % (staging, ctx.prefix, log))
+    os.rename(staging + ctx.prefix, ctx.prefix)
+    shutil.rmtree(staging, ignore_errors=True)
+    write_atomic(os.path.join(ctx.prefix, "BUILD-INFO.txt"), build_info(ctx))
+    ok("installed: %s  (%s)" % (ctx.prefix, human(dir_size(ctx.prefix))))
+
+
+def build_info(ctx):
+    b = ctx.state.d.get("built", {})
+    lines = ["Built by %s %s on %s" % (TOOL, VERSION, now()),
+             "source   : %s  (%s)" % (ctx.tree.src, ctx.tree.ident()),
+             "host cc  : %s" % ctx.host["banner"],
+             "pipeline : host -> stage1 -> %sstage2 -> stage3 (this)" % ("stage2-instrumented -> training -> " if ctx.pgo else ""),
+             "options  : pgo=%s lto=%s link=%s rtti=%s tune=%s" % ("on" if ctx.pgo else "off", ctx.lto, ctx.link,
+                                                                 "on" if ctx.rtti else "off", " ".join(ctx.flags) or "portable"),
+             "bolt     : %s" % bolt_summary(ctx),
+             "projects : %s" % " ".join(b.get("projects", [])),
+             "runtimes : %s" % " ".join(b.get("runtimes", [])),
+             "targets  : %s %s" % (b.get("targets", ""), " ".join(b.get("experimental", [])))]
+    for n, why in sorted(ctx.state.d["dropped"].items()):
+        lines.append("NOT built: %s -- %s" % (n, why))
+    if ctx.lto != "off":
+        lines.append("note     : the static archives of LLVM/clang/MLIR in lib/ hold LLVM bitcode (LTO build): link "
+                     "them with this toolchain's lld, or use libLLVM.so / libclang-cpp.so.  The RUNTIME "
+                     "libraries (libc++, compiler-rt, libomp...) are ordinary native code.")
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------------- verify
+
+class VerifySkipped(Exception):
+    """A check that cannot be made here: said, not counted."""
+
+
+C_HELLO = '#include <stdio.h>\nint main(void){puts("ok-c");return 0;}\n'
+CXX_HELLO = ('#include <iostream>\n#include <vector>\n#include <numeric>\n'
+             'int main(){std::vector<int> v(10,2);std::cout<<"ok-cxx "<<std::accumulate(v.begin(),v.end(),0)<<"\\n";}\n')
+OMP_HELLO = ('#include <omp.h>\n#include <stdio.h>\nint main(void){int n=0;\n#pragma omp parallel reduction(+:n)\n'
+             'n+=1;\nprintf("ok-omp %d\\n",n>0);return n>0?0:1;}\n')
+F90_HELLO = "program h\n  print '(a)', 'ok-fortran'\nend program h\n"
+
+
+def built_from_info(prefix):
+    """What BUILD-INFO.txt in a prefix says was built -- for `verify PREFIX`, which
+    has no record; {} when there is none (then everything is assumed)."""
+    text = read_text(os.path.join(prefix, "BUILD-INFO.txt"))
+    found = {}
+    for key in ("projects", "runtimes"):
+        m = re.search(r"^%s\s*:\s*(.*)$" % key, text, re.M)
+        if m:
+            found[key] = m.group(1).split()
+    m = re.search(r"^targets\s*:\s*(\S*)\s*(.*)$", text, re.M)
+    if m:
+        found["targets"], found["experimental"] = m.group(1), m.group(2).split()
+    if found:
+        found["dropped"] = re.findall(r"^NOT built: (\S+)", text, re.M)
+    return found
+
+
+def do_verify(ctx, prefix=None):
+    prefix = prefix or ctx.prefix
+    b = lambda n: os.path.join(prefix, "bin", n)
+    env = scrubbed_env()
+    built = ctx.state.d.get("built", {}) if ctx else built_from_info(prefix)
+    have = lambda n: not built or n in built.get("projects", []) + built.get("runtimes", [])
+    tree = getattr(ctx, "tree", None) if ctx is not None else None
+    scratch = ctx.root if ctx is not None and os.path.isdir(getattr(ctx, "root", "") or "") else None
+    d = tempfile.mkdtemp(prefix="ect-verify-", dir=scratch)   # beside the build, not under a /tmp that may be noexec
+    results = []
+
+    def check(name, fn, needs=None):
+        if needs and not (have(needs) and os.path.exists(b(needs_bin.get(needs, "clang")))):
+            note("%-34s skipped (%s was not built)" % (name, needs))
+            return
+        try:
+            detail = fn()
+            ok("%-34s %s" % (name, detail or ""))
+            results.append((name, True))
+        except VerifySkipped as e:
+            note("%-34s skipped (%s)" % (name, e))
+        except (ToolError, OSError, AssertionError) as e:
+            bad("%-34s %s" % (name, (str(e).strip().splitlines() or ["failed"])[-1][:200]))
+            results.append((name, False))
+
+    needs_bin = {"flang": "flang", "lldb": "lldb", "mlir": "mlir-opt", "bolt": "llvm-bolt",
+                 "clang-tools-extra": "clang-tidy", "polly": "opt", "openmp": "clang",
+                 "libcxx": "clang", "compiler-rt": "clang"}
+
+    def put(name, text):
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def build_run(cmd, expect):
+        exe = os.path.join(d, "a.out")
+        if os.path.exists(exe):
+            os.unlink(exe)
+        run(cmd + ["-o", exe], env=env, cwd=d, timeout=600)
+        o = run([exe], env=env, cwd=d, timeout=120).stdout or ""
+        assert expect in o, "ran, but printed %r" % o[:80]
+        return expect
+
+    def libdir_of(lib):
+        p = run([b("clang++"), "-stdlib=libc++", "-print-file-name=" + lib], env=env).stdout.strip()
+        assert os.path.isabs(p), "%s not found by the driver" % lib
+        return os.path.dirname(p)
+    try:
+        say("Verifying %s" % prefix)
+        c, cxx = put("h.c", C_HELLO), put("h.cpp", CXX_HELLO)
+        check("clang --version", lambda: run([b("clang"), "--version"], env=env).stdout.splitlines()[0])
+
+        def provenance():
+            o = run([b("llvm-readelf"), "-p", ".comment", os.path.realpath(b("clang"))], env=env).stdout or ""
+            where = ""
+            if "clang version" not in o and ctx is not None and getattr(ctx, "strip", False):
+                # install/strip ran llvm-strip, which drops .comment: the proof is read
+                # from the unstripped stage3 binary the installed one is a copy of.
+                o = run([b("llvm-readelf"), "-p", ".comment",
+                         os.path.realpath(os.path.join(ctx.d("stage3"), "bin", "clang"))], env=env).stdout or ""
+                where = "  (from the unstripped stage3 binary: --strip removes .comment)"
+            ids = sorted(set(re.findall(r"(clang version [^\s)]+|GCC: \([^)]*\) [\d.]+|Linker: LLD [\d.]+)", o)))
+            if not ids and ctx is None:
+                raise VerifySkipped("the binary is stripped: no .comment to read")
+            assert any("clang version" in i for i in ids), "no clang producer string in .comment: %r" % o[:120]
+            if tree is not None:
+                # The proof of a stage3: the producer is the TREE's own clang (stage2),
+                # not the system's that built stage1.
+                want = "clang version " + tree.version
+                assert any(i == want or i.startswith(want + "-") for i in ids), \
+                    "built by %s, not by this tree's own clang %s" % ("; ".join(ids), tree.version)
+            return "; ".join(ids) + where
+        check("the compiler was built by the tree's own clang" if tree is not None else "the compiler was built by clang",
+              provenance)
+        check("C: compile, link, run", lambda: build_run([b("clang"), c], "ok-c"))
+        check("C++ with the system's libstdc++", lambda: build_run([b("clang++"), cxx], "ok-cxx 20"))
+        check("link with lld", lambda: build_run([b("clang++"), "-fuse-ld=lld", cxx], "ok-cxx 20"))
+        check("-O2 -flto=thin with lld", lambda: build_run([b("clang++"), "-O2", "-flto=thin", "-fuse-ld=lld", cxx], "ok-cxx 20"))
+        check("C++ with libc++", lambda: build_run(
+            [b("clang++"), "-stdlib=libc++", "-Wl,-rpath," + libdir_of("libc++.so"), cxx], "ok-cxx 20"), "libcxx")
+        check("compiler-rt builtins + libunwind", lambda: build_run(
+            [b("clang++"), "-stdlib=libc++", "--rtlib=compiler-rt", "--unwindlib=libunwind", "-fuse-ld=lld",
+             "-Wl,-rpath," + libdir_of("libc++.so"), cxx], "ok-cxx 20"), "libcxx")
+        check("AddressSanitizer", lambda: build_run([b("clang"), "-fsanitize=address", "-g", c], "ok-c"), "compiler-rt")
+        check("UndefinedBehaviorSanitizer", lambda: build_run([b("clang++"), "-fsanitize=undefined", cxx], "ok-cxx 20"), "compiler-rt")
+        check("OpenMP", lambda: build_run(
+            [b("clang"), "-fopenmp", "-Wl,-rpath," + libdir_of("libomp.so"), put("o.c", OMP_HELLO)], "ok-omp 1"), "openmp")
+        known_runtimes = tree.runtimes if tree is not None else built.get("runtimes", [])
+        if "flang-rt" in built.get("dropped", []) or \
+                ("flang-rt" in known_runtimes and built and "flang-rt" not in built.get("runtimes", [])):
+            note("%-34s skipped (flang-rt was not built)" % "Fortran (flang + flang-rt)")
+        else:
+            check("Fortran (flang + flang-rt)", lambda: build_run([b("flang"), put("h.f90", F90_HELLO)], "ok-fortran"), "flang")
+
+        def targets():
+            o = run([b("llc"), "--version"], env=env).stdout or ""
+            reg = [r.lower() for r in re.findall(r"^\s{4}(\S+)\s+-", o, re.M)]
+            alias = {"directx": "dxil"}
+            want = [alias.get(t.lower(), t.lower()) for t in ((built.get("experimental") or []) if built else [])]
+            missing = [t for t in want if not any(r.startswith(t[:4]) for r in reg)]
+            assert reg and not missing, "registered %d, missing %s" % (len(reg), missing)
+            return "%d registered targets%s" % (len(reg), ", experimental ones included" if want else "")
+        check("llc: registered targets", targets)
+
+        def cross():
+            o = os.path.join(d, "x.o")
+            host_arch = os.uname().machine
+            target, want = ("x86_64-linux-gnu", "X86-64") if host_arch == "aarch64" else ("aarch64-linux-gnu", "AArch64")
+            run([b("clang"), "--target=" + target, "-ffreestanding", "-c", put("x.c", "int f(int a){return a*3;}\n"), "-o", o], env=env)
+            desc = run([b("llvm-readelf"), "-h", o], env=env).stdout or ""
+            assert want in desc, "not an %s object" % want
+            return "%s -> %s object" % (host_arch, want)
+        if not built or built.get("targets") == "all":
+            check("cross-compile to another target", cross)
+        for tool, needs in (("clang-tidy", "clang-tools-extra"), ("clangd", "clang-tools-extra"), ("lldb", "lldb"),
+                            ("mlir-opt", "mlir"), ("llvm-bolt", "bolt"), ("ld.lld", None), ("llvm-profdata", None)):
+            check("%s --version" % tool, (lambda t=tool: (run([b(t), "--version"], env=env, timeout=120).stdout or "").strip().splitlines()[0][:60]), needs)
+        def polly():
+            assert "-polly" in (run([b("opt"), "--help-hidden"], env=env, check=False).stdout or ""), "opt has no polly options"
+            return build_run([b("clang"), "-O3", "-mllvm", "-polly", c], "ok-c")
+        check("polly: in opt, and clang -O3 -mllvm -polly", polly, "polly")
+
+        def bolted():
+            missing = [n for n in BOLT_TARGETS if not has_bolt_mark(os.path.realpath(b(n)), b("llvm-readelf"))]
+            assert not missing, "no BOLT mark in %s" % ", ".join(missing)
+            return "clang and lld carry BOLT's mark"
+        if getattr(ctx, "bolt", False):
+            check("BOLT post-link layout", bolted, "bolt")
+
+        def libclc_installed():
+            found = [os.path.join(dp, fn) for dp, _, fns in os.walk(prefix) for fn in fns
+                     if ("clc" in fn.lower() or "clc" in dp.lower()) and fn.endswith((".bc", ".spv"))]
+            assert found, "no libclc library (*.bc / *.spv) anywhere under the prefix"
+            return "%d device libraries, e.g. %s" % (len(found), os.path.relpath(found[0], prefix))
+        if built.get("device_triples"):
+            check("libclc for the device targets", libclc_installed)
+
+        def native_runtimes():
+            libs = glob.glob(os.path.join(prefix, "lib", "*", "libc++.a")) + glob.glob(os.path.join(prefix, "lib", "libc++.a"))
+            assert libs, "no libc++.a installed"
+            member = (run([b("llvm-ar"), "t", libs[0]], env=env).stdout or "").split()[0]
+            p = subprocess.run([b("llvm-ar"), "p", libs[0], member], stdout=subprocess.PIPE, env=env)
+            assert p.stdout[:4] == b"\x7fELF", "libc++.a holds %r, not native objects" % p.stdout[:4]
+            return "libc++.a is native code, not LTO bitcode"
+        check("runtime libraries are native code", native_runtimes, "libcxx")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    failed = [n for n, good in results if not good]
+    if failed:
+        raise ToolError("%d of %d checks failed: %s\n  The toolchain is installed in %s; it was NOT activated."
+                        % (len(failed), len(results), ", ".join(failed), prefix))
+    ok("all %d checks passed" % len(results))
+
+
+# ------------------------------------------------------------------ options / CLI
+
+DEFAULTS = {"version": "latest", "ref": "", "source": "", "prefix": "", "workdir": "~/src/enterprise_clang_tool",
+            "build_id": "", "host_cc": "", "tune": "auto", "lto": "thin", "pgo": True, "link": "static",
+            "projects": "all", "runtimes": "all", "without": "", "targets": "all", "experimental_targets": True,
+            "jobs": 0, "link_jobs": 0, "run": "all", "from_stage": "", "only": "", "restart": False,
+            "resume": False, "keep_stages": False, "check": False, "strip": False, "rtti": True, "bolt": True, "activate": None,
+            "install_deps": False, "yes": False, "verbose": False, "ignore_disk": False, "retry_dropped": False,
+            "provision": "", "host_cxx": "", "python": "", "cmake": "", "ninja": "", "host_linker": "default",
+            "host_binutils": "auto",
+            "profile": "", "save_profile": ""}
+# What a profile holds: the CHOICES.  Not --restart, --from, --yes: those belong to one run.
+PROFILE_KEYS = ("version", "ref", "source", "prefix", "workdir", "build_id", "host_cc", "host_cxx", "host_linker",
+                "host_binutils",
+                "python", "cmake", "ninja", "provision", "tune", "lto", "link", "projects", "runtimes", "without",
+                "targets", "jobs", "link_jobs", "run")
+PROFILE_FLAGS = ("pgo", "bolt", "experimental_targets", "keep_stages", "check", "strip", "rtti", "activate")
+PROFILE_HEADER = "# %s profile" % TOOL
+HOST_LINKERS = ("default", "lld", "gold", "bfd", "mold")
+
+
+def profiles_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), TOOL, "profiles")
+
+
+def profile_path(name, must_exist=False):
+    """A bare name lives in the profiles directory; anything with a slash is a path."""
+    name = os.path.expanduser(name)
+    if os.sep in name or (must_exist and os.path.isfile(name)):
+        return name
+    base = os.path.join(profiles_dir(), name)
+    if must_exist:
+        return next((c for c in (base, base + ".ini") if os.path.isfile(c)), base + ".ini")
+    return base if base.endswith(".ini") else base + ".ini"
+
+
+def load_profile(path):
+    path = profile_path(path, must_exist=True)
+    cp = configparser.RawConfigParser()
+    try:
+        read = cp.read(path)
+    except configparser.Error:
+        read = []
+    if not read or not cp.has_section("build"):
+        raise ToolError("cannot read profile %s (no [build] section?)" % path)
+    vals = {}
+    for k, v in cp.items("build"):
+        if k in PROFILE_FLAGS:
+            vals[k] = v.strip().lower() in ("yes", "true", "1", "on")
+        elif k in ("jobs", "link_jobs"):
+            vals[k] = int(v) if v.strip().isdigit() else 0
+        elif k in PROFILE_KEYS:
+            vals[k] = v
+    return vals
+
+
+def save_profile(name, opts):
+    cp = configparser.RawConfigParser()
+    cp.add_section("build")
+    for k in PROFILE_KEYS:
+        value = opts[k]
+        if k in ("source", "workdir", "prefix") and value:  # replayed from any directory: absolute
+            value = os.path.abspath(os.path.expanduser(value))
+        cp.set("build", k, str(value))
+    for k in PROFILE_FLAGS:
+        if opts[k] is not None:                               # activate: None means "ask, default yes"
+            cp.set("build", k, "yes" if opts[k] else "no")
+    path = profile_path(name)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write("%s.  Replay with:  %s.py build --profile %s\n"
+                % (PROFILE_HEADER, TOOL, os.path.basename(path)[:-4] if os.path.dirname(path) == profiles_dir() else path))
+        cp.write(f)
+    info("profile saved: %s" % path)
+
+
+def profile_summary(v):
+    src = v.get("source") or (v.get("ref") and "git " + v["ref"]) or "LLVM " + v.get("version", "latest")
+    return "%s | stage0 %s | %s | pgo %s, lto %s%s" % (
+        src.replace(os.path.expanduser("~"), "~"), (v.get("host_cc") or "auto").replace(os.path.expanduser("~"), "~"),
+        v.get("tune", "auto"), "on" if v.get("pgo", True) else "off", v.get("lto", "thin"),
+        " | without " + v["without"] if v.get("without") else "")
+
+
+def list_profiles():
+    found = []
+    try:
+        names = sorted(os.listdir(profiles_dir()))[:500]
+    except OSError:
+        names = []
+    for n in names:
+        path = os.path.join(profiles_dir(), n)
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > 8192:
+                continue
+            with open(path, "r", errors="replace") as f:
+                if not f.readline().startswith(PROFILE_HEADER):
+                    continue
+            vals = load_profile(path)
+        except (OSError, ToolError):
+            continue
+        found.append({"name": n[:-4] if n.endswith(".ini") else n, "path": path,
+                      "mtime": os.path.getmtime(path), "values": vals, "summary": profile_summary(vals)})
+    found.sort(key=lambda pr: -pr["mtime"])
+    return found
+
+
+def merge_options(args):
+    """Defaults, then the profile, then the command line."""
+    opts = dict(DEFAULTS)
+    prof = getattr(args, "profile", None)
+    if prof:
+        opts.update(load_profile(prof))
+    for k in DEFAULTS:
+        v = getattr(args, k, None)
+        if v is not None:
+            opts[k] = v
+    # --source, --ref and --version choose the same thing: one given on the command
+    # line replaces whichever of the three the profile held.
+    given = [k for k in ("source", "ref", "version") if getattr(args, k, None) is not None]
+    if given and prof:
+        for k in ("source", "ref", "version"):
+            if k not in given:
+                opts[k] = DEFAULTS[k]
+    if opts["host_linker"] not in HOST_LINKERS:
+        raise ToolError("--host-linker must be one of: %s" % ", ".join(HOST_LINKERS))
+    if opts["lto"] not in ("thin", "full", "off"):
+        raise ToolError("--lto must be thin, full or off")
+    if opts["link"] not in ("static", "dylib"):
+        raise ToolError("--link must be static or dylib")
+    if opts["run"] not in ("all", "1", "2"):
+        raise ToolError("--run must be 1, 2 or all")
+    if opts["resume"] and opts["restart"]:
+        raise ToolError("--resume and --restart say opposite things: give one")
+    bid = opts["build_id"]
+    if bid and (os.sep in bid or (os.altsep and os.altsep in bid) or bid in (".", "..")):
+        raise ToolError("--build-id is the NAME of a directory under <workdir>/build, not a path: %r" % bid)
+    names = [s for s, _, _ in STAGES]
+    for k in ("from_stage", "only"):
+        if opts[k] and opts[k] not in names:
+            raise ToolError("unknown stage %s (stages: %s)" % (opts[k], " ".join(names)))
+    if sum(bool(opts[k]) for k in ("source", "ref")) + (opts["version"] != "latest") > 1:
+        raise ToolError("--source, --ref and --version choose the same thing: give one")
+    return opts
+
+
+def doctor(machine, tree, host, python, cmake, ninjap, opts, quiet=False):
+    """-> number of BLOCKING problems.  Says the exact package command for each."""
+    pm, problems, missing_pkgs = machine["pkg_manager"], 0, []
+
+    def pkg(table):
+        return table.get(pm, "")
+
+    say("Preflight")
+    traps = env_traps()
+    if traps:
+        note("set in your shell, and NOT passed on to the build: " + "  ".join(traps))
+    if os.geteuid() == 0:
+        bad("running as root.  Build as yourself; nothing here needs root.")
+        problems += 1
+    if host:
+        if "works" not in host:
+            host["binutils_dir"], host["works"], host["why"] = pick_binutils(host, machine["binutils"], opts["host_binutils"])
+        works, why = host["works"], host["why"]
+        if works:
+            ok("stage0 compiler: %s  (%s, %s)" % (host["banner"], host["path"], host["origin"]))
+            if host.get("instead_of"):
+                note("the first choice, %s, cannot build a C++17 program: this one is used instead" % host["instead_of"])
+            if host["binutils_dir"]:
+                note("it needs a newer assembler than the system's: using the binutils in %s" % host["binutils_dir"])
+            if host.get("rpath"):
+                warn("this gcc brings its own libstdc++ (%s): an rpath to it is baked into every stage, and "
+                     "the FINISHED toolchain needs that directory at run time.  Not portable." % host["rpath"])
+        else:
+            bad("%s cannot build a C++17 program: %s" % (host["cxx"], why))
+            missing_pkgs.append(pkg(REQUIRED_PKGS["compiler"]))
+            problems += 1
+    else:
+        mins = tree.cc_min if tree else {"gcc": (7, 4), "clang": (5, 0)}
+        bad("no C++ compiler that meets this tree's minimum (gcc >= %s or clang >= %s)"
+            % (vstr(mins["gcc"]), vstr(mins["clang"])))
+        for c in machine["host_compilers"]:
+            info("     found: %s -- %s" % (c["banner"][:60], compiler_tags(c, mins, check=False)[0][-1]))
+        missing_pkgs.append(pkg(REQUIRED_PKGS["compiler"]))
+        problems += 1
+    if python:
+        ok("build python   : %s %s%s" % (python["path"], vstr(python["version"]), "" if python["yaml"] else "  (no yaml)"))
+    else:
+        bad("no CPython >= %s found in /usr/bin" % vstr(tree.python_min if tree else (3, 8)))
+        missing_pkgs.append(pkg(REQUIRED_PKGS["python"]))
+        problems += 1
+    for label, found, key, minimum in (("cmake", cmake, "cmake", tree.cmake_min if tree else (3, 20)),
+                                       ("ninja", ninjap, "ninja", NINJA_MIN)):
+        if found[0]:
+            ok("%-15s: %s %s%s" % (label, found[0], vstr(found[1]), "  (built by this tool)" if found[2] else ""))
+        elif host and (label == "ninja" or machine["make"]):
+            note("%s >= %s is not installed: it will be BUILT from source (%s %s).  Or: %s"
+                 % (label, vstr(minimum), label, PROVISION[key]["version"], pkg(REQUIRED_PKGS[key]) or "install it"))
+        else:
+            bad("%s >= %s is missing and cannot be built here" % (label, vstr(minimum)))
+            missing_pkgs += [pkg(REQUIRED_PKGS[key]), pkg(REQUIRED_PKGS["make"])]
+            problems += 1
+    if not machine["tar"] or not machine["xz"]:
+        if not opts["source"] and not opts["ref"]:
+            bad("tar and xz are needed to unpack a release")
+            missing_pkgs.append(pkg(REQUIRED_PKGS["tar"]))
+            problems += 1
+    if opts["ref"] and not machine["git"]:
+        bad("--ref needs git")
+        missing_pkgs.append(pkg(REQUIRED_PKGS["git"]))
+        problems += 1
+    lacking = []
+    for key, what, header, pkgs, why in OPTIONAL_DEPS:
+        present = {"yaml": bool(python and python["yaml"]), "swig": bool(machine["swig"]),
+                   "pydevel": bool(python and python["devel"])}.get(key, machine["headers"].get(key, False))
+        if not present:
+            if key == "swig" and machine.get("swig_found"):
+                what = "swig 4 or newer (%s found)" % machine["swig_found"]
+            pkg_name = python_pkg(pkgs.get(pm, ""), python, pm) if key in ("yaml", "pydevel") else pkgs.get(pm, "")
+            lacking.append((what, pkg_name, why))
+    if lacking and not quiet:
+        note("optional, not installed -- the build adapts, these features are left out:")
+        for what, p, why in lacking:
+            info("       %-32s %s" % (what, why))
+    allpk = " ".join(x for x in missing_pkgs + [p for _, p, _ in lacking] if x)
+    if allpk and pm:
+        info("to install %s:" % ("what is missing" if problems else "the optional ones"))
+        info("    sudo %s install %s%s" % (pm, "-y " if pm != "pacman" else "", allpk)
+             if pm != "pacman" else "    sudo pacman -S " + allpk)
+        hint = crb_hint(machine) if pm in ("dnf", "yum") else ""
+        if hint:
+            info("    (ninja-build and some -devel packages live in the CRB / PowerTools repository:  %s)" % hint)
+    return problems, allpk
+
+
+def install_deps(machine, allpk):
+    pm = machine["pkg_manager"]
+    if not pm or not allpk:
+        note("nothing to install")
+        return
+    cmd = ["sudo", pm, "-S"] + allpk.split() if pm == "pacman" else ["sudo", pm, "install", "-y"] + allpk.split()
+    say("Installing with %s (sudo)" % pm)
+    if pm == "apt-get":
+        run(["sudo", "apt-get", "update"], capture=False, interactive=True, check=False)
+    if run(cmd, capture=False, interactive=True, check=False).returncode != 0:
+        warn("the package manager reported a failure -- carrying on with what is there")
+
+
+def resolve(args, need_source=True):
+    """Everything up to a plan.  -> Ctx.  Fetches the source if it has to (a plan
+    of 'everything' cannot be made without the tree that defines it)."""
+    opts = merge_options(args)
+    workdir = os.path.abspath(os.path.expanduser(opts["workdir"]))
+    machine = detect_machine()
+    src = resolve_source(opts, workdir)
+    if not os.path.isdir(os.path.join(src["dir"], "llvm")):
+        if src["fetch"] is None:
+            raise ToolError("no LLVM source at %s" % src["dir"])
+        if not need_source:
+            return Ctx(opts=opts, machine=machine, src=src, tree=None, workdir=workdir)
+        say("Source")
+        info(src["label"])
+        if free_gb(workdir) < 6 and not opts["ignore_disk"]:
+            raise ToolError("%.0f GB free in %s; the source alone needs about 5" % (free_gb(workdir), workdir))
+        with locked(os.path.join(workdir, "src")):           # two instances, one download
+            if not os.path.isdir(os.path.join(src["dir"], "llvm")):
+                src["fetch"]()
+    tree = Tree(src["dir"])
+    tools_dir = os.path.join(workdir, "tools")
+    host = pick_host_compiler(machine["host_compilers"], tree.cc_min, opts["host_cc"], opts["host_cxx"])
+    python = pick_python(machine["pythons"], tree.python_min, opts["python"])
+    if host:
+        host["binutils_dir"], host["works"], host["why"] = pick_binutils(host, machine["binutils"], opts["host_binutils"])
+        if not host["works"] and not opts["host_cc"]:
+            # The first choice is broken (a clang whose newest GCC installation has no
+            # libstdc++ headers is the usual case): the next usable one is taken, and
+            # the preflight says so, rather than stopping with a remedy that reinstalls
+            # what is already there.
+            for other in ranked_host_compilers(machine["host_compilers"], tree.cc_min):
+                if other["path"] == host["path"]:
+                    continue
+                bdir, works, why = pick_binutils(other, machine["binutils"], opts["host_binutils"])
+                if works:
+                    other["binutils_dir"], other["works"], other["why"] = bdir, works, why
+                    other["instead_of"] = "%s (%s)" % (host["path"], host["why"])
+                    host = other
+                    break
+    forced = [x for x in opts["provision"].split(",") if x]
+    for x in forced:
+        if x not in PROVISION:
+            raise ToolError("--provision knows: %s" % ", ".join(sorted(PROVISION)))
+    tb = os.path.join(tools_dir, "bin")
+    # --provision NAME: use the pinned version built by this tool, never the machine's.
+    cmake = find_tool(["cmake", "cmake3"], tb, tree.cmake_min, opts["cmake"]) if "cmake" not in forced else \
+        ((os.path.join(tb, "cmake"), tool_version(os.path.join(tb, "cmake")), True)
+         if os.access(os.path.join(tb, "cmake"), os.X_OK) else ("", (), False))
+    ninjap = find_tool(["ninja", "ninja-build"], tb, NINJA_MIN, opts["ninja"]) if "ninja" not in forced else \
+        ((os.path.join(tb, "ninja"), tool_version(os.path.join(tb, "ninja")), True)
+         if os.access(os.path.join(tb, "ninja"), os.X_OK) else ("", (), False))
+    build_id = opts["build_id"] or tree.ident()
+    root = os.path.join(workdir, "build", build_id)
+    prefix = os.path.abspath(os.path.expanduser(opts["prefix"] or os.path.join("~", "opt", "clang-" + tree.ident())))
+    bolt_on, bolt_why = bolt_possible(opts, machine)
+    if bolt_on and "bolt" not in tree.projects:
+        bolt_on, bolt_why = False, "this tree has no bolt project"
+    if opts["tune"] in ("", "auto"):
+        name = native_cpu_name(host)
+        machine["cpu_tune"] = name if tree_knows_cpu(tree.src, name) else ""   # else -mtune=native: the tree's clang decides
+    tune_why = auto_tune(machine)[1] if opts["tune"] in ("", "auto") else ""
+    return Ctx(opts=opts, machine=machine, src=src, tree=tree, workdir=workdir, tools_dir=tools_dir,
+               bolt=bolt_on, bolt_why=bolt_why, tune_why=tune_why,
+               host=host, python=python, cmake=cmake[0], ninja=ninjap[0], cmake_found=cmake, ninja_found=ninjap,
+               root=root, prefix=prefix, profdata=os.path.join(root, "clang.profdata"),
+               pgo=opts["pgo"], lto=opts["lto"], link=opts["link"], rtti=opts["rtti"], check=opts["check"],
+               strip=opts["strip"], keep_stages=opts["keep_stages"], verbose=opts["verbose"],
+               flags=tune_flags(opts["tune"], host or {}, machine),
+               jobs=plan_jobs(opts, machine, host["kind"] if host else "gcc"), state=None)
+
+
+def stage_list(ctx):
+    names = [s for s, _, _ in STAGES if s not in ("source", "tools")]
+    if not ctx.pgo:
+        names = [n for n in names if n not in ("stage2-instrumented", "train")]
+    if not ctx.bolt:
+        names = [n for n in names if n != "bolt"]
+    return names
+
+
+def show_plan(ctx, skipped, comps):
+    projects, runtimes, targets, experimental = comps
+    t, m, j = ctx.tree, ctx.machine, ctx.jobs
+    say("Plan")
+    info("machine     : %s, %s, %d CPUs, %.0f GB RAM (%.0f GB available)"
+         % (m["os"], m["arch"], m["cpus"], m["mem_total_gb"], m["mem_avail_gb"]))
+    info("source      : LLVM %s  %s" % (t.ident(), t.src))
+    src = getattr(ctx, "src", None) or {}
+    if src.get("kind") == "tarball" and ctx.opts["version"] in ("latest", "release", "stable"):
+        info("              the newest release today: --version %s pins it for a resume or for run 2" % t.version)
+    elif src.get("kind") == "git":
+        info("              cloned %s; a newer %s is fetched only once this directory is removed"
+             % (time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(t.src))), ctx.opts["ref"]))
+    info("stage0      : %s" % ("%s  (%s, %s)" % (ctx.host["banner"][:70], ctx.host["path"], ctx.host["origin"]) if ctx.host else "NONE"))
+    info("build tools : python %s, cmake %s, ninja %s%s" % (
+        ctx.python["path"] if ctx.python else "NONE", ctx.cmake or "to be built", ctx.ninja or "to be built",
+        ", binutils %s" % ctx.host["binutils_dir"] if ctx.host and ctx.host.get("binutils_dir") else ""))
+    info("pipeline    : " + " -> ".join(stage_list(ctx)))
+    info("optimised   : PGO %s, LTO %s, BOLT %s, RTTI %s, tools linked %s, tuning %s"
+         % ("on" if ctx.pgo else "off", ctx.lto, "on" if ctx.bolt else "off", "on" if ctx.rtti else "off",
+            ctx.link, " ".join(ctx.flags) or "portable (no -march)"))
+    if ctx.tune_why:
+        info("              tuning chosen automatically: %s.  --tune portable builds for any %s"
+             % (ctx.tune_why, ctx.machine["arch"]))
+    if ctx.opts["bolt"] and not ctx.bolt:
+        note("no BOLT     : " + ctx.bolt_why)
+    info("projects    : " + " ".join(projects))
+    info("runtimes    : " + " ".join(runtimes))
+    _, _, triples = device_runtimes(t, runtimes, targets, t.targets)
+    if triples:
+        info("              libclc is a device library: built for " + " ".join(triples))
+    elif "libclc" in runtimes and os.path.exists(os.path.join(t.src, "libclc", "cmake", "caches", "all-targets.cmake")):
+        note("not built   : libclc -- none of its device backends (AMDGPU, NVPTX, SPIRV) is among --targets")
+    info("targets     : %s%s" % (targets if targets != "all" else "all (%s)" % " ".join(t.targets),
+                                 "  + experimental: " + " ".join(experimental) if experimental else ""))
+    for name, why in skipped:
+        note("not built   : %s -- %s" % (name, why))
+    info("jobs        : -j%d; compile %d, link %d, LTO link %d, flang %d  (from AVAILABLE memory)"
+         % (j["jobs"], j["compile"], j["link"], j["lto_link"], j["flang"]))
+    reclaim = getattr(ctx, "reclaim_gb", 0.0)
+    info("build dir   : %s  (%.0f GB free%s; the plan needs about %d GB)"
+         % (ctx.root, free_gb(ctx.root),
+            ", %.0f GB once the previous build is deleted" % (free_gb(ctx.root) + reclaim) if reclaim else "", disk_needed(ctx)))
+    info("prefix      : %s" % ctx.prefix)
+
+
+def cmd_plan(args):
+    ctx = resolve(args, need_source=False)
+    if ctx.tree is None:
+        say("Plan")
+        info("source      : %s  -- not fetched yet" % ctx.src["label"])
+        note("'everything' is read from the tree: run `build` (it fetches first), or `build --only source`")
+        return 0
+    problems, _ = doctor(ctx.machine, ctx.tree, ctx.host, ctx.python, ctx.cmake_found, ctx.ninja_found, ctx.opts)
+    comps = select_components(ctx.tree, ctx.machine, ctx.python, ctx.opts)
+    show_plan(ctx, comps[4], comps[:4])
+    return 1 if problems else 0
+
+
+def disk_needed(ctx):
+    base = (110 if ctx.keep_stages else 75) if ctx.lto != "off" else (80 if ctx.keep_stages else 55)
+    return base + (20 if ctx.bolt else 0)
+
+
+# ------------------------------------------------------ resume, or start over
+
+def host_identity(host):
+    """What the record keeps of the stage0 compiler: its kind and version -- not
+    the distribution's banner, which changes with every package rebuild
+    (21.1.8-1.el10 -> 21.1.8-2.el10) and must not make a build impossible to resume."""
+    if isinstance(host, dict):
+        return "%s %s" % (host["kind"], vstr(host["version"]))
+    text = (host or "").strip()
+    if re.match(r"^(clang|gcc) \d+(?:\.\d+)*$", text):
+        return text                                          # already an identity
+    m = re.search(r"clang version (\d+(?:\.\d+)*)", text)
+    if m:
+        return "clang " + m.group(1)
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
+    return ("gcc " + m.group(1)) if m else text
+
+
+def fingerprint_norm(fp):
+    """A fingerprint as it is compared: a record from before a key existed gets
+    that key's old default, the host its identity, and the gcc installation flag
+    (which changed its spelling once) is left to the host identity to cover."""
+    fp = dict(fp)
+    fp.setdefault("rtti", False)
+    fp.setdefault("link", "static")
+    fp["host"] = host_identity(fp.get("host", ""))
+    fp["flags"] = [f for f in fp.get("flags", []) if not f.startswith(("--gcc-install-dir=", "--gcc-toolchain="))]
+    return fp
+
+
+def recorded_fingerprint(state):
+    """The options the record was started with, or None."""
+    fp = state.d.get("fingerprint")
+    if not isinstance(fp, dict):
+        return None
+    fp = dict(fp)
+    fp.setdefault("link", (state.d.get("options") or {}).get("link", "static"))   # recorded before --link was compared
+    return fingerprint_norm(fp)
+
+
+def fingerprint_diff(then, now):
+    """One line per option that differs between a record's fingerprint and this run's."""
+    return ["%-7s then %s, now %s" % (k, json.dumps(then.get(k)), json.dumps(now.get(k)))
+            for k in sorted(set(then) | set(now)) if then.get(k) != now.get(k)]
+
+
+def when(stamp):
+    """2026-10-08T00:14:48-0400 -> 2026-10-08 00:14"""
+    m = re.match(r"^(\d{4}-\d\d-\d\d)T(\d\d:\d\d)", stamp or "")
+    return "%s %s" % (m.group(1), m.group(2)) if m else (stamp or "?")
+
+
+def stamp_key(stamp):
+    """The instant a record's stamp names -- for ordering stamps written on either
+    side of a clock change, where the wall-clock text orders wrongly."""
+    try:
+        return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def previous_build_summary(state, root, prefix="", fingerprint=None, size=None):
+    """What an earlier run left in the build directory, as lines for the plan;
+    [] when there is nothing: no stage in the record and nothing on disk.
+    `prefix` is where THIS run would install (the record's when not given);
+    `fingerprint` is this run's options, held against the record's; `size` is
+    dir_size(root) when the caller has it already."""
+    stages = state.d["stages"]
+    try:
+        on_disk = sorted(e for e in os.listdir(root) if e not in (".lock", "state.json"))
+    except OSError:
+        on_disk = []
+    if not stages and not on_disk:
+        return []
+    lines = []
+    stamps = [s.get(k) for s in stages.values() for k in ("started", "finished") if s.get(k)]
+    if stamps:
+        lines.append("started     : %s, last activity %s"
+                     % (when(min(stamps, key=stamp_key)), when(max(stamps, key=stamp_key))))
+    if not stages:
+        lines.append("record      : no stage recorded; what is on disk is reused as found (--restart removes it)")
+    label = "stages      :"
+    for name, _, _ in STAGES:
+        s = stages.get(name)
+        if not s:
+            continue
+        status, error = s.get("status", "?"), s.get("error", "")
+        if status == "running":
+            # The record says so, and this process holds the directory's lock:
+            # nothing IS running.  The tool died without a word (SIGKILL, power).
+            status, error = "killed", "(recorded as running, and nothing is running now)"
+        lines.append(("%s %-20s %-12s %s %s" % (label, name, status, hms(s["seconds"]) if s.get("seconds") else "",
+                                                error)).rstrip())
+        label = " " * len(label)
+    lines.append("on disk     : %s%s" % (human(dir_size(root) if size is None else size),
+                                         "  (%s)" % ", ".join(on_disk) if on_disk else ""))
+    prefix = prefix or state.d.get("prefix") or ""
+    if prefix:
+        lines.append("prefix      : %s  %s" % (prefix, "(EXISTS -- it is never installed over: a run that reaches "
+                                                       "install needs --prefix NEW)" if os.path.exists(prefix)
+                                               else "(not installed yet)"))
+    for n, why in sorted(state.d["dropped"].items()):
+        lines.append("dropped     : %s -- %s" % (n, why))
+    then = recorded_fingerprint(state)
+    if fingerprint is not None and then is not None:
+        fingerprint = fingerprint_norm(fingerprint)
+        if then == fingerprint:
+            lines.append("options     : the same as this run's")
+        elif not stages:
+            lines.append("options     : the record's differ from this run's; nothing was built, so this run's count")
+        else:
+            lines.append("options     : DIFFERENT from this run's -- it cannot be continued with these:")
+            lines += ["              " + l for l in fingerprint_diff(then, fingerprint)]
+    return lines
+
+
+RESUME_QUESTION = {  # fingerprint ok -> (question, what it offers, the default)
+    True: ("Resume it (r), delete everything and start over (d), or quit (q)?", ("resume", "restart", "quit"), "r"),
+    False: ("Delete everything and start over (d), or quit (q)?", ("restart", "quit"), "d")}
+# What is typed -> what it means.  Whole words too: "restart" is this tool's own
+# name for delete-and-start-over, and must not be read as its first letter.
+RESUME_ANSWERS = {"r": "resume", "resume": "resume", "d": "restart", "delete": "restart", "restart": "restart",
+                  "q": "quit", "quit": "quit", "exit": "quit"}
+RESUME_LETTER = {"resume": "r", "restart": "d", "quit": "q"}
+
+
+def resume_decision(opts, state, fingerprint_ok, ask=None):
+    """What to do with a build directory that holds an earlier run: "resume",
+    "restart" (delete it all, then build) or "quit".  A record without a stage
+    (nothing was built) is resumed without a question, whatever its options.
+
+    `ask(question, default)` returns the person's answer ('' means the default,
+    None means the input ended: quit); ask itself is None when there is nobody
+    to ask (no terminal, --yes): then the flags decide, and a build that can be
+    continued is continued -- never deleted on a guess.  --restart and --resume
+    answer without asking.  A record started with OTHER options cannot be
+    continued: the question is delete or quit, Enter deletes, and with nobody
+    to ask the answer is quit -- an error, not a deletion."""
+    if opts["restart"]:
+        return "restart"
+    if not state.d["stages"]:
+        return "resume"                                      # nothing was built: nothing to ask about
+    if fingerprint_ok and (opts["resume"] or ask is None):
+        return "resume"
+    if not fingerprint_ok and (opts["resume"] or ask is None):
+        return "quit"
+    question, offered, default = RESUME_QUESTION[bool(fingerprint_ok)]
+    while True:
+        answer = ask(question, default)
+        if answer is None:
+            return "quit"
+        meaning = RESUME_ANSWERS.get((answer or "").strip().lower() or default)
+        if meaning in offered:
+            return meaning
+        out("  one of: %s" % ", ".join(RESUME_LETTER[m] for m in offered))
+
+
+def ask_eof(prompt, default):
+    """The answer as typed ('' for Enter), or None when the input has ended."""
+    try:
+        return input("\n  %s [%s]: " % (prompt, default)).strip()
+    except EOFError:
+        return None
+
+
+def wipe_build_dir(root):
+    """Everything in the build directory goes -- but the lock this process holds
+    on it, so that no second instance can start in the gap.  The source tree,
+    the built tools and the prefix are elsewhere and untouched.  Symbolic links
+    are removed, never followed (bolt/inst/lib points into stage3)."""
+    try:
+        entries = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return                                               # nothing there, nothing to do
+    except OSError as err:
+        raise ToolError("cannot read %s: %s" % (root, err))
+    # The record goes first: a wipe cut short (^C, a disk error) must not leave a
+    # record that calls stages done whose trees are gone.
+    for e in sorted(entries, key=lambda e: e != "state.json"):
+        if e == ".lock":
+            continue
+        p = os.path.join(root, e)
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+        except OSError as err:
+            raise ToolError("cannot remove %s: %s" % (p, err))
+
+
+def doctor_without_tree(ctx):
+    """The preflight before the source is fetched: the minimums are assumed."""
+    m, o = ctx.machine, ctx.opts
+    tools = os.path.join(ctx.workdir, "tools", "bin")
+    p, allpk = doctor(m, None, pick_host_compiler(m["host_compilers"], {"gcc": (7, 4), "clang": (5, 0)}, o["host_cc"], o["host_cxx"]),
+                      pick_python(m["pythons"], (3, 8), o["python"]), find_tool(["cmake", "cmake3"], tools, (3, 20), o["cmake"]),
+                      find_tool(["ninja", "ninja-build"], tools, NINJA_MIN, o["ninja"]), o)
+    note("the source is not fetched yet: minimums assumed (cmake 3.20, python 3.8, gcc 7.4)")
+    return p, allpk
+
+
+def unfinished_builds(workdir, except_root):
+    """Other build directories under <workdir>/build whose record is not finished."""
+    found = []
+    for sp in sorted(glob.glob(os.path.join(workdir, "build", "*", "state.json"))):
+        root = os.path.dirname(sp)
+        if os.path.normpath(root) == os.path.normpath(except_root):
+            continue
+        st = State(sp)
+        if st.d["stages"] and not st.done("verify"):
+            found.append(root)
+    return found
+
+
+def cmd_build(args):
+    if merge_options(args)["install_deps"]:
+        pre = resolve(args, need_source=False)
+        if pre.tree is None:                                 # a fresh machine: tar, xz, a compiler come before the source
+            install_deps(pre.machine, doctor_without_tree(pre)[1])
+    ctx = resolve(args)
+    opts = ctx.opts
+    problems, allpk = doctor(ctx.machine, ctx.tree, ctx.host, ctx.python, ctx.cmake_found, ctx.ninja_found, opts)
+    if opts["install_deps"]:
+        install_deps(ctx.machine, allpk)
+        ctx = resolve(args)
+        problems, _ = doctor(ctx.machine, ctx.tree, ctx.host, ctx.python, ctx.cmake_found, ctx.ninja_found, opts, quiet=True)
+    if problems:
+        raise ToolError("preflight found %d blocking problem(s) -- fix them, or re-run with --install-deps" % problems)
+    # The only directory this tool ever wipes is <workdir>/build/<name>: merge_options
+    # keeps --build-id a name, and this is the proof.
+    if os.path.dirname(os.path.normpath(ctx.root)) != os.path.normpath(os.path.join(ctx.workdir, "build")):
+        raise ToolError("refusing to build in %s: not a directory under %s" % (ctx.root, os.path.join(ctx.workdir, "build")))
+    lock_dir(ctx.root)
+    state_path = os.path.join(ctx.root, "state.json")
+    ctx.state = State(state_path)
+    fp = fingerprint_norm({"source": ctx.tree.ident(), "host": host_identity(ctx.host), "flags": ctx.flags,
+                           "pgo": ctx.pgo, "rtti": ctx.rtti, "link": ctx.link})
+    fingerprint_ok = recorded_fingerprint(ctx.state) in (None, fp)
+    interactive = UI.tty and sys.stdin.isatty() and not opts["yes"]
+    # A build directory with a past is shown and asked about BEFORE the plan,
+    # because the plan depends on the answer.  Nothing is deleted before Proceed.
+    on_disk = dir_size(ctx.root)
+    previous = previous_build_summary(ctx.state, ctx.root, ctx.prefix, fp, size=on_disk)
+    if previous:
+        say("Previous build in %s" % ctx.root)
+        for line in previous:
+            info(line)
+    decision = resume_decision(opts, ctx.state, fingerprint_ok, ask_eof if interactive else None)
+    if decision == "quit":
+        if not fingerprint_ok and (not interactive or opts["resume"]):
+            raise ToolError("%s was started with other options:\n      %s\n  Finish it with those, delete it with "
+                            "--restart, or build beside it with --build-id NAME."
+                            % (ctx.root, "\n      ".join(fingerprint_diff(recorded_fingerprint(ctx.state) or {}, fp))))
+        info("stopped: nothing was changed.")
+        return 0
+    if decision == "restart" and not previous:
+        decision = "resume"                                  # --restart with nothing there: simply a fresh build
+    if decision == "restart":
+        ctx.state = State(state_path, fresh=True)           # the record as it will be once the directory is wiped
+        ctx.reclaim_gb = on_disk / float(1 << 30)            # ...and the disk as it will be
+    elif previous and not interactive and not opts["resume"]:
+        note("resuming it: nobody to ask (no terminal, or --yes); --restart would start over instead")
+    if opts["retry_dropped"] and ctx.state.d["dropped"]:
+        note("--retry-dropped: trying again: %s" % " ".join(sorted(ctx.state.d["dropped"])))
+        ctx.state.d["dropped"] = {}
+        # In memory only, written at Proceed: an 'n' there, or a refusal before it,
+        # leaves the record as it was.  install and verify too: what is retried has
+        # to reach a prefix -- a new one, since an installed one is never touched.
+        for n in ("stage3", "bolt", "install", "verify"):
+            ctx.state.d["stages"].setdefault(n, {})["status"] = "pending"
+    comps = select_components(ctx.tree, ctx.machine, ctx.python, opts, ctx.state.d["dropped"])
+    show_plan(ctx, comps[4], comps[:4])
+    if ctx.src.get("kind") == "tarball" and opts["version"] in ("latest", "release", "stable"):
+        for other in unfinished_builds(ctx.workdir, ctx.root):
+            note("unfinished  : %s -- another release's build; --version or --build-id continues it instead" % other)
+    if opts["save_profile"]:
+        save_profile(opts["save_profile"], opts)
+
+    names = stage_list(ctx)
+    if opts["run"] != "all":
+        names = [n for n in names if dict((s, r) for s, r, _ in STAGES)[n] == int(opts["run"])]
+    if opts["only"]:
+        names = [n for n in names if n == opts["only"]]
+    if opts["from_stage"] and decision == "restart":
+        note("--from %s: not needed, the build starts over" % opts["from_stage"])
+    elif opts["from_stage"]:
+        allnames = stage_list(ctx)
+        if opts["from_stage"] not in allnames:
+            raise ToolError("--from %s: not a stage of this build's pipeline (%s)" % (opts["from_stage"], " -> ".join(allnames)))
+        for n in allnames[allnames.index(opts["from_stage"]):]:
+            ctx.state.d["stages"].setdefault(n, {})["status"] = "pending"   # in memory until Proceed
+    products = {"stage1": ctx.compilers("stage1")[0], "stage2-instrumented": ctx.compilers("stage2-instrumented")[0],
+                "train": ctx.profdata, "stage2": ctx.compilers("stage2")[0],
+                "stage3": os.path.join(ctx.d("stage3"), "bin", "clang"), "install": os.path.join(ctx.prefix, "bin", "clang")}
+    on_disk_product = lambda n: bolt_applied(ctx) if n == "bolt" else os.path.exists(products[n])
+    # A build that starts over is planned against the directory as the wipe will
+    # leave it -- empty -- not as it is now: `--run 2` + delete needs run 1 again.
+    has_product = (lambda n: False) if decision == "restart" else on_disk_product
+    todo = with_profile_users(stages_to_run(stage_list(ctx), names, ctx.state.done, has_product), names, stage_list(ctx))
+    if "install" in todo and os.path.exists(ctx.prefix):
+        raise ToolError("%s already exists.  Never install over a prefix in use -- pass --prefix." % ctx.prefix)
+    if not todo and opts["only"] not in ("source", "tools"):
+        ok("nothing to do: every stage of this build is done.  (installed in %s)" % (ctx.state.d.get("prefix") or ctx.prefix))
+        return 0
+    need, reclaim = disk_needed(ctx), getattr(ctx, "reclaim_gb", 0.0)
+    if free_gb(ctx.root) + reclaim < need and not opts["ignore_disk"] and "stage3" in todo:
+        raise ToolError("%.0f GB free where the build goes (%s)%s; this plan needs about %d GB.\n  --workdir DIR "
+                        "moves it; --ignore-disk goes ahead anyway."
+                        % (free_gb(ctx.root) + reclaim, ctx.root, " once the previous build is deleted" if reclaim else "", need))
+    info("to do       : " + (" -> ".join(todo) or "(tools only)"))
+    if decision == "restart":
+        info("start over  : everything in %s is deleted first (%s); the source and the tools stay"
+             % (ctx.root, human(on_disk)))
+    # The result is meant to be USED: unless --no-activate (or a profile) says
+    # otherwise, clang-current is pointed at it once every check has passed --
+    # asked once here, where the person still is, never five hours later.
+    current = os.path.join(os.path.dirname(ctx.prefix), "clang-current")
+    ask_activate = opts["activate"] is None
+    if ask_activate:
+        opts["activate"] = True
+    if "verify" in todo:
+        info("activate    : %s -> %s  once every check has passed%s"
+             % (current, ctx.prefix, "" if opts["activate"] else "   (NOT done: --no-activate, or the profile says no)"))
+    if interactive:
+        try:
+            if ask_activate and "verify" in todo:
+                opts["activate"] = (input("\n  Point %s at it when done? (y/n) [y] " % current).strip()
+                                    or "y").lower().startswith("y")
+            if not (input("\n  Proceed? (y/n) [y] ").strip() or "y").lower().startswith("y"):
+                info("stopped before building anything.")
+                return 0
+        except EOFError:
+            info("stopped before building anything: the input ended.")
+            return 0
+    if decision == "restart":
+        wipe_build_dir(ctx.root)
+        note("removed the previous build from %s" % ctx.root)
+    ctx.state.d["fingerprint"] = fp
+    ctx.state.d.update(prefix=ctx.prefix, source=ctx.tree.src, options=dict((k, opts[k]) for k in sorted(opts)))
+    ctx.state.save()
+
+    if not ctx.cmake or not ctx.ninja:
+        say("Tools")
+        for name, have in (("cmake", ctx.cmake), ("ninja", ctx.ninja)):
+            if not have:
+                provision(name, ctx.tools_dir, ctx.host, ctx.jobs["jobs"])
+        tb = os.path.join(ctx.tools_dir, "bin")
+        ctx.cmake = ctx.cmake or find_tool(["cmake"], tb, ctx.tree.cmake_min)[0]
+        ctx.ninja = ctx.ninja or find_tool(["ninja"], tb, NINJA_MIN)[0]
+        if not ctx.cmake or not ctx.ninja:
+            raise ToolError("provisioning did not produce a usable cmake/ninja in %s" % tb)
+
+    if opts["only"] in ("source", "tools"):
+        ok("source: %s   cmake: %s   ninja: %s" % (ctx.tree.src, ctx.cmake, ctx.ninja))
+        return 0
+    fns = {"stage1": do_stage1, "stage2-instrumented": do_stage2i, "train": do_train, "stage2": do_stage2,
+           "stage3": do_stage3, "bolt": do_bolt, "install": do_install, "verify": do_verify}
+    what = dict((s, w) for s, _, w in STAGES)
+    began = time.time()
+    for n in todo:
+        say("%s  --  %s" % (n, what[n]))
+        t0 = time.time()
+        before = ctx.state.stage(n)                          # a stage resumed after an interruption keeps its hours
+        prior = before.get("seconds", 0) if before.get("status") in ("interrupted", "failed", "running") else 0
+        ctx.state.set_stage(n, status="running", started=now(), finished="", error="", seconds=prior)
+        try:
+            fns[n](ctx)
+        except KeyboardInterrupt:
+            ctx.state.set_stage(n, status="interrupted", finished=now(), seconds=prior + int(time.time() - t0))
+            raise
+        except Exception as e:
+            ctx.state.set_stage(n, status="failed", finished=now(), seconds=prior + int(time.time() - t0),
+                                error=(str(e).splitlines() or [type(e).__name__])[0][:300])
+            raise
+        ctx.state.set_stage(n, status="done", finished=now(), seconds=prior + int(time.time() - t0))
+        ok("%s done in %s" % (n, hms(time.time() - t0)))
+    say("Done in %s" % hms(time.time() - began))
+    if "verify" in todo and ctx.state.done("verify") and os.path.isdir(ctx.prefix):
+        # stage2 STAYS, for as long as the stage3 tree does: every object in stage3
+        # was compiled by it and depends on the headers inside it.  Removing it
+        # (as this tool once did) orphans the tree -- --retry-dropped, --check or a
+        # one-line fix then costs a full rebuild.  `clean` removes the pair.
+        dropped = ctx.state.d["dropped"]
+        info("toolchain   : %s" % ctx.prefix)
+        info("              everything this tree declares%s" % (", EXCEPT:" if dropped else " was built."))
+        for n, why in sorted(dropped.items()):
+            info("                %-20s %s" % (n, why))
+        info("build dir   : %s  (%s: stage2 + stage3, kept so that a re-run is incremental; `clean` removes them)"
+             % (ctx.root, human(dir_size(ctx.d("stage3")) + dir_size(ctx.d("stage2")))))
+        current = os.path.join(os.path.dirname(ctx.prefix), "clang-current")
+        if opts["activate"] and os.path.isdir(current) and not os.path.islink(current):
+            warn("%s is a real directory, not a link: left alone.  Move it aside, then:  ln -sfn %s %s"
+                 % (current, ctx.prefix, current))
+        elif opts["activate"]:
+            tmp = current + ".new"
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+            os.symlink(ctx.prefix, tmp)
+            os.replace(tmp, current)
+            ok("activated: %s -> %s" % (current, ctx.prefix))
+        else:
+            info("activate    : ln -sfn %s %s      (NOT done: --no-activate, or you said no)" % (ctx.prefix, current))
+            info("              point PATH at the SYMLINK, not the versioned directory; the next rebuild is one ln.")
+    elif opts["run"] == "1":
+        info("run 1 is complete: the stage2 compiler is %s" % ctx.compilers("stage2")[0])
+        info("run 2 builds everything with it:  %s build --run 2 ..." % os.path.basename(sys.argv[0]))
+    return 0
+
+
+def cmd_status(args):
+    opts = merge_options(args)
+    base = os.path.join(os.path.abspath(os.path.expanduser(opts["workdir"])), "build")
+    roots = sorted(glob.glob(os.path.join(base, "*", "state.json")))
+    if not roots:
+        info("no builds under %s" % base)
+        return 0
+    for sp in roots:
+        st = State(sp)
+        say(os.path.dirname(sp))
+        info("prefix : %s%s" % (st.d.get("prefix", "?"), "  (installed)" if os.path.isdir(st.d.get("prefix", "/nonexistent")) else ""))
+        held = lock_is_held(os.path.dirname(sp))
+        for name, _, _ in STAGES:
+            s = st.stage(name)
+            if s:
+                status = s.get("status", "?")
+                if status == "running" and not held:
+                    status = "killed"                        # the record says running; nobody holds the lock
+                info("  %-20s %-12s %s %s" % (name, status, hms(s["seconds"]) if s.get("seconds") else "", s.get("error", "")))
+        for n, why in sorted(st.d["dropped"].items()):
+            note("dropped: %s -- %s" % (n, why))
+    return 0
+
+
+def cmd_versions(args):
+    rels = get_releases()
+    say("LLVM releases")
+    for r in rels[:int(getattr(args, "count", 15) or 15)]:
+        info("%-10s %s%s" % (r["version"], r["url"], "" if r["sha256"] else "   (no published checksum)"))
+    return 0
+
+
+def cmd_detect(args):
+    m = detect_machine()
+    if getattr(args, "json", False):
+        out(json.dumps(m, indent=1, sort_keys=True, default=str))
+        return 0
+    say("This machine")
+    info("%s, %s, %d CPUs, %.0f GB RAM (%.0f available), packages: %s"
+         % (m["os"], m["arch"], m["cpus"], m["mem_total_gb"], m["mem_avail_gb"], m["pkg_manager"] or "?"))
+    for c in m["host_compilers"]:
+        info("compiler : %-50s %s  [%s]" % (c["banner"][:50], c["path"], c["origin"]))
+    for p in m["pythons"]:
+        info("python   : %s %s %s%s%s" % (p["path"], vstr(p["version"]), p["impl"],
+                                         "  yaml" if p["yaml"] else "", "  Python.h" if p["devel"] else ""))
+    info("headers  : " + " ".join("%s=%s" % (k, "yes" if v else "no") for k, v in sorted(m["headers"].items())))
+    return 0
+
+
+def cmd_doctor(args):
+    ctx = resolve(args, need_source=False)
+    if ctx.tree is None:
+        p, allpk = doctor_without_tree(ctx)
+    else:
+        p, allpk = doctor(ctx.machine, ctx.tree, ctx.host, ctx.python, ctx.cmake_found, ctx.ninja_found, ctx.opts)
+    if ctx.opts["install_deps"]:
+        install_deps(ctx.machine, allpk)
+    return 1 if p else 0
+
+
+def cmd_verify(args):
+    prefix = os.path.abspath(os.path.expanduser(args.prefix_arg))
+    if not os.path.exists(os.path.join(prefix, "bin", "clang")):
+        raise ToolError("no bin/clang under %s" % prefix)
+    do_verify(None, prefix)
+    return 0
+
+
+def cmd_clean(args):
+    opts = merge_options(args)
+    if opts["build_id"]:                                     # named: no source tree needed, 'latest' may have moved on
+        root = os.path.join(os.path.abspath(os.path.expanduser(opts["workdir"])), "build", opts["build_id"])
+    else:
+        ctx = resolve(args, need_source=False)
+        if ctx.tree is None:
+            raise ToolError("nothing to clean: the source for this selection was never fetched (--build-id NAME "
+                            "names a build directory directly)")
+        root = ctx.root
+    if not os.path.isdir(root):
+        info("no build directory %s" % root)
+        return 0
+    lock_dir(root)
+    size = dir_size(root)
+    keep = ("state.json", "logs", "clang.profdata", ".lock")
+    for e in os.listdir(root):
+        if e in keep and not getattr(args, "all", False):
+            continue
+        if e == ".lock":
+            continue
+        p = os.path.join(root, e)
+        shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) and not os.path.islink(p) else os.unlink(p)
+    ok("freed %s in %s%s" % (human(size - dir_size(root)), root,
+                             "" if getattr(args, "all", False) else "  (kept: the record, the logs, the profile)"))
+    return 0
+
+
+# ---------------------------------------------------- choosing: toolchains, wizard
+
+def compiler_tags(c, mins, check=True, sets=None):
+    """-> (tags, usable).  What a person choosing a stage0 needs to know about it."""
+    tags = [c["origin"]]
+    need = mins.get(c["kind"], ())
+    if not c["cxx"]:
+        return tags + ["no C++ partner beside it"], False
+    if not ver_ge(c["version"], need):
+        return tags + ["too old: this tree needs %s >= %s" % (c["kind"], vstr(need))], False
+    if c["kind"] == "clang":
+        tags.append("lld beside it" if c["lld"] else "no lld: stage1 links with the system linker")
+    if c.get("gcc_install") and not c.get("rpath"):
+        tags.append("later stages get --gcc-install-dir=%s" % c["gcc_install"])
+    elif c.get("gcc_prefix") and not c.get("rpath"):
+        tags.append("later stages get --gcc-toolchain=%s" % c["gcc_prefix"])
+    if c.get("rpath"):
+        tags.append("NOT PORTABLE: brings its own libstdc++ -- the finished toolchain needs %s at run time" % c["rpath"])
+    usable = True
+    if check:
+        bdir, usable, why = pick_binutils(c, sets or [])
+        if bdir:
+            tags.append("needs a newer assembler than the system's: would use the binutils in %s" % bdir)
+        if not usable:
+            tags.append("BROKEN in a clean environment: " + why)
+    return tags, usable
+
+
+def show_compilers(cands, mins, chosen=None, numbered=False, check=True, sets=None):
+    """-> the usable ones, in the order shown."""
+    usable = []
+    for c in cands:
+        tags, good = compiler_tags(c, mins, check, sets)
+        if good:
+            usable.append(c)
+        mark = ("%2d)" % len(usable)) if numbered and good else "   " if numbered else "  -"
+        out("  %s %-5s %-10s %s%s" % (mark, c["kind"], vstr(c["version"]), c["path"].replace(os.path.expanduser("~"), "~"),
+                                      "    <- would be used" if chosen and c["path"] == chosen["path"] else ""))
+        out("        " + "; ".join(tags))
+    return usable
+
+
+def cmd_toolchains(args):
+    """Every compiler, python, cmake, ninja and linker here; which would be used, and why."""
+    ctx = resolve(args, need_source=False)
+    m, o, tree = ctx.machine, ctx.opts, ctx.tree
+    mins = tree.cc_min if tree else {"gcc": (7, 4), "clang": (5, 0)}
+    pymin = tree.python_min if tree else (3, 8)
+    cmin = tree.cmake_min if tree else (3, 20)
+    if not tree:
+        note("the source is not fetched yet: minimums assumed (gcc 7.4 / clang 5, python 3.8, cmake 3.20)")
+    tools = os.path.join(ctx.workdir, "tools", "bin")
+    host = ctx.host if tree else pick_host_compiler(m["host_compilers"], mins, o["host_cc"], o["host_cxx"])
+    say("Stage0 compilers  (--host-cc PATH [--host-cxx PATH]; default: the system's clang, else its gcc)")
+    show_compilers(m["host_compilers"], mins, host, check=not getattr(args, "no_check", False), sets=m["binutils"])
+    if host and host["path"] not in [c["path"] for c in m["host_compilers"]]:
+        out("  - %-5s %-10s %s    <- would be used (given with --host-cc)" % (host["kind"], vstr(host["version"]), host["path"]))
+    py = ctx.python if tree else pick_python(m["pythons"], pymin, o["python"])
+    say("Pythons for the BUILD  (--python PATH; needs CPython >= %s; the one with yaml is preferred)" % vstr(pymin))
+    for c in m["pythons"]:
+        tags = [c["origin"], c["impl"]] + (["yaml"] if c["yaml"] else ["no yaml: LLVM libc would be skipped"]) + \
+               (["Python.h"] if c["devel"] else ["no Python.h: lldb without python scripting"]) + \
+               ([] if ver_ge(c["version"], pymin) else ["too old"])
+        out("  - %-10s %s%s" % (vstr(c["version"]), c["path"].replace(os.path.expanduser("~"), "~"),
+                                "    <- would be used" if py and c["path"] == py["path"] else ""))
+        out("        " + "; ".join(tags))
+    say("cmake and ninja  (--cmake PATH, --ninja PATH; --provision cmake,ninja builds pinned ones)")
+    for label, names, minimum, forced, key in (("cmake", ["cmake", "cmake3"], cmin, o["cmake"], "cmake"),
+                                              ("ninja", ["ninja", "ninja-build"], NINJA_MIN, o["ninja"], "ninja")):
+        chosen = find_tool(names, tools, minimum, forced)
+        seen = set()
+        for d in [tools] + tool_search_dirs():
+            for n in names:
+                path = os.path.join(d, n)
+                if os.access(path, os.X_OK) and os.path.isfile(path) and os.path.realpath(path) not in seen:
+                    seen.add(os.path.realpath(path))
+                    v = tool_version(path)
+                    out("  - %-6s %-9s %s%s%s%s" % (label, vstr(v), path.replace(os.path.expanduser("~"), "~"),
+                                                   "" if ver_ge(v, minimum) else "   (too old: needs >= %s)" % vstr(minimum),
+                                                   "" if d in [tools] + SYSTEM_PATH else "   (not searched: --%s PATH uses it)" % label,
+                                                   "    <- would be used" if path == chosen[0] else ""))
+        if not chosen[0]:
+            out("  - %-6s none new enough (>= %s): %s %s will be BUILT from source"
+                % (label, vstr(minimum), label, PROVISION[key]["version"]))
+    say("GNU binutils sets  (--host-binutils DIR; default auto: what the chosen compiler finds, or needs)")
+    for bset in m["binutils"]:
+        out("  - %-8s %s%s" % (vstr(bset["version"]), bset["dir"].replace(os.path.expanduser("~"), "~"),
+                               "    <- would be used" if host and host.get("binutils_dir") == bset["dir"] else
+                               "    (the system's)" if bset["system"] else ""))
+    say("Linkers for stage1  (--host-linker %s; later stages always use their own lld)" % "|".join(HOST_LINKERS))
+    for name in ("ld.lld", "ld.gold", "ld.bfd", "mold", "ld"):
+        path = which(name)
+        if path:
+            out("  - %-8s %s" % (name, path))
+    default = "lld" if host and host["kind"] == "clang" and host.get("lld") else "the compiler's own default"
+    info("would be used: %s" % (o["host_linker"] if o["host_linker"] != "default" else default))
+    return 0
+
+
+def cmd_profiles(args):
+    profs = list_profiles()
+    say("Saved profiles  (%s)" % profiles_dir())
+    if not profs:
+        info("none yet: the wizard offers to save one, and so does --save-profile NAME")
+    for pr in profs:
+        out("  %-24s %s   %s" % (pr["name"], time.strftime("%Y-%m-%d %H:%M", time.localtime(pr["mtime"])), pr["summary"]))
+    return 0
+
+
+def ask(prompt, default=""):
+    try:
+        ans = input("%s [%s]: " % (prompt, default)).strip()
+    except EOFError:
+        ans = ""
+    return ans or default
+
+
+def ask_choice(title, options, default):
+    """options: [(key, label)].  Accepts the number or the key."""
+    if default not in [k for k, _ in options]:
+        options = list(options) + [(default, "as given on the command line / in the profile")]
+    out("\n" + _c("1", title))
+    for i, (key, label) in enumerate(options, 1):
+        out("  %2d) %-12s %s%s" % (i, key, label, "   <- default" if key == default else ""))
+    while True:
+        ans = ask("choose", default)
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            return options[int(ans) - 1][0]
+        if ans in [k for k, _ in options]:
+            return ans
+        out("  a number from the list, or one of the keys")
+
+
+def choose_profile(profs):
+    """The FIRST thing the wizard shows.  -> {path, name, as_is} or None (new)."""
+    if not profs:
+        return None
+    say("Saved profiles")
+    for i, pr in enumerate(profs, 1):
+        out("  %2d) %-24s %s   %s" % (i, pr["name"], time.strftime("%Y-%m-%d %H:%M", time.localtime(pr["mtime"])), pr["summary"]))
+    out("   n) new -- answer the questions")
+    while True:
+        ans = ask("profile", "1")
+        if ans.lower() in ("n", "new"):
+            return None
+        pick = profs[int(ans) - 1] if ans.isdigit() and 1 <= int(ans) <= len(profs) else \
+            next((pr for pr in profs if pr["name"] == ans), None)
+        if pick:
+            break
+        out("  a number from the list, a profile's name, or n")
+    how = ask("use it as it is, or edit it? (u/e)", "u")
+    return {"path": pick["path"], "name": pick["name"], "as_is": not how.lower().startswith("e")}
+
+
+def wizard(opts, machine):
+    """Every question is also a flag, and every answer can be saved as a profile.
+    Each has a default good enough to press Enter through: the latest release,
+    the system's compiler, portable, PGO + ThinLTO, everything."""
+    cur = "source" if opts["source"] else "ref" if opts["ref"] else \
+        "latest" if opts["version"] in ("latest", "release", "stable") else "version"
+    kind = ask_choice("Which LLVM?", [("latest", "the newest release (a tarball, checksum verified when published)"),
+                                      ("version", "a release you name: X.Y.Z"),
+                                      ("ref", "a git branch or tag: main, release/21.x, llvmorg-21.1.0"),
+                                      ("source", "an llvm-project tree you already have (used read-only)")], cur)
+    opts["version"], opts["ref"], opts["source"] = ("latest", "", "") if kind == "latest" else \
+        (opts["version"], opts["ref"], opts["source"])
+    if kind == "version":
+        try:
+            out("  available: " + "  ".join(r["version"] for r in get_releases()[:10]))
+        except ToolError:
+            pass
+        opts["version"], opts["ref"], opts["source"] = ask("version", opts["version"] if cur == "version" else ""), "", ""
+    elif kind == "ref":
+        opts["ref"], opts["version"], opts["source"] = ask("branch or tag", opts["ref"] or "main"), "latest", ""
+    elif kind == "source":
+        opts["source"], opts["version"], opts["ref"] = ask("path to the tree", opts["source"]), "latest", ""
+
+    mins = {"gcc": (7, 4), "clang": (5, 0)}
+    if opts["source"] and os.path.isdir(os.path.join(os.path.expanduser(opts["source"]), "llvm")):
+        mins = Tree(os.path.expanduser(opts["source"])).cc_min
+    out("\n" + _c("1", "Stage0: the compiler that builds stage1"))
+    auto = pick_host_compiler(machine["host_compilers"], mins)
+    usable = show_compilers(machine["host_compilers"], mins, None, numbered=True, sets=machine["binutils"])
+    out("   a) auto -- %s" % (auto["path"] if auto else "NONE usable: install gcc-c++ first"))
+    default = next((str(i) for i, c in enumerate(usable, 1) if c["path"] == opts["host_cc"]), opts["host_cc"] or "a")
+    while True:
+        ans = ask("compiler: a number, a, or a path", default)
+        if ans.lower() in ("a", "auto"):
+            opts["host_cc"] = opts["host_cxx"] = ""
+            break
+        if ans.isdigit() and 1 <= int(ans) <= len(usable):
+            opts["host_cc"], opts["host_cxx"] = usable[int(ans) - 1]["path"], ""
+            break
+        if os.sep in ans and compiler_info(os.path.expanduser(ans)):
+            opts["host_cc"], opts["host_cxx"] = os.path.expanduser(ans), ""
+            break
+        out("  a number from the list, a, or the path of a gcc or clang")
+    good_py = [p for p in machine["pythons"] if p["impl"] == "cpython" and ver_ge(p["version"], (3, 8))]
+    if len(good_py) > 1:
+        autopy = pick_python(machine["pythons"], (3, 8))
+        pick = ask_choice("Python for the build", [("auto", "%s%s" % (autopy["path"], " (has yaml)" if autopy["yaml"] else ""))] + [
+            (p["path"], "%s%s%s" % (vstr(p["version"]), ", yaml" if p["yaml"] else ", NO yaml", ", Python.h" if p["devel"] else ""))
+            for p in good_py], opts["python"] or "auto")
+        opts["python"] = "" if pick == "auto" else pick
+    levels = [("x86-64-v2", "SSE4.2 era, 2009+"), ("x86-64-v3", "AVX2 era, 2013+"), ("x86-64-v4", "AVX-512")] \
+        if machine["arch"] == "x86_64" else []
+    detected, why = auto_tune(machine)
+    opts["tune"] = ask_choice("Tuning of the toolchain's own binaries",
+                              [("auto", "%s  (%s)" % (" ".join(detected) or "portable", why))] +
+                              [("portable", "no -march: runs on any %s machine" % machine["arch"]),
+                               ("native", "-march=native: this CPU and newer only")] + levels, opts["tune"])
+    opts["pgo"] = ask_choice("Profile-guided optimisation", [("on", "instrumented stage + training: about +35 min, a ~20% faster compiler"),
+                                                             ("off", "skip it")], "on" if opts["pgo"] else "off") == "on"
+    opts["lto"] = ask_choice("LTO for the final stage", [("thin", "ThinLTO: the usual choice"), ("full", "slower to build, needs much more memory"),
+                                                         ("off", "fastest build")], opts["lto"])
+    if machine["arch"] in BOLT_ARCHES:
+        opts["bolt"] = ask_choice("BOLT post-link layout of clang and lld",
+                                  [("on", "instrumented pair + training: about +30 min, a few % more speed"),
+                                   ("off", "skip it")], "on" if opts["bolt"] else "off") == "on"
+    out("\n" + _c("1", "What to build") + "  -- the default is EVERYTHING the tree declares")
+    opts["without"] = ask("leave out (comma list, e.g. flang,lldb; 'none' for nothing)", opts["without"] or "none")
+    opts["without"] = "" if opts["without"].strip().lower() == "none" else opts["without"].replace(" ", "")
+    opts["prefix"] = ask("\ninstall prefix (empty = ~/opt/clang-<version>)", opts["prefix"] or "")
+    opts["activate"] = ask("point clang-current at it when every check has passed? (y/n)",
+                           "n" if opts["activate"] is False else "y").lower().startswith("y")
+    name = ask("save these answers as a profile? (a name, or empty)", opts.get("_profile_name", ""))
+    if name:
+        save_profile(name, opts)
+    return opts
+
+
+def cmd_wizard(args):
+    if not sys.stdin.isatty():
+        out("Not a terminal: nothing to ask.  Use `build` with flags or --profile; see --help.")
+        return 2
+    reuse = choose_profile(list_profiles())             # FIRST: before anything else is asked
+    if reuse:
+        args.profile = reuse["path"]
+    opts = merge_options(args)
+    if reuse:
+        opts["_profile_name"] = reuse["name"]
+    if not (reuse and reuse["as_is"]):
+        opts = wizard(opts, detect_machine())
+    for k in DEFAULTS:                                   # hand the answers to `build` as if they were flags
+        setattr(args, k, opts[k])
+    args.profile = None
+    return cmd_build(args)
+
+
+def add_build_options(p):
+    g = p.add_argument_group("what to build")
+    g.add_argument("--version", help="an LLVM release X.Y.Z, or 'latest' (default)")
+    g.add_argument("--ref", help="a git branch or tag instead: main, release/21.x, llvmorg-21.1.0")
+    g.add_argument("--source", help="an llvm-project tree you already have (used read-only)")
+    g.add_argument("--projects", help="comma list, default all the tree declares")
+    g.add_argument("--runtimes", help="comma list, default all the tree declares")
+    g.add_argument("--without", help="comma list of optional components to leave out")
+    g.add_argument("--targets", help="all (default), host, or a comma list: X86,AArch64")
+    g.add_argument("--no-experimental-targets", dest="experimental_targets", action="store_false", default=None,
+                   help="leave out the experimental targets (ARC, CSKY, DirectX, M68k, Xtensa...)")
+    g = p.add_argument_group("how")
+    g.add_argument("--prefix", help="where to install (default ~/opt/clang-<version>; must not exist)")
+    g.add_argument("--workdir", help="sources, build trees, built tools (default ~/src/enterprise_clang_tool)")
+    g.add_argument("--build-id", dest="build_id", help="name of the build directory (default: the version)")
+    g.add_argument("--provision", help="cmake,ninja: build the pinned versions from source and use those, "
+                   "whatever the machine has (automatic when its own are missing or too old)")
+    g.add_argument("--host-cc", dest="host_cc", help="the stage0 C compiler (default: the system's clang, else gcc); see `toolchains`")
+    g.add_argument("--host-cxx", dest="host_cxx", help="its C++ partner, if it is not the obvious one beside it")
+    g.add_argument("--host-binutils", dest="host_binutils", help="auto (default) | a directory holding `as` and `ld`: the "
+                   "binutils stage0 uses.  auto finds the newer set a private gcc was built against")
+    g.add_argument("--host-linker", dest="host_linker", help="default | lld | gold | bfd | mold  -- for stage1 only")
+    g.add_argument("--python", help="the python the BUILD uses (default: a CPython >= the tree's minimum that has yaml)")
+    g.add_argument("--cmake", help="a cmake to use")
+    g.add_argument("--ninja", help="a ninja to use")
+    g.add_argument("--profile", help="load choices from a saved profile (a name, or a path)")
+    g.add_argument("--save-profile", dest="save_profile", help="save this run's choices under a name")
+    g.add_argument("--tune", help="auto (default: the x86-64 level this CPU has, -mtune for this CPU) | portable "
+                   "| native | an ISA level such as x86-64-v3 | raw flags")
+    g.add_argument("--lto", help="thin (default) | full | off   -- for stage3")
+    g.add_argument("--no-pgo", dest="pgo", action="store_false", default=None, help="skip the instrumented stage and training")
+    g.add_argument("--link", help="static (default; fastest compiler) | dylib (smallest install)")
+    g.add_argument("--no-bolt", dest="bolt", action="store_false", default=None,
+                   help="skip the BOLT post-link layout of clang and lld")
+    g.add_argument("--no-rtti", dest="rtti", action="store_false", default=None,
+                   help="LLVM_ENABLE_RTTI=OFF, upstream's default (on here: Mesa and friends need it)")
+    g.add_argument("--rtti", dest="rtti", action="store_true", default=None, help=argparse.SUPPRESS)
+    g.add_argument("--strip", action="store_true", default=None, help="install/strip instead of install")
+    g.add_argument("--check", action="store_true", default=None, help="configure stage3 with the test suites")
+    g.add_argument("--jobs", type=int, help="ninja -j (default: CPUs)")
+    g.add_argument("--link-jobs", dest="link_jobs", type=int, help="concurrent links (default: from available memory)")
+    g = p.add_argument_group("which part")
+    g.add_argument("--run", help="1 = bootstrap up to stage2, 2 = everything + install + verify, all (default)")
+    g.add_argument("--from", dest="from_stage", help="redo from this stage on")
+    g.add_argument("--only", help="just this stage")
+    g.add_argument("--resume", action="store_true", default=None,
+                   help="continue the earlier run in this build directory, without being asked")
+    g.add_argument("--restart", action="store_true", default=None,
+                   help="delete the earlier run in this build directory first, without being asked")
+    g.add_argument("--retry-dropped", dest="retry_dropped", action="store_true", default=None,
+                   help="try again the components an earlier attempt dropped")
+    g.add_argument("--keep-stages", dest="keep_stages", action="store_true", default=None,
+                   help="keep stage1 / instrumented / training trees (about +35 GB)")
+    g.add_argument("--activate", action="store_true", default=None,
+                   help="point <prefix parent>/clang-current at the result (the default; asked once on a terminal)")
+    g.add_argument("--no-activate", dest="activate", action="store_false", default=None,
+                   help="build and install, but leave clang-current where it points")
+    g.add_argument("--install-deps", dest="install_deps", action="store_true", default=None, help="sudo <package manager> install ...")
+    g.add_argument("--ignore-disk", dest="ignore_disk", action="store_true", default=None,
+                   help="build even where less disk is free than the plan needs")
+    g.add_argument("--yes", "-y", action="store_true", default=None,
+                   help="ask nothing: Proceed is yes, an earlier run is resumed (never deleted; --restart does that)")
+    g.add_argument("--verbose", "-v", action="store_true", default=None, help="the whole build output on the console")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog=TOOL + ".py", description="Build a complete, bootstrapped (stage3), "
+                                "PGO + LTO optimised LLVM/clang toolchain from source.")
+    p.add_argument("--tool-version", action="version", version="%s %s" % (TOOL, VERSION))
+    sub = p.add_subparsers(dest="command")
+    for name, helptext in (("build", "fetch, bootstrap, build everything, install, verify (resumable)"),
+                           ("plan", "resolve everything and print it; build nothing"),
+                           ("doctor", "preflight: what is missing, and the command that installs it"),
+                           ("clean", "remove a build directory's trees (keeps the record, logs and profile; --all removes those too)")):
+        sp = sub.add_parser(name, help=helptext)
+        add_build_options(sp)
+        if name == "clean":
+            sp.add_argument("--all", action="store_true", help="the record, the logs and the profile too")
+    sp = sub.add_parser("wizard", help="ask the questions (what you get with no command on a terminal)")
+    add_build_options(sp)
+    sp = sub.add_parser("toolchains", help="every compiler, python, cmake, ninja and linker here; which would be used")
+    add_build_options(sp)
+    sp.add_argument("--no-check", dest="no_check", action="store_true", help="do not test-compile with each compiler")
+    sub.add_parser("profiles", help="saved profiles")
+    sp = sub.add_parser("status", help="every build under the work directory, stage by stage")
+    sp.add_argument("--workdir", help="where the builds are (default ~/src/enterprise_clang_tool)")
+    sp = sub.add_parser("versions", help="LLVM releases available now")
+    sp.add_argument("--count", type=int, default=15, help="how many to list (default 15)")
+    sp = sub.add_parser("detect", help="what this machine has")
+    sp.add_argument("--json", action="store_true", help="as JSON")
+    sp = sub.add_parser("verify", help="run the post-install checks against an installed prefix")
+    sp.add_argument("prefix_arg", metavar="PREFIX")
+    return p
+
+
+def _as_interrupt(signum, frame):
+    raise KeyboardInterrupt()
+
+
+def main(argv=None):
+    parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not any(not a.startswith("-") for a in argv) and sys.stdin.isatty() and sys.stdout.isatty() \
+            and not any(a in ("-h", "--help", "--tool-version") for a in argv):
+        argv = ["wizard"] + argv                      # no command, a terminal: the wizard
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 2
+    # SIGTERM / SIGHUP take the ^C path so a finally runs and the record is right;
+    # a SIGHUP somebody chose to ignore (`nohup ... &`) stays ignored.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, _as_interrupt)
+    try:
+        return {"build": cmd_build, "plan": cmd_plan, "doctor": cmd_doctor, "status": cmd_status,
+                "versions": cmd_versions, "detect": cmd_detect, "verify": cmd_verify,
+                "clean": cmd_clean, "toolchains": cmd_toolchains, "profiles": cmd_profiles,
+                "wizard": cmd_wizard}[args.command](args)
+    except ToolError as e:
+        out("\n" + _c("31", "ERROR:") + " " + str(e))
+        return 1
+    except OSError as e:                                     # a full disk, a permission: said plainly
+        out("\n" + _c("31", "ERROR:") + " " + str(e))
+        return 1
+    except KeyboardInterrupt:
+        out("\ninterrupted -- `build` again shows where things stand and continues from there.")
+        return 130
+
+
+def _ensure_platform_python():
+    """Started as `python3 tool.py` where python3 is PyPy or a private build?  The
+    tool itself is happy anywhere; this only keeps behaviour identical."""
+    impl = getattr(sys.implementation, "name", "cpython")
+    if impl != "cpython" and os.access(PLATFORM_PYTHON, os.X_OK) and not os.environ.get("ECT_NO_REEXEC"):
+        os.environ["ECT_NO_REEXEC"] = "1"
+        os.execv(PLATFORM_PYTHON, [PLATFORM_PYTHON, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+
+
+if __name__ == "__main__":
+    _ensure_platform_python()
+    sys.exit(main())

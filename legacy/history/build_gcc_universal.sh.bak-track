@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+#
+# build_gcc_universal.sh
+#
+# Build an optimised GCC from source on a fresh machine -- Debian/Ubuntu or
+# RHEL/Fedora/Rocky/Alma.  Downloads the source itself, resolves the GMP/MPFR/
+# MPC/ISL prerequisites itself, builds out-of-tree, and installs to a versioned
+# prefix under $HOME.  Runnable from any directory; nothing depends on $PWD.
+#
+#   ./build_gcc_universal.sh
+#
+# Everything is overridable from the environment:
+#
+#   GCC_VERSION=15.2.0  PREFIX=$HOME/opt/gcc-mine  JOBS=8 \
+#   MODE=plain  LANGUAGES=c,c++  INSTALL_DEPS=0  ./build_gcc_universal.sh
+#
+# Root is used only to install distro packages.  The build itself is unprivileged
+# and writes only under $SRC_ROOT and $PREFIX.  Never run this whole script with
+# sudo: it would leave a root-owned tree in your home directory.
+#
+# Expect 2-5 hours and ~30 GB of disk in the default mode.
+#
+# Licence: public domain / CC0.  No warranty.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- configuration
+
+GCC_VERSION="${GCC_VERSION:-auto}"            # 'auto' = newest release on ftp.gnu.org
+SRC_ROOT="${SRC_ROOT:-$HOME/src/gcc-build}"   # tarball + unpacked source live here
+PREFIX="${PREFIX:-}"                          # default computed after version is known
+JOBS="${JOBS:-$(nproc)}"
+INSTALL_DEPS="${INSTALL_DEPS:-1}"             # 0 to skip the package step
+LINK_CURRENT="${LINK_CURRENT:-1}"             # maintain $HOME/opt/gcc-current symlink
+LANGUAGES="${LANGUAGES:-c,c++,lto}"           # add fortran,go,d,objc,ada as needed
+MULTILIB="${MULTILIB:-0}"                     # 1 needs 32-bit headers installed
+
+# MODE -- how hard to work for a faster compiler BINARY.
+#
+#   profiled-lto  (default) PGO + LTO bootstrap.  GCC is built, made to compile
+#                 itself to collect a profile, then rebuilt using it, with LTO
+#                 across the whole compiler.  This is the fastest gcc you can
+#                 produce.  It is also the slowest to build and the most likely
+#                 to hit a compiler-in-development bug.
+#   lto           LTO bootstrap, no profiling.  Most of the win, much less time.
+#   plain         Ordinary 3-stage bootstrap.  Always works.  Use this if a
+#                 fancier mode fails, or if you just want a working gcc today.
+#   quick         Stage-1 only, NO bootstrap.  Fast, but the resulting compiler
+#                 was built by the host compiler and is not self-verified.
+#                 Fine for a throwaway; do not ship from it.
+MODE="${MODE:-profiled-lto}"
+
+# --- Tuning.  Two DIFFERENT things get tuned, and conflating them is the usual
+# --- mistake, so this script keeps them separate.
+#
+# 1. BOOT_ARCH -- flags used to compile the compiler ITSELF.  This binary is
+#    going to sit in your home directory on this machine, so building it for
+#    exactly this CPU is free real speed with no portability cost.  Default:
+#    native.
+BOOT_ARCH="${BOOT_ARCH:--march=native -mtune=native}"
+#
+# 2. WITH_ARCH / WITH_TUNE -- the DEFAULT -march/-mtune baked into the installed
+#    compiler, i.e. what your programs get compiled for when you do not say.
+#    WITH_ARCH is deliberately EMPTY.  Setting it to native means every binary
+#    you subsequently build silently stops running on older machines, which is a
+#    nasty surprise to inherit from a toolchain install.  WITH_TUNE is safe: it
+#    schedules for this CPU but emits no instruction the baseline disallowed.
+#
+#    If this compiler only ever targets machines you control, prefer an ISA
+#    LEVEL over a CPU name -- levels license exactly what a
+#    __builtin_cpu_supports("x86-64-v3") check verifies, whereas -march=haswell
+#    also licenses AES, RDRND, PCLMUL and INVPCID, and that gap is where a
+#    SIGILL on somebody else's box lives:
+#
+#      WITH_ARCH=x86-64-v3 ./build_gcc_universal.sh
+WITH_ARCH="${WITH_ARCH:-}"
+WITH_TUNE="${WITH_TUNE:-native}"
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" -ne 0 ] || die "do not run this as root -- it installs into \$HOME.
+       Run it as yourself; it will call sudo only for the package step."
+
+# ------------------------------------------------------------------ dependencies
+
+DNF_PKGS="gcc gcc-c++ make binutils bison flex texinfo gawk perl diffutils
+          findutils patch tar xz bzip2 gzip wget curl file which
+          zlib-devel glibc-devel"
+APT_PKGS="build-essential bison flex texinfo gawk perl diffutils
+          findutils patch tar xz-utils bzip2 gzip wget curl file
+          zlib1g-dev libc6-dev"
+# GMP/MPFR/MPC/ISL are deliberately NOT in these lists.  GCC ships
+# contrib/download_prerequisites, which fetches the exact versions that release
+# was tested against and builds them in-tree.  Distro versions are a common
+# source of "works on my machine" bootstrap failures.
+
+install_deps() {
+    [ "$INSTALL_DEPS" = 1 ] || { warn "INSTALL_DEPS=0, skipping package install"; return 0; }
+    local mgr=""
+    command -v dnf     >/dev/null && mgr=dnf
+    [ -z "$mgr" ] && command -v apt-get >/dev/null && mgr=apt
+    [ -z "$mgr" ] && { warn "no dnf or apt-get -- install deps yourself, then re-run with INSTALL_DEPS=0"; return 0; }
+
+    say "Installing dependencies with $mgr (sudo)"
+    case "$mgr" in
+      dnf) sudo dnf install -y $DNF_PKGS ;;
+      apt) sudo apt-get update && sudo apt-get install -y $APT_PKGS ;;
+    esac
+    if [ "$MULTILIB" = 1 ]; then
+        case "$mgr" in
+          dnf) sudo dnf install -y glibc-devel.i686 libstdc++-devel.i686 || warn "32-bit headers unavailable; multilib may fail" ;;
+          apt) sudo apt-get install -y gcc-multilib g++-multilib || warn "32-bit headers unavailable; multilib may fail" ;;
+        esac
+    fi
+}
+
+# -------------------------------------------------------------- version discovery
+
+GNU_MIRRORS="https://ftp.gnu.org/gnu/gcc
+             https://mirrors.kernel.org/gnu/gcc
+             https://ftpmirror.gnu.org/gcc"
+
+latest_gcc_version() {
+    local base html v
+    for base in $GNU_MIRRORS; do
+        html=$(curl -fsSL --max-time 30 "$base/" 2>/dev/null) || continue
+        v=$(printf '%s\n' "$html" \
+            | grep -oE 'gcc-[0-9]+\.[0-9]+\.[0-9]+/' \
+            | sed -e 's|^gcc-||' -e 's|/$||' \
+            | sort -V | tail -1)
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done
+    return 1
+}
+
+fetch_tarball() {
+    local v="$1" out="$2" base url
+    for base in $GNU_MIRRORS; do
+        url="$base/gcc-$v/gcc-$v.tar.xz"
+        say "Downloading $url"
+        if curl -fL --retry 3 --retry-delay 5 -o "$out.part" "$url"; then
+            mv "$out.part" "$out"; return 0
+        fi
+        rm -f "$out.part"
+        warn "mirror failed, trying the next one"
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------- preflight
+
+install_deps
+
+say "Preflight"
+for t in curl tar xz make gcc g++ bison flex makeinfo; do
+    command -v "$t" >/dev/null || die "missing: $t (install it, or drop INSTALL_DEPS=0)"
+done
+
+if [ "$GCC_VERSION" = auto ]; then
+    say "Resolving the newest GCC release"
+    GCC_VERSION=$(latest_gcc_version) \
+        || die "could not reach a GNU mirror to discover the latest version.
+       Pass one explicitly:  GCC_VERSION=15.2.0 $0"
+fi
+case "$GCC_VERSION" in
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *) die "GCC_VERSION should look like 15.2.0, got '$GCC_VERSION'" ;;
+esac
+
+PREFIX="${PREFIX:-$HOME/opt/gcc-$GCC_VERSION}"
+SRC="$SRC_ROOT/gcc-$GCC_VERSION"
+BUILD="$SRC_ROOT/build-gcc-$GCC_VERSION"       # MUST be outside $SRC; GCC requires it
+TARBALL="$SRC_ROOT/gcc-$GCC_VERSION.tar.xz"
+
+[ -e "$PREFIX" ] && die "$PREFIX already exists.
+       Never install over a prefix that something may be using.
+       Remove it, or set PREFIX= / GCC_VERSION= to somewhere new."
+
+mkdir -p "$SRC_ROOT"
+avail=$(df -BG --output=avail "$SRC_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+need=30; [ "$MODE" = plain ] && need=15; [ "$MODE" = quick ] && need=10
+[ "${avail:-0}" -ge "$need" ] \
+    || warn "only ${avail:-0}G free at $SRC_ROOT; MODE=$MODE typically needs ~${need}G"
+
+ram=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)
+[ "${ram:-0}" -ge 4 ] || warn "only ${ram}G RAM; an LTO bootstrap links large objects and may OOM.
+       Consider MODE=plain, or a smaller JOBS."
+
+printf '  version   : %s\n'   "$GCC_VERSION"
+printf '  mode      : %s\n'   "$MODE"
+printf '  languages : %s\n'   "$LANGUAGES"
+printf '  prefix    : %s\n'   "$PREFIX"
+printf '  source    : %s\n'   "$SRC"
+printf '  build     : %s\n'   "$BUILD"
+printf '  jobs      : %s\n'   "$JOBS"
+printf '  host cc   : %s\n'   "$(gcc --version | head -1)"
+printf '  boot flags: %s\n'   "$BOOT_ARCH"
+printf '  default   : -march=%s -mtune=%s\n' "${WITH_ARCH:-<unset, portable>}" "$WITH_TUNE"
+printf '  free disk : %sG\n   RAM      : %sG\n' "${avail:-?}" "${ram:-?}"
+
+# ------------------------------------------------------------------------ source
+
+if [ ! -d "$SRC" ]; then
+    [ -f "$TARBALL" ] || fetch_tarball "$GCC_VERSION" "$TARBALL" \
+        || die "could not download gcc-$GCC_VERSION from any mirror"
+    say "Verifying archive integrity"
+    xz -t "$TARBALL" || { rm -f "$TARBALL"; die "tarball is corrupt; re-run to fetch it again"; }
+    say "Unpacking"
+    tar -C "$SRC_ROOT" -xf "$TARBALL"
+    [ -d "$SRC" ] || die "unpacked tree is not at $SRC -- unexpected archive layout"
+else
+    say "Reusing existing source at $SRC"
+fi
+
+if [ ! -e "$SRC/gmp" ]; then
+    say "Fetching in-tree prerequisites (GMP, MPFR, MPC, ISL)"
+    # Run from inside the source tree: the script hardcodes relative paths.
+    ( cd "$SRC" && ./contrib/download_prerequisites ) \
+        || die "download_prerequisites failed -- check network, or install
+       gmp-devel/mpfr-devel/libmpc-devel/isl-devel and re-run with
+       CONFIGURE_EXTRA='--with-system-gmp' style flags."
+else
+    say "Prerequisites already present in the source tree"
+fi
+
+# --------------------------------------------------------------------- configure
+
+say "Configuring (out of tree)"
+rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
+
+CONFIGURE_ARGS=(
+    --prefix="$PREFIX"
+    --enable-languages="$LANGUAGES"
+    --enable-checking=release          # assertions off: a materially faster gcc
+    --enable-threads=posix
+    --enable-__cxa_atexit
+    --enable-lto
+    --enable-plugin
+    --enable-default-pie
+    --with-system-zlib
+    --with-linker-hash-style=gnu
+    --disable-werror                   # newer host compilers warn on older gcc source
+    --with-tune="$WITH_TUNE"
+)
+[ -n "$WITH_ARCH" ] && CONFIGURE_ARGS+=( --with-arch="$WITH_ARCH" )
+[ "$MULTILIB" = 1 ] || CONFIGURE_ARGS+=( --disable-multilib )
+[ "$MODE" = quick ] && CONFIGURE_ARGS+=( --disable-bootstrap )
+# shellcheck disable=SC2206
+[ -n "${CONFIGURE_EXTRA:-}" ] && CONFIGURE_ARGS+=( ${CONFIGURE_EXTRA} )
+
+"$SRC/configure" "${CONFIGURE_ARGS[@]}" 2>&1 | tee "$BUILD/configure.log"
+[ -f "$BUILD/Makefile" ] || die "configure produced no Makefile -- see $BUILD/configure.log"
+
+# ------------------------------------------------------------------------- build
+
+case "$MODE" in
+    profiled-lto) TARGET=profiledbootstrap; BCFG=bootstrap-lto ;;
+    lto)          TARGET=bootstrap;         BCFG=bootstrap-lto ;;
+    plain)        TARGET=bootstrap;         BCFG= ;;
+    quick)        TARGET=;                  BCFG= ;;
+    *) die "unknown MODE='$MODE' (profiled-lto | lto | plain | quick)" ;;
+esac
+
+say "Building: MODE=$MODE  target='${TARGET:-all}'  BUILD_CONFIG='${BCFG:-none}'"
+printf '    This is the long part.  profiled-lto compiles GCC several times on\n'
+printf '    purpose; that is what makes the final binary fast.\n'
+
+MAKE_ARGS=( -j"$JOBS" )
+[ -n "$BCFG" ]   && MAKE_ARGS+=( BUILD_CONFIG="$BCFG" )
+[ -n "$BOOT_ARCH" ] && MAKE_ARGS+=( BOOT_CFLAGS="-O2 -g $BOOT_ARCH" BOOT_CXXFLAGS="-O2 -g $BOOT_ARCH" )
+[ -n "$TARGET" ] && MAKE_ARGS+=( "$TARGET" )
+
+if ! make "${MAKE_ARGS[@]}"; then
+    die "the build failed in MODE=$MODE.
+       If this was profiled-lto or lto, the usual next move is:
+           MODE=plain GCC_VERSION=$GCC_VERSION $0
+       A plain bootstrap is far more forgiving and still produces a good compiler."
+fi
+
+# ----------------------------------------------------------------------- install
+
+say "Installing to $PREFIX"
+make install-strip -j"$JOBS" || make install -j"$JOBS"
+
+# ------------------------------------------------------------------------ verify
+# A compiler that installs but cannot build and RUN a program is not installed.
+
+say "Verifying the installed toolchain"
+GXX="$PREFIX/bin/g++"; GCC="$PREFIX/bin/gcc"
+[ -x "$GCC" ] || die "no gcc at $GCC"
+[ -x "$GXX" ] || die "no g++ at $GXX"
+printf '  %s\n' "$("$GCC" --version | head -1)"
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/t.cc" <<'EOF'
+#include <string>
+#include <vector>
+#include <numeric>
+#include <cstdio>
+int main() {
+    std::vector<int> v(10); std::iota(v.begin(), v.end(), 1);
+    std::string s = "sum=" + std::to_string(std::accumulate(v.begin(), v.end(), 0));
+    std::puts(s.c_str());
+    return s == "sum=55" ? 0 : 1;
+}
+EOF
+# The freshly built libstdc++ must be visible at run time, otherwise the test
+# silently links against the system one and proves nothing about this install.
+LIBDIRS="$PREFIX/lib64:$PREFIX/lib"
+"$GXX" -std=c++20 -O2 "$tmp/t.cc" -o "$tmp/t" \
+    -Wl,-rpath,"$PREFIX/lib64" -Wl,-rpath,"$PREFIX/lib" \
+    || die "the installed g++ cannot compile a C++20 program"
+out=$(LD_LIBRARY_PATH="$LIBDIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$tmp/t") \
+    || die "the test program compiled but did not run cleanly"
+[ "$out" = "sum=55" ] || die "test program printed '$out', expected 'sum=55'"
+printf '  c++20 compile + link + run : ok (%s)\n' "$out"
+
+if [ -n "$WITH_ARCH" ]; then
+    "$GCC" -Q --help=target 2>/dev/null | grep -q -- "-march=.*$WITH_ARCH" \
+        && printf '  default -march              : %s\n' "$WITH_ARCH" \
+        || warn "could not confirm the baked-in default -march"
+fi
+
+# ---------------------------------------------------------------------- activate
+
+if [ "$LINK_CURRENT" = 1 ]; then
+    mkdir -p "$HOME/opt"
+    ln -sfn "$PREFIX" "$HOME/opt/gcc-current"
+    printf '  gcc-current -> %s\n' "$(readlink -f "$HOME/opt/gcc-current")"
+fi
+
+say "Done"
+cat <<EOF
+
+  Installed: $PREFIX
+
+  To use it, put it ahead of the system compiler:
+
+      export PATH="$PREFIX/bin:\$PATH"
+      export LD_LIBRARY_PATH="$PREFIX/lib64:$PREFIX/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+
+  That LD_LIBRARY_PATH matters.  Programs you build with this gcc link against
+  its newer libstdc++, and at run time the dynamic loader must find it -- the
+  system one is older and will refuse with a GLIBCXX_x.y.z version error.
+  The alternative, if you would rather not set it globally, is to bake the path
+  into each binary at link time:
+
+      g++ -Wl,-rpath,$PREFIX/lib64 ...
+
+EOF

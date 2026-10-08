@@ -1,0 +1,17 @@
+
+==> Packaging /home/madness/src/elkt-test/linux-7.2.6 as rpm
+  full log    : /home/madness/Documents/universal_linux_kernel_script/test-runs/elkt-state/package-linux-7.2.6.log
+  [00:03:01]     30 steps  TEST posttest
+Kernel: arch/x86/boot/bzImage is ready  (#6.el10)
+warning: absolute symlink: /lib/modules/7.2.6-elkt/build -> /usr/src/kernels/7.2.6-elkt
+  ok   packaged in 4m42s
+  ok   the kernel image INSIDE kernel-7.2.6_elkt-6.el10.x86_64.rpm is signed with 'madness@siege3 kernel signing key'
+
+==> Ready to publish: /tmp/claude-1000/-home-madness-Documents/cbd9b883-73a7-4c43-8160-de6b1a90a465/scratchpad/pkg-out
+       863 B  INSTALL.txt
+       479 B  SHA256SUMS
+     29.4 MB  kernel-7.2.6_elkt-6.el10.x86_64.rpm
+     10.4 MB  kernel-devel-7.2.6_elkt-6.el10.x86_64.rpm
+      1.6 MB  kernel-headers-7.2.6_elkt-6.el10.x86_64.rpm
+       863 B  secureboot.der
+exit=0

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# build_clang_local.sh -- rebuild the clang trunk toolchain on THIS machine.
+#
+# Three-stage PGO + ThinLTO self-host: stage1 -> instrumented stage2 -> training
+# run -> final stage2.  Installs to a NEW versioned prefix, then repoints
+# ~/opt/clang-current at it.  ~/.bashrc, the kernel tree's GNUmakefile and
+# satellite's LLVM_BIN all read that symlink, so one flip switches everything.
+#
+# Machine-specific by design: fixed paths, fixed -march, bootstraps from the
+# previous prefix.  For a portable version see build_clang_universal.sh.
+set -euo pipefail
+
+VERSION="${VERSION:-24-4}"                       # produces ~/opt/clang-24-4
+BOOTSTRAP="${BOOTSTRAP:-$HOME/opt/clang-24-3}"   # build N with N-1
+SRC="${SRC:-$HOME/source-opt/llvm-24/llvm-project}"
+BUILD="${BUILD:-$HOME/source-opt/llvm-24/build-pgo}"
+PREFIX="$HOME/opt/clang-$VERSION"
+MARCH="${MARCH:--march=x86-64-v3 -mtune=haswell}"
+PY="${PY:-/usr/bin/python3}"                      # NOT bare python3 -- see preflight
+
+# x86-64-v3 and NOT haswell: -march=haswell also licenses AES, RDRND, PCLMUL and
+# INVPCID, which a plain v3 check does not verify.  -mtune is free -- it only
+# schedules, it never emits an instruction -march did not already allow.
+
+say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+say "Preflight"
+[ -x "$BOOTSTRAP/bin/clang++" ] || die "no bootstrap compiler at $BOOTSTRAP/bin/clang++
+       Build N is built with N-1.  Set BOOTSTRAP= to an installed prefix."
+[ -d "$SRC/llvm" ] || die "no LLVM source at $SRC"
+[ -e "$PREFIX" ] && die "$PREFIX already exists -- bump VERSION, never install over a prefix in use"
+for t in cmake ninja git; do command -v "$t" >/dev/null || die "missing: $t"; done
+# Check the interpreter the BUILD uses, not whatever python3 is first on PATH.
+# A PyPy or pyenv shim ahead of /usr/bin will not have yaml, and cmake would
+# never have consulted it anyway.
+[ -x "$PY" ] || die "no interpreter at $PY (set PY= to override)"
+"$PY" -c 'import yaml' 2>/dev/null || die "$PY is missing the yaml module (dnf install python3-pyyaml)"
+
+avail=$(df -BG --output=avail "$(dirname "$BUILD")" | tail -1 | tr -dc '0-9')
+[ "$avail" -ge 60 ] || die "only ${avail}G free; a three-stage PGO build needs ~60G"
+
+printf '  bootstrap : %s\n' "$("$BOOTSTRAP/bin/clang" --version | head -1)"
+printf '  python    : %s\n' "$("$PY" -VV | head -1)"
+printf '  source    : %s\n' "$(git -C "$SRC" log -1 --format=%h 2>/dev/null || echo 'not a git tree')"
+printf '  prefix    : %s\n  jobs      : %s\n  free disk : %sG\n' "$PREFIX" "$(nproc)" "$avail"
+
+# ~/opt/clang-current/lib holds libclang-cpp.so.24.0git and friends, and this
+# build emits those same sonames.  LD_LIBRARY_PATH is searched BEFORE clang's
+# $ORIGIN RUNPATH, so a freshly built binary could load the OLD library.
+unset LD_LIBRARY_PATH
+
+say "Configure"
+rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
+cmake -G Ninja "$SRC/llvm" \
+  -C "$SRC/clang/cmake/caches/PGO.cmake" \
+  -DPGO_INSTRUMENT_LTO=Thin \
+  -DPython3_EXECUTABLE="$PY" \
+  -DLLVM_ENABLE_RUNTIMES="compiler-rt;libcxx;libcxxabi;libunwind;openmp" \
+  -DLLVM_USE_LINKER=lld \
+  -DBOOTSTRAP_LLVM_ENABLE_LLD=ON \
+  -DBOOTSTRAP_BOOTSTRAP_LLVM_ENABLE_LLD=ON \
+  -DBOOTSTRAP_CMAKE_C_FLAGS="$MARCH" \
+  -DBOOTSTRAP_CMAKE_CXX_FLAGS="$MARCH" \
+  -DBOOTSTRAP_BOOTSTRAP_CMAKE_C_FLAGS="$MARCH" \
+  -DBOOTSTRAP_BOOTSTRAP_CMAKE_CXX_FLAGS="$MARCH" \
+  -DCLANG_BOOTSTRAP_TARGETS="generate-profdata;stage2;stage2-install" \
+  -DCLANG_BOOTSTRAP_PASSTHROUGH="CMAKE_INSTALL_PREFIX;LLVM_TARGETS_TO_BUILD;LLVM_ENABLE_RUNTIMES;Python3_EXECUTABLE;CLANG_BOOTSTRAP_PASSTHROUGH" \
+  -DCMAKE_C_COMPILER="$BOOTSTRAP/bin/clang" \
+  -DCMAKE_CXX_COMPILER="$BOOTSTRAP/bin/clang++" \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" 2>&1 | tee "$BUILD/configure.log"
+
+say "Verifying the configure actually armed PGO"
+fail=0
+for want in \
+    "Found Python3: $PY" \
+    'Found Python module yaml' \
+    'lld project is enabled' \
+    'Setting next clang stage to: stage2-instrumented'; do
+  if grep -qF "$want" "$BUILD/configure.log"; then printf '  ok   %s\n' "$want"
+  else printf '  MISS %s\n' "$want"; fail=1; fi
+done
+[ "$fail" -eq 0 ] || die "configure degraded silently -- see $BUILD/configure.log"
+
+say "Building (hours -- stage1, instrumented stage2, training, final stage2)"
+ninja stage2-install
+
+say "Activating"
+# clang-use is a ~/.bashrc function and is not available to a script, so the
+# symlink is made directly.
+ln -sfn "$PREFIX" "$HOME/opt/clang-current"
+printf '  clang-current -> %s\n' "$(readlink -f "$HOME/opt/clang-current")"
+"$PREFIX/bin/clang" --version | head -1
+say "Done. Open a new shell to pick it up."

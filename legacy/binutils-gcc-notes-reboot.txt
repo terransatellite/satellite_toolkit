@@ -1,0 +1,7 @@
+sudo dnf install epel-release m4 expect dejagnu clang llvm-devel gcc-gfortran gcc-go gcc-gdc mingw64-binutils binutils-devel
+
+../binutils-with-gold-2.46/configure --prefix="$HOME/opt/binutils-246" --enable-plugins --enable-lto --enable-gold
+
+export CXXFLAGS="-g -O3 -march=native"
+
+export CFLAGS="-g -O3 -march=native"

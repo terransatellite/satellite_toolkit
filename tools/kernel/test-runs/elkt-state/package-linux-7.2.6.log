@@ -1,0 +1,548 @@
+  GEN     rpmbuild/SPECS/kernel.spec
+rpmbuild -bb rpmbuild/SPECS/kernel.spec --define='_topdir /home/madness/src/elkt-test/linux-7.2.6/rpmbuild' --target x86_64-linux --build-in-place --noprep --define='_smp_mflags %{nil}' $(rpm -q rpm >/dev/null 2>&1 || echo --nodeps)
+Building target platforms: x86_64-linux
+Building for target x86_64-linux
+setting SOURCE_DATE_EPOCH=1789862400
+Executing(%build): /bin/sh -e /var/tmp/rpm-tmp.GktYY5
++ umask 022
++ cd /home/madness/src/elkt-test/linux-7.2.6
++ CFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Werror=format-security -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer '
++ export CFLAGS
++ CXXFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Werror=format-security -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer '
++ export CXXFLAGS
++ FFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -I/usr/lib64/gfortran/modules '
++ export FFLAGS
++ FCFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -I/usr/lib64/gfortran/modules '
++ export FCFLAGS
++ VALAFLAGS=-g
++ export VALAFLAGS
++ LDFLAGS='-Wl,-z,relro -Wl,--as-needed  -Wl,-z,pack-relative-relocs -Wl,-z,now -specs=/usr/lib/rpm/redhat/redhat-hardened-ld -specs=/usr/lib/rpm/redhat/redhat-hardened-ld-errors -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -Wl,--build-id=sha1 -specs=/usr/lib/rpm/redhat/redhat-package-notes '
++ export LDFLAGS
++ LT_SYS_LIBRARY_PATH=/usr/lib64:
++ export LT_SYS_LIBRARY_PATH
++ CC=gcc
++ export CC
++ CXX=g++
++ export CXX
++ make ARCH=x86 KERNELRELEASE=7.2.6-elkt KBUILD_BUILD_VERSION=6.el10
+  DESCEND objtool
+  UPD     init/utsversion-tmp.h
+  CC      init/version.o
+  AR      init/built-in.a
+  AR      built-in.a
+  AR      built-in-fixup.a
+  COPY    vmlinux.a
+  LD      vmlinux.o
+  GEN     .vmlinux.objs
+  MODPOST Module.symvers
+  UPD     include/generated/utsversion.h
+  CC      init/version-timestamp.o
+  KSYMS   .tmp_vmlinux0.kallsyms.S
+  AS      .tmp_vmlinux0.kallsyms.o
+  LD      .tmp_vmlinux1
+  NM      .tmp_vmlinux1.syms
+  KSYMS   .tmp_vmlinux1.kallsyms.S
+  AS      .tmp_vmlinux1.kallsyms.o
+  LD      .tmp_vmlinux2
+  NM      .tmp_vmlinux2.syms
+  KSYMS   .tmp_vmlinux2.kallsyms.S
+  AS      .tmp_vmlinux2.kallsyms.o
+  LD      vmlinux.unstripped
+  NM      System.map
+  SORTTAB vmlinux.unstripped
+  OBJCOPY vmlinux
+  GEN     modules.builtin.modinfo
+  GEN     modules.builtin
+  TEST    posttest
+  arch/x86/tools/insn_decoder_test: success: Decoded and checked 6676026 instructions
+  TEST    posttest
+  arch/x86/tools/insn_sanity: success: Decoded and checked 1000000 random instructions with 0 errors (seed:0x7151a708)
+  CC      arch/x86/boot/version.o
+  VOFFSET arch/x86/boot/compressed/../voffset.h
+  OBJCOPY arch/x86/boot/compressed/vmlinux.bin
+  RELOCS  arch/x86/boot/compressed/vmlinux.relocs
+  CC      arch/x86/boot/compressed/kaslr.o
+  GZIP    arch/x86/boot/compressed/vmlinux.bin.gz
+  CC      arch/x86/boot/compressed/misc.o
+  MKPIGGY arch/x86/boot/compressed/piggy.S
+  AS      arch/x86/boot/compressed/piggy.o
+  LD      arch/x86/boot/compressed/vmlinux
+  ZOFFSET arch/x86/boot/zoffset.h
+  OBJCOPY arch/x86/boot/vmlinux.bin
+  AS      arch/x86/boot/header.o
+  LD      arch/x86/boot/setup.elf
+  OBJCOPY arch/x86/boot/setup.bin
+  BUILD   arch/x86/boot/bzImage
+Kernel: arch/x86/boot/bzImage is ready  (#6.el10)
+  tree        : /home/madness/src/elkt-test/linux-7.2.6
+
+==> Secure Boot signing
+  ok   arch/x86/boot/bzImage is signed with 'madness@siege3 kernel signing key'
+  --   to boot it with Secure Boot ON, a machine must trust the certificate -- once:
+         sudo mokutil --import /home/madness/.config/enterprise_linux_kernel_tool/keys/secureboot.der      (choose a one-time password)
+         reboot; in the blue MOK Manager screen: Enroll MOK, that password
+       Anyone you give this kernel to needs that .der file too -- never the .key.
++ RPM_EC=0
+++ jobs -p
++ exit 0
+Executing(%install): /bin/sh -e /var/tmp/rpm-tmp.JiyLkC
++ umask 022
++ cd /home/madness/src/elkt-test/linux-7.2.6
++ '[' /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64 '!=' / ']'
++ rm -rf /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64
+++ dirname /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64
++ mkdir -p /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT
++ mkdir /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64
++ CFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Werror=format-security -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer '
++ export CFLAGS
++ CXXFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Werror=format-security -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer '
++ export CXXFLAGS
++ FFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -I/usr/lib64/gfortran/modules '
++ export FFLAGS
++ FCFLAGS='-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -m64 -march=x86-64-v2 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -I/usr/lib64/gfortran/modules '
++ export FCFLAGS
++ VALAFLAGS=-g
++ export VALAFLAGS
++ LDFLAGS='-Wl,-z,relro -Wl,--as-needed  -Wl,-z,pack-relative-relocs -Wl,-z,now -specs=/usr/lib/rpm/redhat/redhat-hardened-ld -specs=/usr/lib/rpm/redhat/redhat-hardened-ld-errors -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1  -Wl,--build-id=sha1 -specs=/usr/lib/rpm/redhat/redhat-package-notes '
++ export LDFLAGS
++ LT_SYS_LIBRARY_PATH=/usr/lib64:
++ export LT_SYS_LIBRARY_PATH
++ CC=gcc
++ export CC
++ CXX=g++
++ export CXX
++ mkdir -p /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt
+++ make ARCH=x86 -s image_name
++ cp arch/x86/boot/bzImage /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/vmlinuz
++ make ARCH=x86 INSTALL_MOD_PATH=/home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64 DEPMOD=true modules_install
+  SYMLINK /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/build
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/modules.order
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/modules.builtin
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/modules.builtin.modinfo
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/events/intel/intel-uncore.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/events/intel/intel-cstate.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/kvm/kvm-intel.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/events/rapl.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/kvm/kvm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/kvm/kvm-amd.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/events/intel/intel-uncore.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/events/intel/intel-cstate.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/kvm/kvm-intel.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/events/rapl.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/kvm/kvm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/arch/x86/kvm/kvm-amd.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nfs_common/grace.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nls/nls_utf8.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nls/nls_iso8859-1.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/binfmt_misc.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/mbcache.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/netfs/netfs.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nfs_common/grace.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nls/nls_utf8.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/mbcache.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/binfmt_misc.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nls/nls_iso8859-1.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/netfs/netfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/ext4/ext4.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/jbd2/jbd2.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/squashfs/squashfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/fat/fat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/ext4/ext4.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/fat/vfat.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/exfat/exfat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/jbd2/jbd2.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/fat/fat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/fat/vfat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/squashfs/squashfs.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/exfat/exfat.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/isofs/isofs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/lockd/lockd.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nfs/nfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/fuse/fuse.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/xfs/xfs.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/isofs/isofs.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/lockd/lockd.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/nfs/nfs.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/fuse/fuse.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/xfs/xfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/btrfs/btrfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/kunit/kunit.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/crc/crc8.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/crypto/libblake2b.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/crc/crc16.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/raid/xor/xor.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/raid/raid6/raid6_pq.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/zstd/zstd_compress.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/fs/btrfs/btrfs.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/kunit/kunit.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/crc/crc8.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/crypto/libblake2b.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/raid/xor/xor.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/raid/raid6/raid6_pq.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/crc/crc16.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/lib/zstd/zstd_compress.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/acpi/video.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/clk/clk_kunit_helpers.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/virtio/virtio_dma_buf.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/clients/drm_client_lib.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/acpi/video.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/clk/clk_kunit_helpers.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/virtio/virtio_dma_buf.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/clients/drm_client_lib.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/display/drm_display_helper.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/sysfb/drm_sysfb_helper.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/sysfb/simpledrm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/tiny/bochs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_panel_backlight_quirks.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/display/drm_display_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/sysfb/drm_sysfb_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/sysfb/simpledrm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_exec.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_panel_backlight_quirks.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/tiny/bochs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_gpuvm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_exec.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_buddy.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_gpusvm_helper.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_shmem_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_gpuvm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_suballoc_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_buddy.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_shmem_helper.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_ttm_helper.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_kms_helper.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/ttm/ttm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/scheduler/gpu-sched.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_gpusvm_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_suballoc_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_ttm_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/drm_kms_helper.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/ttm/ttm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/scheduler/gpu-sched.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/xe/xe.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/amd/amdxcp/amdxcp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/mgag200/mgag200.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/vmwgfx/vmwgfx.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/udl/udl.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/ast/ast.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/xe/xe.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/vmwgfx/vmwgfx.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/udl/udl.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/mgag200/mgag200.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/ast/ast.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/amd/amdxcp/amdxcp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/qxl/qxl.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/virtio/virtio-gpu.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/block/virtio_blk.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/hyperv/hyperv_drm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/misc/mei/mei.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/block/loop.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/misc/mei/mei-me.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/virtio/virtio-gpu.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/mfd/lpc_ich.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/scsi_transport_iscsi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/qxl/qxl.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/block/virtio_blk.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/block/loop.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/misc/mei/mei-me.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/misc/mei/mei.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/gpu/drm/hyperv/hyperv_drm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/scsi_transport_iscsi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/mfd/lpc_ich.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/libiscsi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/libiscsi_tcp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/iscsi_tcp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/iscsi_boot_sysfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/cxgbi/libcxgbi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/cxgbi/cxgb4i/cxgb4i.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/bnx2i/bnx2i.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/libiscsi_tcp.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/libiscsi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/iscsi_tcp.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/iscsi_boot_sysfs.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/qedi/qedi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/cxgbi/libcxgbi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/bnx2i/bnx2i.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/be2iscsi/be2iscsi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/cxgbi/cxgb4i/cxgb4i.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/virtio_scsi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/be2iscsi/be2iscsi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/sd_mod.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/qedi/qedi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/sg.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/virtio_scsi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/common/nvme-auth.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/common/nvme-keyring.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme-core.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/sd_mod.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/common/nvme-auth.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/scsi/sg.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/common/nvme-keyring.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme-core.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme-fabrics.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/chelsio/libcxgb/libcxgb.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme-tcp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/broadcom/bnx2.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/broadcom/cnic.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/chelsio/cxgb4/cxgb4.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/chelsio/libcxgb/libcxgb.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme-fabrics.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/nvme/host/nvme-tcp.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/broadcom/bnx2.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/broadcom/cnic.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/chelsio/cxgb4/cxgb4.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/qlogic/qed/qed.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/mdio.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/virtio_net.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/ethernet/qlogic/qed/qed.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/mdio.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/virtio_net.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/net_failover.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/usb/storage/uas.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/usb/storage/usb-storage.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/input/misc/pcspkr.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/net/net_failover.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/usb/storage/uas.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/usb/storage/usb-storage.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/input/misc/uinput.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/input/misc/pcspkr.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/input/joydev.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/algos/i2c-algo-bit.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/input/misc/uinput.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/busses/i2c-i801.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/input/joydev.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/algos/i2c-algo-bit.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/busses/i2c-i801.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/i2c-smbus.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/i2c-dev.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/media/cec/core/cec.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/hwmon/coretemp.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/i2c-smbus.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/i2c/i2c-dev.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/media/cec/core/cec.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/hwmon/coretemp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/thermal/intel/intel_powerclamp.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/thermal/intel/x86_pkg_temp_thermal.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/watchdog/iTCO_wdt.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/thermal/intel/intel_powerclamp.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/thermal/intel/x86_pkg_temp_thermal.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-mod.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/watchdog/iTCO_wdt.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-multipath.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-round-robin.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-mirror.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-log.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-region-hash.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/platform/x86/intel/intel-vsec.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-mod.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-multipath.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-round-robin.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-mirror.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-log.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/md/dm-region-hash.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/platform/x86/intel/intel-vsec.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/platform/x86/mxm-wmi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/platform/wmi/wmi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/virt/coco/tdx-host/tdx-host.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/powercap/intel_rapl_common.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/powercap/intel_rapl_msr.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/accel/amdxdna/amdxdna.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/platform/x86/mxm-wmi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/platform/wmi/wmi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/virt/coco/tdx-host/tdx-host.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/powercap/intel_rapl_common.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/powercap/intel_rapl_msr.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/accel/amdxdna/amdxdna.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/libata.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/ahci.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/libahci.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/ahci_platform.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/libahci_platform.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/libata.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/uio/uio.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/ahci.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/libahci.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/ahci_platform.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/ata/libahci_platform.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/uio/uio.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/ib_core.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/ib_cm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/iw_cm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/rdma_cm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/ib_core.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/ib_cm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/iw_cm.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/core/rdma_cm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/ulp/iser/ib_iser.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/soundcore.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-ctl-led.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/drivers/infiniband/ulp/iser/ib_iser.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/soundcore.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-ctl-led.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-hwdep.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-timer.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-hrtimer.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-pcm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-seq-device.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-hwdep.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-timer.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-hrtimer.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-pcm.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/seq/snd-seq.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/snd-seq-device.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/seq/snd-seq-dummy.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/core/snd-hda-core.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/core/snd-intel-dspcfg.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/seq/snd-seq.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/core/snd-hda-core.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/core/seq/snd-seq-dummy.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/core/snd-intel-dspcfg.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/core/snd-intel-sdw-acpi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/common/snd-hda-codec.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/hdmi/snd-hda-codec-hdmi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/hdmi/snd-hda-codec-atihdmi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/core/snd-intel-sdw-acpi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/common/snd-hda-codec.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/realtek/snd-hda-codec-realtek-lib.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/hdmi/snd-hda-codec-hdmi.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/hdmi/snd-hda-codec-atihdmi.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/realtek/snd-hda-codec-alc662.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/realtek/snd-hda-codec-realtek-lib.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/side-codecs/snd-hda-scodec-component.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/snd-hda-codec-generic.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/core/failover.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/controllers/snd-hda-intel.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/snd-hda-codec-generic.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/side-codecs/snd-hda-scodec-component.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/codecs/realtek/snd-hda-codec-alc662.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/core/failover.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/sound/hda/controllers/snd-hda-intel.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nf_conntrack.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nf_nat.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nf_tables.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_ct.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nf_conntrack.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nf_nat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nf_tables.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_ct.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_nat.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_reject.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_reject_inet.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_fib.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_nat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_reject.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_reject_inet.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_fib_inet.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_fib.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_chain_nat.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nf_defrag_ipv4.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nf_reject_ipv4.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nft_reject_ipv4.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_fib_inet.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/netfilter/nft_chain_nat.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nf_defrag_ipv4.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nf_reject_ipv4.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nft_reject_ipv4.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nft_fib_ipv4.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nf_defrag_ipv6.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nf_reject_ipv6.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nft_reject_ipv6.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nft_fib_ipv6.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv4/netfilter/nft_fib_ipv4.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nf_defrag_ipv6.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nf_reject_ipv6.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nft_reject_ipv6.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/ipv6/netfilter/nft_fib_ipv6.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/tls/tls.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/sunrpc/sunrpc.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/rfkill/rfkill.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/qrtr/qrtr.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/sunrpc/sunrpc.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/tls/tls.ko
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/virt/lib/irqbypass.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/rfkill/rfkill.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/net/qrtr/qrtr.ko
+  SIGN    /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/kernel/virt/lib/irqbypass.ko
+  DEPMOD  /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt
++ make ARCH=x86 INSTALL_HDR_PATH=/home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/usr headers_install
+  INSTALL /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/usr/include
++ cp System.map /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt
++ cp .config /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/config
++ make ARCH=x86 run-command 'KBUILD_RUN_COMMAND=test -d ${srctree}/arch/${SRCARCH}/boot/dts'
++ ln -fns /usr/src/kernels/7.2.6-elkt /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/build
++ make ARCH=x86 run-command 'KBUILD_RUN_COMMAND=${srctree}/scripts/package/install-extmod-build /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/usr/src/kernels/7.2.6-elkt'
++ echo /lib/modules/7.2.6-elkt
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.alias'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.alias.bin'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.builtin.alias.bin'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.builtin.bin'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.dep'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.dep.bin'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.devname'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.softdep'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.symbols'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.symbols.bin'
++ for x in alias alias.bin builtin.alias.bin builtin.bin dep dep.bin devname softdep symbols symbols.bin weakdep
++ echo '%ghost /lib/modules/7.2.6-elkt/modules.weakdep'
++ for x in System.map config vmlinuz
++ echo '%ghost /boot/System.map-7.2.6-elkt'
++ for x in System.map config vmlinuz
++ echo '%ghost /boot/config-7.2.6-elkt'
++ for x in System.map config vmlinuz
++ echo '%ghost /boot/vmlinuz-7.2.6-elkt'
++ '[' -d /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64/lib/modules/7.2.6-elkt/dtb ']'
++ echo '%exclude /lib/modules/7.2.6-elkt/build'
++ /usr/lib/rpm/brp-compress
+Processing files: kernel-7.2.6_elkt-6.el10.x86_64
+Provides: kernel = 7.2.6_elkt-6.el10 kernel(x86-64) = 7.2.6_elkt-6.el10 kernel-7.2.6-elkt kmod(8250.ko) kmod(8250_base.ko) kmod(8250_dw.ko) kmod(8250_exar.ko) kmod(8250_mid.ko) kmod(8250_pci.ko) kmod(8250_pci1xxxx.ko) kmod(8250_pericom.ko) kmod(ac.ko) kmod(acpi_mdio.ko) kmod(aead.ko) kmod(aes.ko) kmod(aesni-intel.ko) kmod(af_alg.ko) kmod(af_packet.ko) kmod(af_packet_diag.ko) kmod(ahci.ko) kmod(ahci_platform.ko) kmod(akcipher.ko) kmod(algif_aead.ko) kmod(algif_hash.ko) kmod(algif_rng.ko) kmod(algif_skcipher.ko) kmod(amd-uncore.ko) kmod(amd_hfi.ko) kmod(amdgpu.ko) kmod(amdxcp.ko) kmod(amdxdna.ko) kmod(asn1_decoder.ko) kmod(asn1_encoder.ko) kmod(ast.ko) kmod(atkbd.ko) kmod(atomic64_test.ko) kmod(authenc.ko) kmod(authencesn.ko) kmod(autofs4.ko) kmod(backlight.ko) kmod(battery.ko) kmod(be2iscsi.ko) kmod(bfq.ko) kmod(binfmt_misc.ko) kmod(binfmt_script.ko) kmod(bitrev.ko) kmod(bnx2.ko) kmod(bnx2i.ko) kmod(bochs.ko) kmod(bpf_crypto_skcipher.ko) kmod(bsg.ko) kmod(btrfs.ko) kmod(buddy.ko) kmod(button.ko) kmod(cbc.ko) kmod(ccm.ko) kmod(cec.ko) kmod(cfbcopyarea.ko) kmod(cfbfillrect.ko) kmod(cfbimgblt.ko) kmod(clk_kunit_helpers.ko) kmod(cls_cgroup.ko) kmod(cmac.ko) kmod(cn.ko) kmod(cnic.ko) kmod(configfs.ko) kmod(configs.ko) kmod(coretemp.ko) kmod(cpufreq_conservative.ko) kmod(cpufreq_ondemand.ko) kmod(cpufreq_performance.ko) kmod(cpufreq_powersave.ko) kmod(cpufreq_userspace.ko) kmod(cpuid.ko) kmod(cpuidle-haltpoll.ko) kmod(crc-ccitt.ko) kmod(crc-t10dif.ko) kmod(crc16.ko) kmod(crc32.ko) kmod(crc32c-cryptoapi.ko) kmod(crc64.ko) kmod(crc8.ko) kmod(cryptd.ko) kmod(crypto.ko) kmod(crypto_acompress.ko) kmod(crypto_algapi.ko) kmod(crypto_hash.ko) kmod(crypto_null.ko) kmod(crypto_skcipher.ko) kmod(crypto_user.ko) kmod(cryptomgr.ko) kmod(ctr.ko) kmod(cts.ko) kmod(cxgb4.ko) kmod(cxgb4i.ko) kmod(dax.ko) kmod(deflate.ko) kmod(dh_generic.ko) kmod(digsig.ko) kmod(dimlib.ko) kmod(dm-log.ko) kmod(dm-mirror.ko) kmod(dm-mod.ko) kmod(dm-multipath.ko) kmod(dm-region-hash.ko) kmod(dm-round-robin.ko) kmod(dmi-sysfs.ko) kmod(drbg.ko) kmod(drm.ko) kmod(drm_buddy.ko) kmod(drm_client_lib.ko) kmod(drm_display_helper.ko) kmod(drm_exec.ko) kmod(drm_gpusvm_helper.ko) kmod(drm_gpuvm.ko) kmod(drm_kms_helper.ko) kmod(drm_mipi_dsi.ko) kmod(drm_panel_backlight_quirks.ko) kmod(drm_panel_orientation_quirks.ko) kmod(drm_shmem_helper.ko) kmod(drm_suballoc_helper.ko) kmod(drm_sysfb_helper.ko) kmod(drm_ttm_helper.ko) kmod(drop_monitor.ko) kmod(dw_dmac_core.ko) kmod(dw_dmac_pci.ko) kmod(e1000e.ko) kmod(ecb.ko) kmod(ecc.ko) kmod(ecdh_generic.ko) kmod(ecdsa_generic.ko) kmod(edac_core.ko) kmod(eeprom_93cx6.ko) kmod(efi-pstore.ko) kmod(efivarfs.ko) kmod(ehci-hcd.ko) kmod(ehci-pci.ko) kmod(encrypted-keys.ko) kmod(evdev.ko) kmod(exfat.ko) kmod(exportfs.ko) kmod(ext4.ko) kmod(failover.ko) kmod(fan.ko) kmod(fat.ko) kmod(fb.ko) kmod(fb_io_fops.ko) kmod(fb_sys_fops.ko) kmod(firmware_class.ko) kmod(fixed_phy.ko) kmod(font.ko) kmod(fuse.ko) kmod(fwnode_mdio.ko) kmod(gcm.ko) kmod(geniv.ko) kmod(gf128mul.ko) kmod(ghes_edac.ko) kmod(glob.ko) kmod(gpu-sched.ko) kmod(grace.ko) kmod(hed.ko) kmod(hid-generic.ko) kmod(hid-magicmouse.ko) kmod(hid-ntrig.ko) kmod(hid-sensor-hub.ko) kmod(hid.ko) kmod(hid_bpf.ko) kmod(hmac.ko) kmod(hsu_dma.ko) kmod(hv_storvsc.ko) kmod(hv_vmbus.ko) kmod(hwmon.ko) kmod(hyperv-keyboard.ko) kmod(hyperv_drm.ko) kmod(i2c-algo-bit.ko) kmod(i2c-core.ko) kmod(i2c-dev.ko) kmod(i2c-i801.ko) kmod(i2c-smbus.ko) kmod(i8042.ko) kmod(iTCO_wdt.ko) kmod(ib_cm.ko) kmod(ib_core.ko) kmod(ib_iser.ko) kmod(inet_diag.ko) kmod(input-core.ko) kmod(input-leds.ko) kmod(intel-cstate.ko) kmod(intel-lpss-acpi.ko) kmod(intel-lpss-pci.ko) kmod(intel-lpss.ko) kmod(intel-uncore.ko) kmod(intel-vsec.ko) kmod(intel_powerclamp.ko) kmod(intel_rapl_common.ko) kmod(intel_rapl_msr.ko) kmod(iommu_amdv1.ko) kmod(iommu_vtdss.ko) kmod(iommu_x86_64.ko) kmod(iosf_mbi.ko) kmod(iova.ko) kmod(irqbypass.ko) kmod(iscsi_boot_sysfs.ko) kmod(iscsi_tcp.ko) kmod(isofs.ko) kmod(iw_cm.ko) kmod(jbd2.ko) kmod(jitterentropy_rng.ko) kmod(joydev.ko) kmod(kdf_sp800108.ko) kmod(kgdboc.ko) kmod(kpp.ko) kmod(kunit.ko) kmod(kvm-amd.ko) kmod(kvm-intel.ko) kmod(kvm.ko) kmod(kyber-iosched.ko) kmod(led-class.ko) kmod(libaes.ko) kmod(libaesgcm.ko) kmod(libahci.ko) kmod(libahci_platform.ko) kmod(libata.ko) kmod(libblake2b.ko) kmod(libchacha.ko) kmod(libchacha20poly1305.ko) kmod(libcryptoutils.ko) kmod(libcxgb.ko) kmod(libcxgbi.ko) kmod(libgf128hash.ko) kmod(libiscsi.ko) kmod(libiscsi_tcp.ko) kmod(libmd5.ko) kmod(libphy.ko) kmod(libpoly1305.ko) kmod(libps2.ko) kmod(libsha1.ko) kmod(libsha256.ko) kmod(libsha3.ko) kmod(libsha512.ko) kmod(linear_ranges.ko) kmod(lockd.ko) kmod(loop.ko) kmod(lpc_ich.ko) kmod(lz4.ko) kmod(lz4_compress.ko) kmod(lz4_decompress.ko) kmod(lzo-rle.ko) kmod(lzo.ko) kmod(lzo_compress.ko) kmod(lzo_decompress.ko) kmod(mbcache.ko) kmod(md-mod.ko) kmod(md5.ko) kmod(mdio.ko) kmod(mdio_bus.ko) kmod(mdio_devres.ko) kmod(mei-me.ko) kmod(mei.ko) kmod(mfd-core.ko) kmod(mgag200.ko) kmod(mousedev.ko) kmod(mpi.ko) kmod(mpls_gso.ko) kmod(mptcp_diag.ko) kmod(mq-deadline.ko) kmod(msr.ko) kmod(mxm-wmi.ko) kmod(n_null.ko) kmod(net_failover.ko) kmod(netfilter.ko) kmod(netfs.ko) kmod(netkit.ko) kmod(netlink_diag.ko) kmod(nf_conntrack.ko) kmod(nf_defrag_ipv4.ko) kmod(nf_defrag_ipv6.ko) kmod(nf_nat.ko) kmod(nf_reject_ipv4.ko) kmod(nf_reject_ipv6.ko) kmod(nf_tables.ko) kmod(nfs.ko) kmod(nft_chain_nat.ko) kmod(nft_ct.ko) kmod(nft_fib.ko) kmod(nft_fib_inet.ko) kmod(nft_fib_ipv4.ko) kmod(nft_fib_ipv6.ko) kmod(nft_nat.ko) kmod(nft_reject.ko) kmod(nft_reject_inet.ko) kmod(nft_reject_ipv4.ko) kmod(nft_reject_ipv6.ko) kmod(nls_ascii.ko) kmod(nls_base.ko) kmod(nls_cp437.ko) kmod(nls_iso8859-1.ko) kmod(nls_utf8.ko) kmod(nsh.ko) kmod(nvme-auth.ko) kmod(nvme-core.ko) kmod(nvme-fabrics.ko) kmod(nvme-keyring.ko) kmod(nvme-tcp.ko) kmod(nvme.ko) kmod(nvram.ko) kmod(ohci-hcd.ko) kmod(ohci-pci.ko) kmod(oid_registry.ko) kmod(pci-stub.ko) kmod(pcspkr.ko) kmod(pinctrl-intel.ko) kmod(pkcs7_message.ko) kmod(platform_profile.ko) kmod(pps_core.ko) kmod(pretimeout_panic.ko) kmod(processor.ko) kmod(psmouse.ko) kmod(pstore.ko) kmod(ptp.ko) kmod(public_key.ko) kmod(qed.ko) kmod(qedi.ko) kmod(qemu_fw_cfg.ko) kmod(qrtr.ko) kmod(quota_tree.ko) kmod(quota_v2.ko) kmod(qxl.ko) kmod(raid6_pq.ko) kmod(rapl.ko) kmod(rational.ko) kmod(raw_diag.ko) kmod(rdma_cm.ko) kmod(rfkill.ko) kmod(rng-core.ko) kmod(rng.ko) kmod(roles.ko) kmod(rsa_generic.ko) kmod(rtc-cmos.ko) kmod(sch_fq_codel.ko) kmod(scsi_common.ko) kmod(scsi_dh_alua.ko) kmod(scsi_dh_emc.ko) kmod(scsi_dh_hp_sw.ko) kmod(scsi_dh_rdac.ko) kmod(scsi_mod.ko) kmod(scsi_transport_iscsi.ko) kmod(sd_mod.ko) kmod(selftests.ko) kmod(seqiv.ko) kmod(serial_base.ko) kmod(serial_mctrl_gpio.ko) kmod(serio.ko) kmod(sg.ko) kmod(sha1.ko) kmod(sha256.ko) kmod(sha3.ko) kmod(sha512.ko) kmod(sig.ko) kmod(simpledrm.ko) kmod(snd-ctl-led.ko) kmod(snd-hda-codec-alc662.ko) kmod(snd-hda-codec-atihdmi.ko) kmod(snd-hda-codec-generic.ko) kmod(snd-hda-codec-hdmi.ko) kmod(snd-hda-codec-realtek-lib.ko) kmod(snd-hda-codec.ko) kmod(snd-hda-core.ko) kmod(snd-hda-intel.ko) kmod(snd-hda-scodec-component.ko) kmod(snd-hrtimer.ko) kmod(snd-hwdep.ko) kmod(snd-intel-dspcfg.ko) kmod(snd-intel-sdw-acpi.ko) kmod(snd-pcm.ko) kmod(snd-seq-device.ko) kmod(snd-seq-dummy.ko) kmod(snd-seq.ko) kmod(snd-timer.ko) kmod(snd.ko) kmod(soundcore.ko) kmod(squashfs.ko) kmod(sunrpc.ko) kmod(syscopyarea.ko) kmod(sysfillrect.ko) kmod(sysimgblt.ko) kmod(system_heap.ko) kmod(tcp_cubic.ko) kmod(tcp_diag.ko) kmod(tdx-host.ko) kmod(test-kstrtox.ko) kmod(thermal.ko) kmod(thunderbolt.ko) kmod(tls.ko) kmod(tpm.ko) kmod(tpm_crb.ko) kmod(tpm_tis.ko) kmod(tpm_tis_core.ko) kmod(tpm_tis_i2c.ko) kmod(tpm_tis_spi.ko) kmod(trusted.ko) kmod(tsm-core.ko) kmod(ttm.ko) kmod(typec.ko) kmod(typec_ucsi.ko) kmod(uas.ko) kmod(ucs2_string.ko) kmod(ucsi_acpi.ko) kmod(udl.ko) kmod(udp_diag.ko) kmod(uhci-hcd.ko) kmod(uinput.ko) kmod(uio.ko) kmod(unix_diag.ko) kmod(usb-common.ko) kmod(usb-storage.ko) kmod(usbcore.ko) kmod(usbhid.ko) kmod(usbmon.ko) kmod(usbserial.ko) kmod(vfat.ko) kmod(vgacon.ko) kmod(video-common.ko) kmod(video.ko) kmod(virt-dma.ko) kmod(virtio-gpu.ko) kmod(virtio-iommu.ko) kmod(virtio-rng.ko) kmod(virtio.ko) kmod(virtio_blk.ko) kmod(virtio_dma_buf.ko) kmod(virtio_net.ko) kmod(virtio_pci.ko) kmod(virtio_pci_legacy_dev.ko) kmod(virtio_pci_modern_dev.ko) kmod(virtio_ring.ko) kmod(virtio_scsi.ko) kmod(vivaldi-fmap.ko) kmod(vmd.ko) kmod(vmgenid.ko) kmod(vmwgfx.ko) kmod(watchdog.ko) kmod(wmi.ko) kmod(wwnr.ko) kmod(x509_key_parser.ko) kmod(x509_selftest.ko) kmod(x86_pkg_temp_thermal.ko) kmod(x_tables.ko) kmod(xe.ko) kmod(xenbus.ko) kmod(xenbus_probe_frontend.ko) kmod(xfrm_algo.ko) kmod(xfrm_user.ko) kmod(xfs.ko) kmod(xhci-hcd.ko) kmod(xhci-pci-renesas.ko) kmod(xhci-pci.ko) kmod(xor.ko) kmod(xt_tcpudp.ko) kmod(xts.ko) kmod(xxhash.ko) kmod(xz_dec.ko) kmod(zlib_deflate.ko) kmod(zlib_inflate.ko) kmod(zsmalloc.ko) kmod(zstd_common.ko) kmod(zstd_compress.ko) kmod(zstd_decompress.ko)
+Requires(interp): /bin/sh /bin/sh
+Requires(rpmlib): rpmlib(CompressedFileNames) <= 3.0.4-1 rpmlib(FileDigests) <= 4.6.0-1 rpmlib(PayloadFilesHavePrefix) <= 4.0-1
+Requires(post): /bin/sh
+Requires(preun): /bin/sh
+Processing files: kernel-headers-7.2.6_elkt-6.el10.x86_64
+Provides: kernel-headers = 7.2.6_elkt kernel-headers = 7.2.6_elkt-6.el10 kernel-headers(x86-64) = 7.2.6_elkt-6.el10
+Requires(rpmlib): rpmlib(CompressedFileNames) <= 3.0.4-1 rpmlib(FileDigests) <= 4.6.0-1 rpmlib(PayloadFilesHavePrefix) <= 4.0-1
+Obsoletes: kernel-headers < 7.2.6_elkt
+Processing files: kernel-devel-7.2.6_elkt-6.el10.x86_64
+warning: absolute symlink: /lib/modules/7.2.6-elkt/build -> /usr/src/kernels/7.2.6-elkt
+Provides: kernel-devel = 7.2.6_elkt-6.el10 kernel-devel(x86-64) = 7.2.6_elkt-6.el10
+Requires(rpmlib): rpmlib(CompressedFileNames) <= 3.0.4-1 rpmlib(FileDigests) <= 4.6.0-1 rpmlib(PayloadFilesHavePrefix) <= 4.0-1
+Checking for unpackaged file(s): /usr/lib/rpm/check-files /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64
+Wrote: /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/RPMS/x86_64/kernel-headers-7.2.6_elkt-6.el10.x86_64.rpm
+Wrote: /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/RPMS/x86_64/kernel-devel-7.2.6_elkt-6.el10.x86_64.rpm
+Wrote: /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/RPMS/x86_64/kernel-7.2.6_elkt-6.el10.x86_64.rpm
+Executing(%clean): /bin/sh -e /var/tmp/rpm-tmp.ZFAllz
++ umask 022
++ cd /home/madness/src/elkt-test/linux-7.2.6
++ rm -rf /home/madness/src/elkt-test/linux-7.2.6/rpmbuild/BUILDROOT/kernel-7.2.6_elkt-6.el10.x86_64
++ RPM_EC=0
+++ jobs -p
++ exit 0
+Executing(rmbuild): /bin/sh -e /var/tmp/rpm-tmp.yFO6Xk
++ umask 022
++ cd /home/madness/src/elkt-test/linux-7.2.6
++ rm -rf '/home/madness/src/elkt-test/linux-7.2.6/%{buildsubdir}-SPECPARTS'
++ RPM_EC=0
+++ jobs -p
++ exit 0
+
+RPM build warnings:
+    absolute symlink: /lib/modules/7.2.6-elkt/build -> /usr/src/kernels/7.2.6-elkt

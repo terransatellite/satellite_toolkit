@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+#
+# build_python_universal.sh
+#
+# Build CPython 3, PyPy2 and PyPy3 from source on a fresh machine --
+# Debian/Ubuntu or RHEL/Fedora/Rocky/Alma.  Downloads every source tarball
+# itself, installs each interpreter to its own versioned prefix under $HOME,
+# and refuses to call a build successful until the interpreter it produced can
+# actually import the modules people care about.
+#
+# Runnable from any directory; nothing depends on $PWD.
+#
+#   ./build_python_universal.sh                     # all three
+#   TARGETS=cpython ./build_python_universal.sh     # just one
+#   TARGETS=pypy2,pypy3 ./build_python_universal.sh
+#
+# Root is used only to install distro packages.  The builds are unprivileged.
+# Never run the whole script with sudo -- it installs into $HOME.
+#
+# Rough cost:  CPython ~20 min.  Each PyPy 1-3 hours and ~8-16 GB of RAM.
+#
+# Licence: public domain / CC0.  No warranty.
+
+set -euo pipefail
+
+# --- integrity self-check -------------------------------------------------
+# This file must be pure ASCII.  Copying a script out of a web page or a chat
+# window silently replaces ordinary spaces with U+00A0 (non-breaking space),
+# which bash treats as part of a command name -- you get "command not found"
+# on a line that looks perfectly correct.
+#
+# NOTE: the body below is deliberately NOT indented.  Leading whitespace is
+# exactly what gets converted, so an indented error handler is unable to report
+# the corruption it just detected -- it fails as "printf: command not found".
+if LC_ALL=C tr -d '\11\12\40-\176' < "$0" | head -c 1 | LC_ALL=C grep -q .; then
+printf 'ERROR: %s contains non-ASCII bytes.\n' "$0" >&2
+printf 'It was almost certainly corrupted by copy-paste from a web page.\n' >&2
+printf 'Repair it with:\n' >&2
+printf "    sed -i 's/%s/ /g' %s\n" '\xc2\xa0' "$0" >&2
+printf 'or, better, download the file directly instead of pasting it.\n' >&2
+exit 1
+fi
+# --------------------------------------------------------------------------
+
+# ---------------------------------------------------------------- configuration
+
+TARGETS="${TARGETS:-cpython,pypy2,pypy3}"
+SRC_ROOT="${SRC_ROOT:-$HOME/src/python-build}"
+OPT_ROOT="${OPT_ROOT:-$HOME/opt}"
+JOBS="${JOBS:-$(nproc)}"
+INSTALL_DEPS="${INSTALL_DEPS:-1}"
+LINK_CURRENT="${LINK_CURRENT:-1}"
+
+CPY_VERSION="${CPY_VERSION:-auto}"     # e.g. 3.13.2, or 'auto' for newest stable
+PYPY_VERSION="${PYPY_VERSION:-auto}"   # PyPy release, e.g. 7.3.17, or 'auto'
+
+# ---------------------------------------------------------------------------
+# THE BOOTSTRAP PROBLEM -- the one genuinely awkward thing in this script.
+#
+# PyPy is not compiled, it is *translated*: the RPython toolchain is a Python
+# program that consumes PyPy's source and emits C.  So building PyPy requires a
+# working Python to run RPython.  On a fresh machine there is no PyPy yet, and
+# RPython running under CPython is roughly 3-4x slower than under PyPy.
+#
+# HOST_MODE picks a way out of that circle:
+#
+#   prebuilt (default) Download the official portable PyPy2 binary and use it
+#                      purely as the translation host.  Fastest, and it does not
+#                      matter that it is prebuilt -- it is a tool, not the
+#                      product.  It is discarded afterwards.
+#   system             Use a pypy/pypy2 already on PATH, or $PYPY_HOST.
+#   cpython            Use CPython.  No download, but expect it to take hours
+#                      longer.  Use this on a machine with no network egress to
+#                      downloads.python.org, or if you object on principle.
+HOST_MODE="${HOST_MODE:-prebuilt}"
+PYPY_HOST="${PYPY_HOST:-}"             # explicit host interpreter; overrides HOST_MODE
+# ---------------------------------------------------------------------------
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+step() { printf '\n\033[1;36m--- %s\033[0m\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\n\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" -ne 0 ] || die "do not run this as root -- it installs into \$HOME."
+
+want() { case ",$TARGETS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+for t in $(printf '%s' "$TARGETS" | tr ',' ' '); do
+    case "$t" in cpython|pypy2|pypy3) : ;;
+      *) die "unknown target '$t' in TARGETS (valid: cpython, pypy2, pypy3)" ;;
+    esac
+done
+
+# ------------------------------------------------------------------ dependencies
+
+DNF_PKGS="gcc gcc-c++ make patch pkgconfig wget curl tar xz bzip2 gzip findutils
+          openssl-devel bzip2-devel libffi-devel zlib-devel xz-devel
+          sqlite-devel ncurses-devel readline-devel gdbm-devel tk-devel
+          libuuid-devel expat-devel gmp-devel"
+APT_PKGS="build-essential patch pkg-config wget curl tar xz-utils bzip2 gzip
+          libssl-dev libbz2-dev libffi-dev zlib1g-dev liblzma-dev
+          libsqlite3-dev libncurses-dev libreadline-dev libgdbm-dev tk-dev
+          uuid-dev libexpat1-dev libgmp-dev"
+# Every one of these maps to an optional stdlib module.  Miss libffi and you get
+# a Python with no ctypes; miss openssl and pip cannot reach the network.  Those
+# failures surface at the END of a long build, which is why they are installed
+# up front and verified at the end rather than trusted.
+
+install_deps() {
+    [ "$INSTALL_DEPS" = 1 ] || { warn "INSTALL_DEPS=0, skipping package install"; return 0; }
+    local mgr=""
+    command -v dnf     >/dev/null && mgr=dnf
+    [ -z "$mgr" ] && command -v apt-get >/dev/null && mgr=apt
+    [ -z "$mgr" ] && { warn "no dnf or apt-get -- install deps yourself, re-run with INSTALL_DEPS=0"; return 0; }
+    say "Installing dependencies with $mgr (sudo)"
+    case "$mgr" in
+      dnf) sudo dnf install -y $DNF_PKGS || warn "some packages were unavailable; continuing" ;;
+      apt) sudo apt-get update && { sudo apt-get install -y $APT_PKGS || warn "some packages were unavailable; continuing"; } ;;
+    esac
+}
+
+# ------------------------------------------------------------------- downloading
+
+dl() {  # dl <url> <dest>
+    local url="$1" dest="$2"
+    [ -s "$dest" ] && { printf '  cached: %s\n' "$(basename "$dest")"; return 0; }
+    printf '  fetching %s\n' "$url"
+    curl -fL --retry 3 --retry-delay 5 --max-time 1800 -o "$dest.part" "$url" || { rm -f "$dest.part"; return 1; }
+    mv "$dest.part" "$dest"
+}
+
+CPY_BASE="https://www.python.org/ftp/python"
+PYPY_BASE="https://downloads.python.org/pypy"
+
+latest_cpython() {
+    local html v
+    html=$(curl -fsSL --compressed --max-time 30 "$CPY_BASE/" 2>/dev/null) || return 1
+    # Directories exist for release candidates and for versions never shipped,
+    # so candidates are tried newest-first and confirmed by an actual HEAD.
+    for v in $(printf '%s\n' "$html" | grep -oE '3\.[0-9]+\.[0-9]+/' | tr -d '/' \
+               | sort -V -u | tail -12 | tac); do
+        curl -fsI --max-time 20 "$CPY_BASE/$v/Python-$v.tar.xz" >/dev/null 2>&1 \
+            && { printf '%s' "$v"; return 0; }
+    done
+    return 1
+}
+
+# The PyPy download index carries every release for every Python level at once,
+# e.g. pypy2.7-v7.3.23-src.tar.bz2 alongside pypy3.11-v7.3.23-src.tar.bz2.
+#
+# --compressed is NOT optional: downloads.python.org serves this listing
+# Content-Encoding: gzip, and without it curl hands back raw binary, every grep
+# below matches nothing, and the script reports "no release found" on a
+# perfectly healthy mirror.
+#
+# versions.json exists and is tempting, but it indexes BINARIES only -- it
+# contains no source tarballs at all -- so source discovery has to come from
+# here regardless.
+pypy_index() { curl -fsSL --compressed --max-time 30 "$PYPY_BASE/" 2>/dev/null; }
+
+# Upstream publishes releases as .tar.bz2 and .tar.gz, and which of the two
+# exists has changed between releases.  Match either.
+PYPY_EXT='tar\.(bz2|gz)'
+
+latest_pypy_release() {   # newest vX.Y.Z that ships a pypy2.7 source tarball
+    printf '%s\n' "$1" | grep -oE "pypy2\.7-v[0-9]+\.[0-9]+\.[0-9]+-src\.$PYPY_EXT" \
+        | sed -e 's/^pypy2\.7-v//' -e 's/-src\..*$//' | sort -V -u | tail -1
+}
+pypy_srcname() {          # $1=index  $2=release  $3=2|3  -> source tarball name
+    local pat
+    if [ "$3" = 2 ]; then pat='pypy2\.7'; else pat='pypy3\.[0-9]+'; fi
+    printf '%s\n' "$1" | grep -oE "$pat-v$2-src\.$PYPY_EXT" | sort -V -u | tail -1
+}
+pypy_hostname() {         # portable PyPy2 binary of release $2 for THIS arch
+    local tag
+    case "$(uname -m)" in
+        x86_64|amd64)  tag=linux64 ;;
+        aarch64|arm64) tag=aarch64 ;;
+        i686|i386)     tag=linux32 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$1" | grep -oE "pypy2\.7-v$2-$tag\.$PYPY_EXT" | sort -V -u | tail -1
+}
+
+# --------------------------------------------------------------------- preflight
+
+install_deps
+
+say "Preflight"
+for t in curl tar make gcc; do command -v "$t" >/dev/null || die "missing: $t"; done
+command -v bzip2 >/dev/null || command -v bunzip2 >/dev/null || die "missing: bzip2"
+
+mkdir -p "$SRC_ROOT" "$OPT_ROOT"
+avail=$(df -BG --output=avail "$SRC_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+[ "${avail:-0}" -ge 20 ] || warn "only ${avail:-0}G free at $SRC_ROOT; ~20G is comfortable"
+
+ram=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)
+if want pypy2 || want pypy3; then
+    [ "${ram:-0}" -ge 8 ] || warn "only ${ram}G RAM.  A 64-bit JIT translation peaks around
+       8 GB and will thrash or be OOM-killed below that.  Consider TARGETS=cpython,
+       or add swap before starting a translation."
+fi
+
+printf '  targets   : %s\n  jobs      : %s\n  sources   : %s\n  prefixes  : %s\n' \
+       "$TARGETS" "$JOBS" "$SRC_ROOT" "$OPT_ROOT"
+printf '  free disk : %sG\n  RAM       : %sG\n' "${avail:-?}" "${ram:-?}"
+
+# ============================================================ verification helper
+# One place that decides whether an interpreter is actually usable.  A build that
+# "succeeded" while quietly dropping ssl or ctypes is worse than a failed one,
+# because you find out weeks later.
+
+verify_interpreter() {   # verify_interpreter <exe> <label> <py2|py3>
+    local exe="$1" label="$2" flavour="$3" missing="" mod
+    [ -x "$exe" ] || { warn "$label: no executable at $exe"; return 1; }
+    printf '  %s: %s\n' "$label" "$("$exe" -c 'import sys; print(sys.version.split()[0])' 2>&1 | head -1)"
+
+    # The two Pythons do not have the same stdlib, so these lists are defined
+    # per flavour rather than as a shared base with additions.  A "common" list
+    # that is not actually common is what makes a build fail at the very end,
+    # after hours, on a module that was never supposed to be there:
+    #   lzma    arrived in Python 3.3 -- demanding it of 2.7 fails every time
+    #   gdbm    is spelled dbm.gnu in Python 3 -- demanding gdbm warns forever
+    local CORE NICE
+    if [ "$flavour" = py2 ]; then
+        CORE="zlib bz2 ctypes sqlite3 hashlib decimal select socket ssl"
+        NICE="curses readline gdbm uuid"
+    else
+        CORE="zlib bz2 lzma ctypes sqlite3 hashlib decimal select socket ssl"
+        NICE="curses readline dbm.gnu uuid"
+    fi
+
+    for mod in $CORE; do
+        "$exe" -c "import $mod" >/dev/null 2>&1 || missing="$missing $mod"
+    done
+    for mod in $NICE; do
+        "$exe" -c "import $mod" >/dev/null 2>&1 || warn "$label: optional module '$mod' missing (install the matching -devel package and rebuild if you need it)"
+    done
+    if [ -n "$missing" ]; then
+        warn "$label: MISSING REQUIRED MODULES:$missing"
+        return 1
+    fi
+    # ssl must not merely import -- it must build a usable context.  An ssl
+    # module compiled against a different OpenSSL than the one it loads will
+    # import perfectly and then SEGFAULT here, so the exit status is inspected:
+    # anything above 128 is death by signal, which is worth saying out loud
+    # rather than reporting as a polite failure.
+    # Captured with '|| rc=$?' rather than inside 'if ! cmd': the '!' inverts the
+    # status, so $? in the then-branch would read 0 and the signal test below
+    # could never fire.
+    local rc=0
+    "$exe" -c 'import ssl; ssl.create_default_context()' >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -gt 128 ]; then
+            warn "$label: ssl CRASHED (signal $((rc - 128))) building a default context.
+       The ssl module imports but its OpenSSL bindings are broken -- usually a
+       cffi module built against a different OpenSSL than the one now loaded.
+       HTTPS, pip and anything network-facing will not work."
+        else
+            warn "$label: ssl imports but cannot create a default context"
+        fi
+        return 1
+    fi
+    printf '  %s: core modules ok (%s)\n' "$label" "$CORE"
+    return 0
+}
+
+FAILED=""
+BUILT=""
+
+# ================================================================= CPython 3
+build_cpython() {
+    step "CPython 3"
+    local v="$CPY_VERSION"
+    if [ "$v" = auto ]; then
+        v=$(latest_cpython) || die "could not discover the latest CPython.  Pass CPY_VERSION=3.13.2"
+    fi
+    local tb="$SRC_ROOT/Python-$v.tar.xz"
+    local src="$SRC_ROOT/Python-$v"
+    local build="$SRC_ROOT/build-cpython-$v"
+    local prefix="$OPT_ROOT/cpython-$v"
+
+    [ -e "$prefix" ] && { warn "CPython: $prefix already exists, skipping"; return 0; }
+
+    dl "$CPY_BASE/$v/Python-$v.tar.xz" "$tb" || die "could not download CPython $v"
+    xz -t "$tb" || { rm -f "$tb"; die "CPython tarball corrupt; re-run"; }
+    [ -d "$src" ] || tar -C "$SRC_ROOT" -xf "$tb"
+
+    rm -rf "$build"; mkdir -p "$build"; cd "$build"
+    # --enable-optimizations is PGO: it builds python, runs a training workload,
+    # then rebuilds using the profile.  --with-lto stacks LTO on top.  Together
+    # they are worth roughly 10-20% on real workloads and cost build time only.
+    # --enable-shared is deliberately NOT used: it produces a libpython3.so that
+    # must then be found at run time, and that is a support burden for a
+    # side-installed interpreter.  Nothing here needs it.
+    "$src/configure" \
+        --prefix="$prefix" \
+        --enable-optimizations \
+        --with-lto \
+        --with-computed-gotos \
+        --with-ensurepip=install \
+        --enable-loadable-sqlite-extensions \
+        2>&1 | tee "$build/configure.log"
+
+    make -j"$JOBS" 2>&1 | tail -40
+    # altinstall, not install: it will not create a bare 'python3', so this
+    # cannot shadow or displace the system interpreter by accident.
+    make altinstall
+
+    local exe
+    exe=$(find "$prefix/bin" -maxdepth 1 -name 'python3.*' ! -name '*-config' -type f | sort -V | tail -1)
+    [ -n "$exe" ] || { warn "CPython: no python3.x in $prefix/bin"; FAILED="$FAILED cpython"; return 1; }
+    ln -sfn "$(basename "$exe")" "$prefix/bin/python3"     # convenience, inside the prefix only
+
+    if verify_interpreter "$exe" "cpython-$v" py3; then
+        BUILT="$BUILT cpython-$v:$prefix"
+        # A bare '[ ] && cmd' here would be the function's last statement, so a
+        # false test would make the function return 1 and report a good build
+        # as a failure.  An explicit if-block keeps the exit status honest.
+        if [ "$LINK_CURRENT" = 1 ]; then ln -sfn "$prefix" "$OPT_ROOT/cpython-current"; fi
+        return 0
+    else
+        FAILED="$FAILED cpython"; return 1
+    fi
+}
+
+# =================================================== PyPy translation host
+PYPY_IDX=""
+HOST=""
+
+acquire_host() {
+    step "Translation host for RPython"
+    if [ -n "$PYPY_HOST" ]; then
+        [ -x "$PYPY_HOST" ] || die "PYPY_HOST=$PYPY_HOST is not executable"
+        HOST="$PYPY_HOST"; printf '  explicit host: %s\n' "$HOST"; return 0
+    fi
+    case "$HOST_MODE" in
+      system)
+        for c in pypy2 pypy "$HOME/opt/pypy2/pypy2/bin/pypy"; do
+            command -v "$c" >/dev/null 2>&1 && { HOST=$(command -v "$c"); break; }
+            [ -x "$c" ] && { HOST="$c"; break; }
+        done
+        [ -n "$HOST" ] || die "HOST_MODE=system but no pypy/pypy2 found.  Set PYPY_HOST=, or use HOST_MODE=prebuilt."
+        ;;
+      cpython)
+        HOST=$(command -v python3) || die "no python3 found"
+        warn "translating under CPython -- expect this to take several hours longer than under PyPy"
+        ;;
+      prebuilt)
+        local rel bin tb dir
+        rel="$PYPY_VERSION"
+        [ "$rel" = auto ] && rel=$(latest_pypy_release "$PYPY_IDX")
+        [ -n "$rel" ] || die "could not determine a PyPy release from the download index"
+        bin=$(pypy_hostname "$PYPY_IDX" "$rel") || true
+        [ -n "$bin" ] || die "no portable PyPy2 build for release $rel on $(uname -m).
+       Use HOST_MODE=system or HOST_MODE=cpython instead."
+        tb="$SRC_ROOT/$bin"
+        dl "$PYPY_BASE/$bin" "$tb" || die "could not download the host PyPy2"
+        dir="$SRC_ROOT/host-pypy2"
+        rm -rf "$dir"; mkdir -p "$dir"
+        tar -C "$dir" --strip-components=1 -xf "$tb"
+        HOST=$(find "$dir/bin" -maxdepth 1 -name 'pypy*' -type f -perm -u+x | head -1)
+        [ -n "$HOST" ] || die "the downloaded PyPy2 has no usable binary under $dir/bin"
+        # A portable build still needs to actually start on this libc.
+        "$HOST" -c 'print("host ok")' >/dev/null 2>&1 \
+            || die "the downloaded PyPy2 will not run on this system.
+       Fall back with:  HOST_MODE=cpython $0"
+        ;;
+      *) die "unknown HOST_MODE='$HOST_MODE' (prebuilt | system | cpython)" ;;
+    esac
+    printf '  host: %s\n  %s\n' "$HOST" "$("$HOST" -c 'import sys; print(sys.version.split()[0])' 2>&1 | head -1)"
+}
+
+# ================================================================= PyPy builds
+build_pypy() {   # build_pypy <2|3>
+    local gen="$1"
+    step "PyPy$gen"
+    local rel="$PYPY_VERSION" srcname
+    [ "$rel" = auto ] && rel=$(latest_pypy_release "$PYPY_IDX")
+    [ -n "$rel" ] || { warn "PyPy$gen: no release discovered"; FAILED="$FAILED pypy$gen"; return 1; }
+
+    srcname=$(pypy_srcname "$PYPY_IDX" "$rel" "$gen")
+    [ -n "$srcname" ] || { warn "PyPy$gen: no source tarball for release $rel"; FAILED="$FAILED pypy$gen"; return 1; }
+
+    # Strip either extension: 'pypy3.11-v7.3.23-src.tar.gz' -> 'pypy3.11-v7.3.23'
+    local stem="${srcname%-src.tar.*}"
+    local tb="$SRC_ROOT/$srcname"
+    local src="$SRC_ROOT/$stem-src"
+    local prefix="$OPT_ROOT/$stem"                    # e.g. ~/opt/pypy3.11-v7.3.23
+
+    [ -e "$prefix" ] && { warn "PyPy$gen: $prefix already exists, skipping"; return 0; }
+
+    dl "$PYPY_BASE/$srcname" "$tb" || { warn "PyPy$gen: download failed"; FAILED="$FAILED pypy$gen"; return 1; }
+    if [ ! -d "$src" ]; then
+        tar -C "$SRC_ROOT" -xf "$tb"
+        [ -d "$src" ] || src=$(find "$SRC_ROOT" -maxdepth 1 -type d -name "$stem*" | head -1)
+    fi
+    [ -d "$src/pypy/goal" ] || { warn "PyPy$gen: unexpected source layout under $src"; FAILED="$FAILED pypy$gen"; return 1; }
+
+    say "Translating PyPy$gen -- this is the long part"
+    printf '    RPython is largely single-threaded until it emits C, so most of\n'
+    printf '    this will look like one busy core.  That is normal, not a hang.\n'
+    cd "$src/pypy/goal"
+    # --opt=jit is the whole point; without it you get a slow interpreter.
+    # PYPY_USESSION_DIR keeps the multi-GB scratch next to the build instead of
+    # in /tmp, which on many systems is tmpfs and will run out of RAM.
+    mkdir -p "$SRC_ROOT/rpython-scratch"
+    if ! PYPY_USESSION_DIR="$SRC_ROOT/rpython-scratch" \
+         "$HOST" ../../rpython/bin/rpython --opt=jit targetpypystandalone.py; then
+        warn "PyPy$gen: translation failed.  The log above is authoritative; the two
+       usual causes are running out of memory and a host interpreter RPython
+       does not support.  Try HOST_MODE=prebuilt, or add swap."
+        FAILED="$FAILED pypy$gen"; return 1
+    fi
+
+    local built
+    built=$(find "$src/pypy/goal" -maxdepth 1 -name 'pypy*-c' -o -maxdepth 1 -name 'pypy-c' | head -1)
+    [ -n "$built" ] || { warn "PyPy$gen: translation reported success but produced no binary"; FAILED="$FAILED pypy$gen"; return 1; }
+    printf '  translated: %s\n' "$built"
+
+    # The cffi-backed stdlib modules (ssl, sqlite3, curses, ...) are built AFTER
+    # translation by a helper whose path has moved between releases, so it is
+    # located rather than assumed.
+    say "Building cffi-backed stdlib modules"
+    local cffi
+    cffi=$(find "$src" -name 'build_cffi_imports.py' -type f | head -1)
+    if [ -n "$cffi" ]; then
+        ( cd "$src" && "$built" "$cffi" ) || warn "PyPy$gen: some cffi modules failed to build -- verification below will say which"
+    else
+        warn "PyPy$gen: build_cffi_imports.py not found; ssl/sqlite3 may be missing"
+    fi
+
+    say "Installing to $prefix"
+    # package.py knows this release's directory layout, so prefer it.  If its CLI
+    # has drifted, fall back to assembling the prefix by hand.  Either way the
+    # verification step below is what actually decides whether it worked.
+    local pkg staged=""
+    pkg=$(find "$src/pypy/tool/release" -name 'package.py' -type f 2>/dev/null | head -1)
+    if [ -n "$pkg" ]; then
+        local stage="$SRC_ROOT/stage-pypy$gen"
+        rm -rf "$stage"; mkdir -p "$stage"
+        if ( cd "$src" && "$HOST" "$pkg" --archive-name "pypy-local" --targetdir "$stage" ) >/dev/null 2>&1; then
+            local arch
+            arch=$(find "$stage" -name '*.tar.bz2' -o -name '*.tar.gz' | head -1)
+            if [ -n "$arch" ]; then
+                mkdir -p "$prefix"
+                tar -C "$prefix" --strip-components=1 -xf "$arch" && staged=1
+            fi
+        fi
+        [ -n "$staged" ] || warn "PyPy$gen: package.py did not produce an archive; assembling the prefix manually"
+    fi
+    if [ -z "$staged" ]; then
+        mkdir -p "$prefix/bin"
+        cp -a "$built" "$prefix/bin/"
+        for d in lib-python lib_pypy lib include; do
+            [ -d "$src/$d" ] && cp -a "$src/$d" "$prefix/"
+        done
+        # translation with --shared emits this next to the binary
+        find "$src/pypy/goal" -maxdepth 1 -name 'libpypy*-c.so' -exec cp -a {} "$prefix/bin/" \; 2>/dev/null || true
+    fi
+
+    local exe
+    exe=$(find "$prefix/bin" -maxdepth 1 \( -name 'pypy' -o -name 'pypy2' -o -name 'pypy3' -o -name 'pypy*-c' \) -type f -perm -u+x | sort | head -1)
+    [ -n "$exe" ] || { warn "PyPy$gen: no interpreter found under $prefix/bin"; FAILED="$FAILED pypy$gen"; return 1; }
+
+    local flav=py3; [ "$gen" = 2 ] && flav=py2
+    if verify_interpreter "$exe" "pypy$gen" "$flav"; then
+        BUILT="$BUILT pypy$gen:$prefix"
+        if [ "$LINK_CURRENT" = 1 ]; then ln -sfn "$prefix" "$OPT_ROOT/pypy$gen-current"; fi
+        return 0
+    else
+        warn "PyPy$gen: built, but incomplete -- see the missing modules above.
+       The usual cause is a -devel package that was absent during the cffi step."
+        FAILED="$FAILED pypy$gen"; return 1
+    fi
+}
+
+# ======================================================================== run
+
+want cpython && { build_cpython || true; }
+
+if want pypy2 || want pypy3; then
+    PYPY_IDX=$(pypy_index) || die "could not reach $PYPY_BASE to list releases"
+    [ -n "$PYPY_IDX" ] || die "the PyPy download index came back empty"
+    acquire_host
+    want pypy2 && { build_pypy 2 || true; }
+    want pypy3 && { build_pypy 3 || true; }
+fi
+
+# ===================================================================== summary
+
+say "Summary"
+if [ -n "$BUILT" ]; then
+    printf '\n  Built and verified:\n'
+    for b in $BUILT; do printf '    %-22s %s\n' "${b%%:*}" "${b#*:}"; done
+fi
+if [ -n "$FAILED" ]; then
+    printf '\n\033[31m  Failed or incomplete:\033[0m%s\n' "$FAILED"
+    printf '  Scroll up for the specific reason; each failure printed one.\n\n'
+    exit 1
+fi
+cat <<EOF
+
+  Add whichever you want to PATH, newest-first, e.g.:
+
+      export PATH="\$HOME/opt/cpython-current/bin:\$PATH"
+
+  A caution worth internalising: if you put a PyPy on PATH ahead of CPython,
+  then 'python3' IS PyPy for every script and build system on this machine.
+  PyPy does not ship the same third-party modules, so anything that shells out
+  to python3 and imports yaml, psutil or setuptools may fail in a way that
+  looks like a broken build rather than a shadowed interpreter.
+  Pin the interpreter explicitly in build scripts instead of trusting PATH.
+
+EOF

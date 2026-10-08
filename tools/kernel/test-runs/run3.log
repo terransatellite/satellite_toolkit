@@ -1,0 +1,6 @@
+  DESCEND objtool
+  TEST    posttest
+  arch/x86/tools/insn_decoder_test: success: Decoded and checked 6789598 instructions
+  TEST    posttest
+  arch/x86/tools/insn_sanity: success: Decoded and checked 1000000 random instructions with 0 errors (seed:0xace82caa)
+Kernel: arch/x86/boot/bzImage is ready  (#1)

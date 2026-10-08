@@ -1,0 +1,138 @@
+
+==> Preflight
+  ok   build tools and headers present
+  ok   567.2 GB free in /home/madness/src/elkt-test
+  --   your shell exports things that would leak into a build; every make here runs in a scrubbed environment instead:
+         CC=/home/madness/opt/clang-current/bin/clang
+         CXX=/home/madness/opt/clang-current/bin/clang++
+         LDFLAGS=-fuse-ld=lld
+         LD_RUN_PATH=/home/madness/opt/clang-current/lib:/home/madness/opt/gcc...
+         LD_LIBRARY_PATH=/home/madness/opt/clang-current/lib:/home/madness/opt/gcc...
+         python3 on PATH is /home/madness/opt/pypy3/pypy3/bin/python3, not /usr/bin/python3
+         gcc on PATH is /home/madness/opt/gcc-17/bin/gcc, not /usr/bin/gcc
+  --   /lib/firmware/intel-ucode is empty: no CPU microcode update will be loaded by ANY kernel here (install microcode_ctl / intel-microcode / amd64-microcode, then rebuild the initramfs).
+
+==> Source
+  kernel      : 7.2.6  (stable)
+  --   PGP         : sha256sums.asc signature NOT verified (key 632D3A06589DA6B1 is not in your keyring).
+  --                 The checksum still proves the download is intact; it
+  --                 does not prove who published it.  --require-pgp enforces.
+  ok   sha256      : 039aef84f2b0994a...  linux-7.2.6.tar.xz
+  extracting  : /home/madness/src/elkt-test/linux-7.2.6
+
+==> Plan
+  tree        : /home/madness/src/elkt-test/linux-7.2.6
+  gpu drivers : amd  (detected) + VM/BMC/rescue, always
+  toolchain   : gcc (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)
+  modules     : trimmed     cpu: generic     preempt: keep     hz: keep     debug info: off
+  release     : <version>-elkt     jobs: 24     clean: auto
+  base config : /lib/modules/7.2.4-gpu/build/.config (the running kernel's)
+  then        : stop after building (install later with the `install` command)
+  profile saved: ../test-runs/siege3-trimmed.ini
+
+==> Previous attempt on this tree
+  recorded    : nothing
+  keeping     : no object files present -- nothing to clean
+
+==> Configuring
+  base        : /lib/modules/7.2.4-gpu/build/.config (the running kernel's)
+  trimmed     : 2514 -> 143 modules (to what is loaded now)
+
+==> Verifying the configuration
+  ok   CONFIG_MEMORY_HOTPLUG               = y
+  ok   CONFIG_MEMORY_HOTREMOVE             = y
+  ok   CONFIG_ZONE_DEVICE                  = y
+  ok   CONFIG_DEVICE_PRIVATE               = y
+  ok   CONFIG_PCI_P2PDMA                   = y
+  ok   CONFIG_DRM_ACCEL                    = y
+  ok   CONFIG_MODULES                      = y
+  ok   CONFIG_MODULE_UNLOAD                = y
+  ok   CONFIG_SYSFB_SIMPLEFB               = y
+  ok   CONFIG_DRM_SIMPLEDRM                = m
+  ok   CONFIG_DRM_FBDEV_EMULATION          = y
+  ok   CONFIG_FRAMEBUFFER_CONSOLE          = y
+  ok   CONFIG_DRM_VIRTIO_GPU               = m
+  ok   CONFIG_DRM_QXL                      = m
+  ok   CONFIG_DRM_BOCHS                    = m
+  ok   CONFIG_DRM_AST                      = m
+  ok   CONFIG_DRM_MGAG200                  = m
+  ok   CONFIG_DRM_UDL                      = m
+  --   CONFIG_HYPERV                       wanted m|y, got n
+  --   CONFIG_DRM_HYPERV                   wanted m, got <absent>
+  --   CONFIG_DRM_EFIDRM                   wanted m, got <absent>
+  --   CONFIG_DRM_VESADRM                  wanted m, got <absent>
+  ok   CONFIG_FW_LOADER                    = y
+  ok   CONFIG_FW_LOADER_COMPRESS           = y
+  ok   CONFIG_FW_LOADER_COMPRESS_XZ        = y
+  ok   CONFIG_FW_LOADER_COMPRESS_ZSTD      = y
+  ok   CONFIG_DRM_AMDGPU                   = m
+  ok   CONFIG_DRM_AMD_DC                   = y
+  ok   CONFIG_DRM_AMDGPU_USERPTR           = y
+  ok   CONFIG_DRM_AMDGPU_SI                = y
+  ok   CONFIG_DRM_AMDGPU_CIK               = y
+  ok   CONFIG_HSA_AMD                      = y
+  ok   CONFIG_HSA_AMD_SVM                  = y
+  --   CONFIG_DMABUF_MOVE_NOTIFY           not in this kernel version  (HSA_AMD_P2P depends on it before 7.x)
+  ok   CONFIG_HSA_AMD_P2P                  = y
+  ok   CONFIG_VFAT_FS                      = m
+  ok   CONFIG_NLS_CODEPAGE_437             = y
+  ok   CONFIG_NLS_ISO8859_1                = m
+  ok   CONFIG_NLS_ASCII                    = y
+  ok   CONFIG_NLS_UTF8                     = m
+  ok   CONFIG_XFS_FS                       = m
+  ok   CONFIG_BLK_DEV_DM                   = m
+  ok   CONFIG_USB_STORAGE                  = m
+  ok   CONFIG_USB_UAS                      = m
+  ok   CONFIG_BLK_DEV_LOOP                 = m
+  ok   CONFIG_ISO9660_FS                   = m
+  ok   CONFIG_SQUASHFS                     = m
+  ok   CONFIG_VFAT_FS                      = m
+  ok   CONFIG_NLS_CODEPAGE_437             = y
+  ok   CONFIG_NLS_ISO8859_1                = m
+  ok   CONFIG_NLS_UTF8                     = m
+  ok   CONFIG_EXT4_FS                      = m
+  ok   CONFIG_XFS_FS                       = m
+  ok   CONFIG_BLK_DEV_NVME                 = m
+  ok   CONFIG_SATA_AHCI                    = m
+  ok   CONFIG_BLK_DEV_DM                   = m
+  ok   CONFIG_VIRTIO_PCI                   = y
+  ok   CONFIG_VIRTIO_BLK                   = m
+  ok   CONFIG_VIRTIO_NET                   = m
+  ok   CONFIG_SCSI_VIRTIO                  = m
+  ok   CONFIG_HID_GENERIC                  = y
+  ok   CONFIG_USB_HID                      = y
+  ok   CONFIG_SYSTEM_TRUSTED_KEYS          = ""
+  ok   CONFIG_SYSTEM_REVOCATION_KEYS       = ""
+  ok   CONFIG_EFI_SBAT_FILE                = ""
+  ok   CONFIG_FRAME_WARN                   = 8192
+  ok   CONFIG_IKCONFIG                     = y
+  ok   CONFIG_IKCONFIG_PROC                = y
+  ok   CONFIG_DEBUG_INFO_NONE              = y
+  ok   CONFIG_LOCALVERSION                 = -elkt
+  config      : 2116 built-in, 168 modules
+  release     : 7.2.6-elkt
+
+==> Building 7.2.6-elkt with -j24
+  full log    : ../test-runs/elkt-state/build-linux-7.2.6.log
+  [00:02:00]   3653 steps  CC drivers/pci/hotplug/shpchp_ctrl.o
+  [00:04:00]   5275 steps  CC drivers/acpi/x86/s2idle.o
+  [00:06:00]   6949 steps  CC [M] fs/btrfs/props.o
+  [00:08:00]   8118 steps  CC [M] drivers/gpu/drm/amd/amdgpu/../display/dc/hubbub/dcn20/dcn20_hub
+Kernel: arch/x86/boot/bzImage is ready  (#1)
+  ok   built in 9m33s: 8796 steps, 0 warnings
+
+==> Post-build checks
+  ok   kernel release: 7.2.6-elkt
+  ok   all 120 modules loaded right now exist in this build
+  --   BTF is off but BPF_LSM is on: systemd will log 'bpf-restrict-fs: Failed to load BPF object' at boot, and bpftrace / CO-RE tools will not run.  --debug-info btf fixes that, for a slower build.
+  ok   amdgpu built as a module
+
+==> Out-of-tree (DKMS) build check
+  ok   a module compiles the way DKMS will run it (root's PATH, system compiler)
+       vermagic: 7.2.6-elkt SMP preempt mod_unload modversions
+  --   amdgpu/6.19.14-2364437.el10: DKMS will skip 7.2.6-elkt cleanly (capped at 6.18)
+       the in-tree amdgpu built here serves the GPU instead
+
+==> Built, not installed.
+  install with:  enterprise_linux_kernel_tool.py install --source /home/madness/src/elkt-test/linux-7.2.6
+exit=0

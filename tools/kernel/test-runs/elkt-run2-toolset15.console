@@ -1,0 +1,143 @@
+
+==> Preflight
+  ok   build tools and headers present
+  ok   563.9 GB free in /home/madness/src/elkt-test
+  --   your shell exports things that would leak into a build; every make here runs in a scrubbed environment instead:
+         CC=/home/madness/opt/clang-current/bin/clang
+         CXX=/home/madness/opt/clang-current/bin/clang++
+         LDFLAGS=-fuse-ld=lld
+         LD_RUN_PATH=/home/madness/opt/clang-current/lib:/home/madness/opt/gcc...
+         LD_LIBRARY_PATH=/home/madness/opt/clang-current/lib:/home/madness/opt/gcc...
+         python3 on PATH is /home/madness/opt/pypy3/pypy3/bin/python3, not /usr/bin/python3
+         gcc on PATH is /home/madness/opt/gcc-17/bin/gcc, not /usr/bin/gcc
+  --   /lib/firmware/intel-ucode is empty: no CPU microcode update will be loaded by ANY kernel here (install microcode_ctl / intel-microcode / amd64-microcode, then rebuild the initramfs).
+
+==> Source
+  kernel      : 7.2.6  (stable)
+  source      : /home/madness/src/elkt-test/linux-7.2.6 (already extracted)
+
+==> Plan
+  tree        : /home/madness/src/elkt-test/linux-7.2.6
+  gpu drivers : amd  (detected) + VM/BMC/rescue, always
+  compiler    : gcc (GCC) 15.2.1 20260123 (Red Hat 15.2.1-7)
+                /opt/rh/gcc-toolset-15/root/usr/bin/gcc  [Red Hat gcc-toolset (vendor-supported)]
+  assembler   : /opt/rh/gcc-toolset-15/root/usr/bin/as  (GNU assembler version 2.44-8.el10)
+  linker      : /opt/rh/gcc-toolset-15/root/usr/bin/ld  (GNU ld version 2.44-8.el10)
+  python3     : /usr/bin/python3  (Python 3.12.14)
+  make        : /usr/bin/make  (GNU Make 4.4.1)
+  make args   : CC=/opt/rh/gcc-toolset-15/root/usr/bin/gcc HOSTCC=/usr/bin/gcc
+warning: /opt/rh/gcc-toolset-15/root/usr/bin/gcc is not the system compiler.  DKMS builds as root with the system one; mixing compilers between a kernel and its modules is the usual reason DKMS stops compiling.
+  modules     : trimmed     cpu: generic     preempt: keep     hz: keep     debug info: off
+  release     : <version>-elkt     jobs: 24     clean: auto
+  base config : the .config already in this tree
+  then        : stop after building (install later with the `install` command)
+
+==> What this tree requires of the build tools
+  ok   14 build tools meet this tree's own minimums (changes.rst)
+  --   optional, not available: bindgen
+
+==> Previous attempt on this tree
+  recorded    : built at stage done  (2026-09-19T00:15:41-0400)
+  keeping     : the last run finished cleanly (built); incremental is correct
+
+==> Configuring
+  base        : the .config already in this tree
+  trimmed     : 169 -> 142 modules (to what is loaded now)
+
+==> Verifying the configuration
+  ok   CONFIG_MEMORY_HOTPLUG               = y
+  ok   CONFIG_MEMORY_HOTREMOVE             = y
+  ok   CONFIG_ZONE_DEVICE                  = y
+  ok   CONFIG_DEVICE_PRIVATE               = y
+  ok   CONFIG_PCI_P2PDMA                   = y
+  ok   CONFIG_DRM_ACCEL                    = y
+  ok   CONFIG_MODULES                      = y
+  ok   CONFIG_MODULE_UNLOAD                = y
+  ok   CONFIG_DRM                          = y
+  ok   CONFIG_SYSFB_SIMPLEFB               = y
+  ok   CONFIG_DRM_SIMPLEDRM                = m
+  ok   CONFIG_DRM_FBDEV_EMULATION          = y
+  ok   CONFIG_FRAMEBUFFER_CONSOLE          = y
+  ok   CONFIG_DRM_VIRTIO_GPU               = m
+  ok   CONFIG_DRM_QXL                      = m
+  ok   CONFIG_DRM_BOCHS                    = m
+  ok   CONFIG_DRM_AST                      = m
+  ok   CONFIG_DRM_MGAG200                  = m
+  ok   CONFIG_DRM_UDL                      = m
+  --   CONFIG_DRM_EFIDRM                   wanted m, got <absent>
+  --   CONFIG_DRM_VESADRM                  wanted m, got <absent>
+  ok   CONFIG_FW_LOADER                    = y
+  ok   CONFIG_FW_LOADER_COMPRESS           = y
+  ok   CONFIG_FW_LOADER_COMPRESS_XZ        = y
+  ok   CONFIG_FW_LOADER_COMPRESS_ZSTD      = y
+  ok   CONFIG_DRM_AMDGPU                   = m
+  ok   CONFIG_DRM_AMD_DC                   = y
+  ok   CONFIG_DRM_AMDGPU_USERPTR           = y
+  ok   CONFIG_DRM_AMDGPU_SI                = y
+  ok   CONFIG_DRM_AMDGPU_CIK               = y
+  ok   CONFIG_HSA_AMD                      = y
+  ok   CONFIG_HSA_AMD_SVM                  = y
+  --   CONFIG_DMABUF_MOVE_NOTIFY           not in this kernel version  (HSA_AMD_P2P depends on it before 7.x)
+  ok   CONFIG_HSA_AMD_P2P                  = y
+  ok   CONFIG_VFAT_FS                      = m
+  ok   CONFIG_NLS_CODEPAGE_437             = y
+  ok   CONFIG_NLS_ISO8859_1                = m
+  ok   CONFIG_NLS_ASCII                    = y
+  ok   CONFIG_NLS_UTF8                     = m
+  ok   CONFIG_XFS_FS                       = m
+  ok   CONFIG_BLK_DEV_DM                   = m
+  ok   CONFIG_USB_STORAGE                  = m
+  ok   CONFIG_USB_UAS                      = m
+  ok   CONFIG_BLK_DEV_LOOP                 = m
+  ok   CONFIG_ISO9660_FS                   = m
+  ok   CONFIG_SQUASHFS                     = m
+  ok   CONFIG_VFAT_FS                      = m
+  ok   CONFIG_NLS_CODEPAGE_437             = y
+  ok   CONFIG_NLS_ISO8859_1                = m
+  ok   CONFIG_NLS_UTF8                     = m
+  ok   CONFIG_EXT4_FS                      = m
+  ok   CONFIG_XFS_FS                       = m
+  ok   CONFIG_BLK_DEV_NVME                 = m
+  ok   CONFIG_SATA_AHCI                    = m
+  ok   CONFIG_BLK_DEV_DM                   = m
+  ok   CONFIG_VIRTIO_PCI                   = y
+  ok   CONFIG_VIRTIO_BLK                   = m
+  ok   CONFIG_VIRTIO_NET                   = m
+  ok   CONFIG_SCSI_VIRTIO                  = m
+  ok   CONFIG_HID_GENERIC                  = y
+  ok   CONFIG_USB_HID                      = y
+  ok   CONFIG_SYSTEM_TRUSTED_KEYS          = ""
+  ok   CONFIG_SYSTEM_REVOCATION_KEYS       = ""
+  ok   CONFIG_EFI_SBAT_FILE                = ""
+  ok   CONFIG_FRAME_WARN                   = 8192
+  ok   CONFIG_IKCONFIG                     = y
+  ok   CONFIG_IKCONFIG_PROC                = y
+  ok   CONFIG_DEBUG_INFO_NONE              = y
+  ok   CONFIG_LOCALVERSION                 = -elkt
+  config      : 2124 built-in, 169 modules
+  release     : 7.2.6-elkt
+
+==> Building 7.2.6-elkt with -j24
+  full log    : /home/madness/Documents/universal_linux_kernel_script/test-runs/elkt-state/build-linux-7.2.6.log
+  [00:02:00]   2378 steps  HDRTEST usr/include/video/edid.h
+  [00:04:00]   3895 steps  AR fs/nls/built-in.a
+  [00:06:00]   5148 steps  CC [M] drivers/md/dm-path-selector.o
+  [00:08:00]   6351 steps  CC [M] drivers/gpu/drm/amd/amdgpu/../display/dc/dml/dcn314/display_mod
+Kernel: arch/x86/boot/bzImage is ready  (#3)
+  ok   built in 9m57s: 7287 steps, 0 warnings
+
+==> Post-build checks
+  ok   kernel release: 7.2.6-elkt
+  ok   all 120 modules loaded right now exist in this build
+  --   BTF is off but BPF_LSM is on: systemd will log 'bpf-restrict-fs: Failed to load BPF object' at boot, and bpftrace / CO-RE tools will not run.  --debug-info btf fixes that, for a slower build.
+  ok   amdgpu built as a module
+
+==> Out-of-tree (DKMS) build check
+  ok   a module compiles the way DKMS will run it (root's PATH, system compiler)
+       vermagic: 7.2.6-elkt SMP preempt mod_unload modversions
+  --   amdgpu/6.19.14-2364437.el10: DKMS will skip 7.2.6-elkt cleanly (capped at 6.18)
+       the in-tree amdgpu built here serves the GPU instead
+
+==> Built, not installed.
+  install with:  enterprise_linux_kernel_tool.py install --source /home/madness/src/elkt-test/linux-7.2.6  (plus the same --toolchain/--cc/--llvm-prefix)
+exit=0

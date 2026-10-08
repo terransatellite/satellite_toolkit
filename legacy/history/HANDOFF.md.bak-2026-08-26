@@ -1,0 +1,41 @@
+# Handoff — siege3, 2026-08-26 (evening)
+
+## Running right now
+- **GCC 16.2.0**, `~/Documents/build_gcc_universal.sh`, MODE=profiled-lto.
+  Stage order: stage1 (done) -> stageprofile (done) -> **stagetrain** -> stagefeedback.
+  stagetrain looks like a hang: load drops to 1-2 for a while. That is normal.
+  Log: `~/src/gcc-build/build-gcc-16.2.0/build.log`. Installs to `~/opt/gcc-16.2.0`,
+  then repoints `~/opt/gcc-current`.
+
+## Done today
+- **clang-24-4** built + installed, `clang-current` -> it. 121 MB vs 24-3's 196 MB
+  (the earlier build wrongly inherited LLVM_TARGETS_TO_BUILD=all; now X86 only).
+- Six build scripts in `~/Documents`, packaged as `build-scripts.tar.gz` + `SHA256SUMS`.
+  The four published ones carry an unindented ASCII self-check that detects
+  copy-paste NBSP corruption and prints the exact sed repair.
+
+## Three traps on this machine, all the same shape
+Every one of these was "the script checked one thing and used another":
+1. `python3` on PATH is **PyPy**, not CPython. Pin `/usr/bin/python3`.
+2. `.bashrc` exports **CC/CXX -> clang-current**. This silently breaks GCC
+   builds: MPFR's LTO probe runs clang bitcode through the system LLVMgold.so
+   (llvm-libs 21) and dies with "Invalid record" in stage 1.
+   `build_gcc_universal.sh` now ignores env CC and picks /usr/bin/gcc.
+3. Kernel `.ko` FILES keep hyphens (`virtio-gpu.ko`); only the module NAME uses
+   underscores. 897 of 2424 modules on this box have hyphenated filenames.
+
+## Open work
+- **PyPy SSL is broken.** Both `~/opt/pypy2` and `~/opt/pypy3` SEGFAULT (signal 11)
+  on `ssl.SSLContext(PROTOCOL_TLS_CLIENT)`; HTTPS fails entirely. PyPy3 is what
+  answers `python3` on PATH, so anything shelling out to python3 for network work
+  is broken. Likely cffi _ssl bindings built against an older OpenSSL than the
+  loaded 3.5.5. Fix attempt: `TARGETS=pypy3 ~/Documents/build_python_universal.sh`
+  (needs ~8 GB RAM; do not run while GCC has the cores).
+- **Kernel 7.2.0** built but NOT installed — `/lib/modules/7.2.0` is empty:
+      sudo make -j 24 modules_install
+      sudo ~/Documents/fix-amdgpu-dkms.sh     # BEFORE install
+      sudo make -j 24 install
+      sudo lsinitrd /boot/initramfs-7.2.0.img | grep -c 'firmware/amdgpu'
+- **GCC 17** if wanted: `TRACK=snapshot ~/Documents/build_gcc_universal.sh`
+  -> 17-20260823, installs to its own prefix. `~/opt/gcc-17` is the older 20260816.
+- `~/code/cxx/satellite`: main has 6 unpushed commits.

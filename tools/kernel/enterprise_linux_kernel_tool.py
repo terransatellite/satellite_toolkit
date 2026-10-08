@@ -1,0 +1,5414 @@
+#!/usr/bin/python3 -I
+# -*- coding: utf-8 -*-
+"""
+enterprise_linux_kernel_tool.py
+
+Pick a kernel from kernel.org, configure it for the machine it is run on, build
+it, prove that out-of-tree (DKMS) modules still compile against it, and install
+it without taking over the boot menu.
+
+    ./enterprise_linux_kernel_tool.py                  interactive wizard
+    ./enterprise_linux_kernel_tool.py kernels          what kernel.org offers
+    ./enterprise_linux_kernel_tool.py detect           what this machine is
+    ./enterprise_linux_kernel_tool.py doctor           can this machine build?
+    ./enterprise_linux_kernel_tool.py plan  --kernel stable
+    ./enterprise_linux_kernel_tool.py build --kernel 6.12 --modules trimmed
+    ./enterprise_linux_kernel_tool.py install --source ~/src/linux-7.2.6
+    ./enterprise_linux_kernel_tool.py dkms-check --source ~/src/linux-7.2.6
+
+Standard library only, and the SYNTAX is held to Python 3.6 so RHEL 8's
+platform interpreter can run it: no walrus, no `capture_output=`, no
+`text=`, no dataclasses.  The shebang pins /usr/bin/python3 -- the interpreter
+the package manager itself depends on -- because "python3" on PATH is not
+reliably CPython (on the machine this was written on it is a PyPy whose ssl
+module segfaults).
+
+THE ONE THING THIS TOOL EXISTS TO GET RIGHT, inherited from the shell script it
+replaces: GPU drivers are MODULES.  A built-in (=y) driver probes before the
+root filesystem is mounted, so its firmware must already be in the initramfs --
+but dracut and initramfs-tools pick firmware by looking at installed MODULES,
+and a built-in driver is not one.  Result: no display, no /dev/kfd.  As modules
+they also stay replaceable, which is what amdgpu-dkms and NVIDIA's stack need.
+
+Licence: public domain / CC0.  No warranty.  It installs a kernel; read it first.
+"""
+
+import sys
+
+if sys.version_info < (3, 6):
+    sys.exit("enterprise_linux_kernel_tool.py needs Python 3.6 or newer")
+
+import argparse
+import base64
+import configparser
+import errno
+import fcntl
+import glob
+import gzip
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+TOOL = "enterprise_linux_kernel_tool"
+VERSION = "0.1.0"
+PLATFORM_PYTHON = "/usr/bin/python3"
+KORG_RELEASES = "https://www.kernel.org/releases.json"
+KORG_CDN = "https://cdn.kernel.org/pub/linux/kernel"
+USER_AGENT = TOOL + "/" + VERSION
+
+
+# ------------------------------------------------------------------------ output
+
+class UI(object):
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    tty = sys.stdout.isatty()
+
+
+def _c(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if UI.color else text
+
+
+def out(text=""):
+    try:
+        print(text)
+    except UnicodeEncodeError:      # a C locale meeting U+FFFD from errors="replace"
+        print(text.encode("ascii", "replace").decode("ascii"))
+    sys.stdout.flush()
+
+
+def say(msg):
+    out("\n" + _c("1", "==> " + msg))
+
+
+def info(msg):
+    out("  " + msg)
+
+
+def ok(msg):
+    out("  " + _c("32", "ok  ") + " " + msg)
+
+
+def note(msg):
+    out("  --   " + msg)
+
+
+def bad(msg):
+    out("  " + _c("31", "FAIL") + " " + msg)
+
+
+def warn(msg):
+    # stdout, not stderr: with both redirected to one log file the two streams
+    # interleave out of order, and a warning that lands three sections late is
+    # worse than no warning.
+    out(_c("33", "warning:") + " " + msg)
+
+
+class ToolError(Exception):
+    """A failure with a message fit to show the user.  No traceback."""
+
+
+# ----------------------------------------------------------------------- process
+
+def which(name, path=None):
+    return shutil.which(name, path=path)
+
+
+def run(cmd, cwd=None, env=None, check=True, capture=True, stdin_data=None,
+        interactive=False, timeout=None):
+    """subprocess.run with 3.6-safe arguments.  stdin is /dev/null unless asked
+    for, so nothing downstream can sit waiting on a prompt nobody will see."""
+    kw = dict(cwd=cwd, env=env, universal_newlines=True, errors="replace",
+              timeout=timeout)
+    if capture and not interactive:
+        kw["stdout"] = subprocess.PIPE
+        kw["stderr"] = subprocess.STDOUT
+    if stdin_data is not None:
+        kw["input"] = stdin_data
+    elif not interactive:
+        kw["stdin"] = subprocess.DEVNULL
+    try:
+        p = subprocess.run(cmd, **kw)
+    except FileNotFoundError:
+        raise ToolError("command not found: %s" % cmd[0])
+    except PermissionError as e:
+        # ^C while a root-owned `sudo` child runs: subprocess.run's clean-up
+        # kill() is refused (EPERM) and the PermissionError REPLACES the
+        # KeyboardInterrupt -- a traceback instead of the ^C path.  sudo relays
+        # the terminal's SIGINT to its child itself.  (EACCES is the other
+        # PermissionError: a file that is not executable.)
+        if e.errno == errno.EPERM:
+            raise KeyboardInterrupt()
+        raise ToolError("cannot run %s: %s" % (cmd[0], e))
+    except OSError as e:
+        # ENOEXEC: a file named like a compiler that the kernel cannot run (no
+        # shebang, another architecture's binary) in ~/opt or ~/.local/bin.  It
+        # used to escape from detect_machine() as a traceback and stop EVERY
+        # command, `doctor` included.
+        raise ToolError("cannot run %s: %s" % (cmd[0], e))
+    except subprocess.TimeoutExpired:
+        raise ToolError("timed out: %s" % " ".join(cmd))
+    if check and p.returncode != 0:
+        tail = (p.stdout or "").strip()[-2000:]
+        raise ToolError("command failed (exit %d): %s\n%s"
+                        % (p.returncode, " ".join(cmd), tail))
+    return p
+
+
+# Environment for every make invocation.  An ALLOW-list: the traps that cost
+# whole builds on real machines were all inherited variables nobody remembered
+# exporting -- CC/CXX pointing at a private clang, LD_RUN_PATH baked into every
+# host tool's RPATH, LOCALVERSION appended a second time by setlocalversion,
+# PYTHON* steering kbuild's scripts into another interpreter.
+# XDG_*: where THIS tool keeps its keys and state.  The sign hook in a tree runs the
+# tool again from inside make; without these it would look in another place.
+ENV_KEEP = ("HOME", "USER", "LOGNAME", "TERM", "TMPDIR", "SHELL", "CCACHE_DIR",
+            "XDG_CONFIG_HOME", "XDG_STATE_HOME")
+SYSTEM_PATH = ["/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin"]
+
+
+def scrubbed_env(extra_path=None):
+    env = dict((k, os.environ[k]) for k in ENV_KEEP if k in os.environ)
+    env["ELKT_NO_SIGN"] = "1"      # the tree's wrapper signs for OTHER callers; we do it ourselves
+    env["ELKT_NO_PIN"] = "1"       # ...and pins for them: our makes NAME their toolchain, ccache and all
+    path = ([extra_path] if extra_path else []) + SYSTEM_PATH
+    env["PATH"] = ":".join(path)
+    env["LC_ALL"] = "C"
+    return env
+
+
+def dkms_env(pkg_manager):
+    """What an out-of-tree build sees when DKMS runs it: root, via sudo or a
+    package hook, with sudo's secure_path and none of the user's exports."""
+    path = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+    if pkg_manager == "apt-get":
+        path = ["/usr/local/sbin", "/usr/local/bin"] + path
+    return {"PATH": ":".join(path), "LC_ALL": "C", "HOME": "/root", "TERM": "dumb"}
+
+
+def env_traps():
+    """Inherited settings that would have leaked into a build.  Reported by
+    `doctor` so the user knows they exist; neutralised by scrubbed_env()."""
+    found = []
+    for var in ("LLVM", "LLVM_IAS", "CC", "CXX", "HOSTCC", "HOSTCXX", "LD", "CFLAGS", "LDFLAGS", "KCFLAGS",
+                "LD_RUN_PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH",
+                "C_INCLUDE_PATH", "LOCALVERSION", "ARCH", "CROSS_COMPILE",
+                "PYTHONPATH", "PYTHONHOME", "KCONFIG_CONFIG", "KBUILD_OUTPUT"):
+        if var in os.environ:
+            val = os.environ[var]
+            found.append("%s=%s" % (var, val if len(val) < 60 else val[:57] + "..."))
+    py = which("python3")
+    if py and os.path.realpath(py) != os.path.realpath(PLATFORM_PYTHON):
+        found.append("python3 on PATH is %s, not %s" % (py, PLATFORM_PYTHON))
+    gcc = which("gcc")
+    if gcc and os.path.realpath(gcc) != os.path.realpath("/usr/bin/gcc") \
+            and os.path.exists("/usr/bin/gcc"):
+        found.append("gcc on PATH is %s, not /usr/bin/gcc" % gcc)
+    return found
+
+
+def read_text(path, default=""):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read()
+    except (OSError, IOError):
+        return default
+
+
+def rp(root, path):
+    return os.path.join(root, path.lstrip("/"))
+
+
+def human(nbytes):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if nbytes < 1024 or unit == "TB":
+            return "%.1f %s" % (nbytes, unit) if unit != "B" else "%d B" % nbytes
+        nbytes /= 1024.0
+    return "%d" % nbytes
+
+
+def free_bytes(path):
+    p = path
+    while p and not os.path.exists(p):
+        p = os.path.dirname(p)
+    try:
+        return shutil.disk_usage(p or "/").free
+    except OSError:
+        return 0
+
+
+# ---------------------------------------------------------------------- versions
+
+def version_key(v):
+    """Sortable key.  7.3-rc3 < 7.3 < 7.3.1; anything unparseable sorts first."""
+    m = re.match(r"^v?(\d+)\.(\d+)(?:\.(\d+))?(?:-rc(\d+))?", v or "")
+    if not m:
+        return (0, 0, 0, 0, 0)
+    a, b, c, rc = m.groups()
+    return (int(a), int(b), int(c or 0), 0 if rc else 1, int(rc or 0))
+
+
+def series_of(v):
+    k = version_key(v)
+    return "%d.%d" % (k[0], k[1])
+
+
+# -------------------------------------------------------------------- kernel.org
+
+def http_get(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise ToolError("could not fetch %s: %s" % (url, e))
+
+
+def parse_releases(raw):
+    data = json.loads(raw)
+    rels = []
+    for r in data.get("releases", []):
+        rels.append({
+            "moniker": r.get("moniker", ""),
+            "version": r.get("version", ""),
+            "eol": bool(r.get("iseol")),
+            "date": (r.get("released") or {}).get("isodate", ""),
+            "source": r.get("source") or "",
+        })
+    latest = (data.get("latest_stable") or {}).get("version", "")
+    return latest, rels
+
+
+def get_releases():
+    return parse_releases(http_get(KORG_RELEASES).decode("utf-8", "replace"))
+
+
+SUM_LINE = re.compile(r"^([0-9a-f]{64})\s+linux-(\d+\.\d+(?:\.\d+)?)\.tar\.xz\s*$")
+
+
+def signed_body(text):
+    """Only what the PGP signature covers.  gpg verifies the clearsigned block
+    and ignores whatever surrounds it, so a checksum line appended AFTER the
+    signature would sail through `gpg --verify` and still be parsed -- unless
+    the parser stops where the signature does.  The same goes for text put
+    BEFORE it: gpg starts at the first line that IS the armor header, so must
+    this (`^`, not anywhere in a line), and a file that has a signed block but
+    does not begin with it is refused outright rather than half-trusted."""
+    if "-----BEGIN PGP SIGNED MESSAGE-----" not in text:
+        return text
+    if not text.lstrip("\r\n").startswith("-----BEGIN PGP SIGNED MESSAGE-----"):
+        raise ToolError("the checksum file has text BEFORE its PGP-signed block -- refusing it: "
+                        "a signature check would pass while unsigned lines were read")
+    m = re.search(r"^-----BEGIN PGP SIGNED MESSAGE-----\r?\n(?:[^\r\n]+\r?\n)*\r?\n(.*?)"
+                  r"\r?\n-----BEGIN PGP SIGNATURE-----", text, re.S | re.M)
+    return m.group(1) if m else ""
+
+
+def parse_sha256sums(text):
+    sums = {}
+    for line in signed_body(text).splitlines():
+        m = SUM_LINE.match(line)
+        if m and m.group(2) not in sums:     # first wins; a second entry is suspect
+            sums[m.group(2)] = m.group(1)
+    return sums
+
+
+def get_series_sums(major):
+    """One fetch yields every point release in vN.x AND its checksum."""
+    url = "%s/v%d.x/sha256sums.asc" % (KORG_CDN, major)
+    text = http_get(url, timeout=60).decode("utf-8", "replace")
+    return parse_sha256sums(text), text
+
+
+def resolve_kernel(selector, latest, rels, sums_for):
+    """selector: stable | longterm | mainline | X.Y | X.Y.Z | X.Y-rcN
+    sums_for(major) -> (dict version->sha256, signed text).  Injected so the
+    resolution rules can be tested without a network."""
+    sel = (selector or "stable").strip().lower()
+    by_ver = dict((r["version"], r) for r in rels)
+    ver = None
+    if sel in ("stable", "latest", "latest-stable"):
+        ver = latest or next((r["version"] for r in rels if r["moniker"] == "stable"), None)
+    elif sel in ("longterm", "lts", "latest-longterm"):
+        ver = next((r["version"] for r in rels
+                    if r["moniker"] == "longterm" and not r["eol"]), None)
+    elif sel == "mainline":
+        ver = next((r["version"] for r in rels if r["moniker"] == "mainline"), None)
+    elif re.match(r"^\d+\.\d+$", sel):
+        sums, _ = sums_for(int(sel.split(".")[0]))
+        cands = [v for v in sums if series_of(v) == sel]
+        if not cands:
+            raise ToolError("kernel.org has no %s.y releases" % sel)
+        ver = max(cands, key=version_key)
+    elif re.match(r"^\d+\.\d+(\.\d+)?(-rc\d+)?$", sel):
+        ver = sel
+    else:
+        raise ToolError("cannot read kernel selector '%s' -- use stable, longterm, "
+                        "mainline, a series (6.12) or a version (6.12.9)" % selector)
+    if not ver:
+        raise ToolError("kernel.org's release feed has no '%s' entry right now" % sel)
+
+    major = version_key(ver)[0]
+    if major < 3:
+        raise ToolError("kernels before 3.0 are not supported")
+    target = {"version": ver, "sha256": None, "signed_text": None,
+              "eol": by_ver.get(ver, {}).get("eol", False),
+              "moniker": by_ver.get(ver, {}).get("moniker", "")}
+    if "-rc" in ver:
+        src = by_ver.get(ver, {}).get("source", "")
+        if not src:
+            raise ToolError("%s is not the current mainline -rc; kernel.org only "
+                            "publishes a tarball for the newest one" % ver)
+        target["url"] = src
+        target["tarball"] = os.path.basename(src)
+    else:
+        sums, text = sums_for(major)
+        if ver not in sums:
+            raise ToolError("kernel.org has no linux-%s.tar.xz (series %s has %d releases)"
+                            % (ver, series_of(ver),
+                               len([v for v in sums if series_of(v) == series_of(ver)])))
+        target["sha256"] = sums[ver]
+        target["signed_text"] = text
+        target["tarball"] = "linux-%s.tar.xz" % ver
+        target["url"] = "%s/v%d.x/%s" % (KORG_CDN, major, target["tarball"])
+    return target
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pgp_check(signed_text):
+    """(state, detail).  state: good | nokey | bad | unavailable."""
+    gpg = which("gpg") or which("gpg2")
+    if not gpg:
+        return "unavailable", "gpg is not installed"
+    fd, tmp = tempfile.mkstemp(prefix="elkt-sums-", suffix=".asc")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(signed_text)
+        p = run([gpg, "--batch", "--status-fd", "1", "--verify", tmp], check=False)
+    finally:
+        os.unlink(tmp)
+    o = p.stdout or ""
+    if "[GNUPG:] BADSIG" in o:
+        return "bad", "BAD signature on sha256sums.asc"
+    m = re.search(r"\[GNUPG:\] GOODSIG \S+ (.*)", o)
+    if m and "[GNUPG:] VALIDSIG" in o:
+        return "good", m.group(1).strip()
+    m = re.search(r"\[GNUPG:\] NO_PUBKEY (\S+)", o)
+    if m:
+        return "nokey", m.group(1)
+    return "unavailable", "gpg could not verify the file"
+
+
+def download(url, dest, sha256=None):
+    """To dest.part, hashed as it streams, renamed only once it checks out --
+    an interrupted download can never be mistaken for a finished one."""
+    part = dest + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    h = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done, last = 0, -1
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                pct = int(done * 100 / total) if total else 0
+                if UI.tty:
+                    sys.stdout.write("\r  downloading  %3d%%  %s / %s "
+                                     % (pct, human(done), human(total)))
+                    sys.stdout.flush()
+                elif pct // 25 != last:
+                    last = pct // 25
+                    info("downloading  %3d%%" % pct)
+            if UI.tty:
+                sys.stdout.write("\n")
+            if total and done != total:
+                # read() returns short, silently, when the peer closes early.
+                raise OSError("connection closed after %d of %d bytes" % (done, total))
+    except (urllib.error.URLError, OSError) as e:
+        if os.path.exists(part):
+            os.unlink(part)
+        raise ToolError("download failed: %s: %s" % (url, e))
+    if sha256 and h.hexdigest() != sha256:
+        os.unlink(part)
+        raise ToolError("sha256 MISMATCH for %s\n  expected %s\n  got      %s\n"
+                        "The file has been deleted.  Do not retry blindly if this repeats."
+                        % (os.path.basename(dest), sha256, h.hexdigest()))
+    os.replace(part, dest)
+
+
+def extract(tarball, tree):
+    """Into a scratch directory, then one rename.  A half-extracted tree has a
+    Makefile long before it has drivers/, so its mere existence proves nothing;
+    the rename is what makes `tree exists` mean `tree is complete`."""
+    work = os.path.dirname(tree)
+    tmp = tempfile.mkdtemp(prefix=".extracting-", dir=work)
+    try:
+        run(["tar", "-xf", tarball, "-C", tmp])
+        tops = os.listdir(tmp)
+        if len(tops) != 1 or not os.path.isfile(os.path.join(tmp, tops[0], "Makefile")):
+            raise ToolError("%s does not look like a kernel source archive" % tarball)
+        os.rename(os.path.join(tmp, tops[0]), tree)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def pgp_problem(state, detail):
+    """What --require-pgp says to a signature that is not good -- the same words
+    whether the tree is about to be downloaded or is already here."""
+    if state == "bad":
+        return detail + " -- refusing to use these checksums"
+    return ("sha256sums.asc signature NOT verified (%s).\n  Import the kernel.org keys, e.g.\n"
+            "      gpg --locate-keys autosigner@kernel.org torvalds@kernel.org gregkh@kernel.org"
+            % ("key %s is not in your keyring" % detail if state == "nokey" else detail))
+
+
+def fetch_source(target, workdir, require_pgp=False):
+    tree = os.path.join(workdir, "linux-" + target["version"])
+    if os.path.isfile(os.path.join(tree, "Makefile")):
+        if require_pgp:
+            # A tree proves nothing by existing.  What can still be checked: the
+            # signature, and the tarball beside it against the signed checksum.
+            if not target.get("signed_text"):
+                raise ToolError("--require-pgp cannot be satisfied for -rc snapshots")
+            state, detail = pgp_check(target["signed_text"])
+            if state != "good":
+                raise ToolError(pgp_problem(state, detail))
+            tarball = os.path.join(workdir, target["tarball"])
+            if not os.path.isfile(tarball) or sha256_file(tarball) != target["sha256"]:
+                raise ToolError("--require-pgp, and %s already exists: it can be vouched for only "
+                                "through the tarball it came from, and %s.  Move the tree away to "
+                                "have it downloaded and verified again." % (
+                                    tree, "%s is not beside it" % target["tarball"]
+                                    if not os.path.isfile(tarball) else
+                                    "%s does not match the signed checksum" % target["tarball"]))
+            ok("PGP         : sha256sums.asc signed by %s; %s matches it" % (detail, target["tarball"]))
+        info("source      : %s (already extracted)" % tree)
+        return tree
+    if os.path.exists(tree):
+        raise ToolError("%s exists but is not a kernel tree (no Makefile).  This tool "
+                        "never leaves one like that; move it away or use another --workdir."
+                        % tree)
+    os.makedirs(workdir, exist_ok=True)
+    for stale in glob.glob(os.path.join(workdir, ".extracting-*")):
+        # Old ones only: a young one is another instance, mid-extract.
+        if time.time() - os.path.getmtime(stale) > 6 * 3600:
+            shutil.rmtree(stale, ignore_errors=True)
+
+    if target.get("signed_text"):
+        state, detail = pgp_check(target["signed_text"])
+        if state == "good":
+            ok("PGP         : sha256sums.asc signed by %s" % detail)
+        elif state == "bad" or require_pgp:
+            raise ToolError(pgp_problem(state, detail))
+        else:
+            msg = ("sha256sums.asc signature NOT verified (%s)." % (
+                "key %s is not in your keyring" % detail if state == "nokey" else detail))
+            note("PGP         : " + msg)
+            note("              The checksum still proves the download is intact; it")
+            note("              does not prove who published it.  --require-pgp enforces.")
+    else:
+        warn("%s is a git snapshot: kernel.org publishes no checksum for it."
+             % target["tarball"])
+        if require_pgp:
+            raise ToolError("--require-pgp cannot be satisfied for -rc snapshots")
+
+    tarball = os.path.join(workdir, target["tarball"])
+    have = os.path.isfile(tarball)
+    if have and target["sha256"] and sha256_file(tarball) != target["sha256"]:
+        warn("cached %s fails its checksum -- downloading again" % target["tarball"])
+        have = False
+    if not have:
+        say("Downloading %s" % target["tarball"])
+        download(target["url"], tarball, target["sha256"])
+    if target["sha256"]:
+        ok("sha256      : %s  %s" % (target["sha256"][:16] + "...", target["tarball"]))
+    info("extracting  : %s" % tree)
+    try:
+        extract(tarball, tree)
+    except ToolError:
+        if not target["sha256"] and os.path.exists(tarball):
+            os.unlink(tarball)      # nothing vouches for it; never reuse it
+        raise
+    return tree
+
+
+# --------------------------------------------------------------------- detection
+
+GPU_VENDORS = {0x1002: "amd", 0x10de: "nvidia", 0x8086: "intel"}
+NPU_VENDORS = {0x1022: "amd", 0x8086: "intel"}
+OTHER_VIDEO = {0x1af4: "virtio", 0x15ad: "vmware", 0x1b36: "qxl", 0x1234: "bochs",
+               0x1a03: "aspeed-bmc", 0x102b: "matrox-bmc", 0x1414: "hyperv",
+               0x1013: "cirrus", 0x80ee: "virtualbox"}
+
+
+def pci_name(vendor, device, root="/"):
+    """Best-effort lookup in pci.ids.  Purely cosmetic -- decisions use the ids."""
+    want_v, want_d = "%04x" % vendor, "%04x" % device
+    for cand in ("usr/share/hwdata/pci.ids", "usr/share/misc/pci.ids",
+                 "usr/share/pci.ids"):
+        path = rp(root, cand)
+        if not os.path.isfile(path):
+            continue
+        vname, inside = "", False
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                if not line.startswith("\t"):
+                    if inside:
+                        return vname
+                    inside = line.startswith(want_v)
+                    if inside:
+                        vname = line[4:].strip()
+                elif inside and not line.startswith("\t\t") and line[1:5] == want_d:
+                    return "%s %s" % (vname, line[5:].strip())
+        if vname:
+            return vname
+    return ""
+
+
+def scan_pci(root="/"):
+    """Display controllers (class 03xx) and processing accelerators (1200).
+    Class and vendor ids from sysfs: no lspci needed, and no matching on the
+    marketing name, where 'AMD' or 'ATI' can appear in somebody else's string."""
+    base = rp(root, "sys/bus/pci/devices")
+    devs = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return devs
+    for name in names:
+        d = os.path.join(base, name)
+        try:
+            cls = int(read_text(d + "/class").strip() or "0", 16)
+            ven = int(read_text(d + "/vendor").strip() or "0", 16)
+            dev = int(read_text(d + "/device").strip() or "0", 16)
+        except ValueError:
+            continue
+        if cls >> 16 == 0x03:
+            kind = "display"
+        elif cls >> 8 == 0x1200:
+            kind = "accelerator"
+        else:
+            continue
+        drv = ""
+        if os.path.islink(d + "/driver"):
+            drv = os.path.basename(os.readlink(d + "/driver"))
+        devs.append({"addr": name, "class": cls, "vendor": ven, "device": dev,
+                     "kind": kind, "driver": drv,
+                     "name": pci_name(ven, dev, root)})
+    return devs
+
+
+def gpu_vendors_present(devs):
+    found = set()
+    for d in devs:
+        table = GPU_VENDORS if d["kind"] == "display" else NPU_VENDORS
+        if d["vendor"] in table:
+            found.add(table[d["vendor"]])
+    return found
+
+
+def parse_os_release(text):
+    rel = {}
+    for line in text.splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            rel[k.strip()] = v.strip().strip('"').strip("'")
+    return rel
+
+
+PKG_MANAGERS = ("dnf", "yum", "apt-get", "zypper", "pacman")
+BUILD_DEPS = {
+    "dnf": "gcc make flex bison bc openssl openssl-devel elfutils-libelf-devel dwarves "
+           "ncurses-devel rsync cpio perl python3 xz zstd tar kmod",
+    "apt-get": "build-essential flex bison bc openssl libssl-dev libelf-dev dwarves "
+               "libncurses-dev rsync cpio perl python3 xz-utils zstd tar kmod",
+    "zypper": "gcc make flex bison bc openssl libopenssl-devel libelf-devel dwarves "
+              "ncurses-devel rsync cpio perl python3 xz zstd tar kmod",
+    "pacman": "base-devel bc openssl libelf pahole ncurses rsync cpio perl python xz "
+              "zstd tar kmod",
+}
+BUILD_DEPS["yum"] = BUILD_DEPS["dnf"]
+INSTALL_CMD = {
+    "dnf": ["dnf", "install", "-y"], "yum": ["yum", "install", "-y"],
+    "apt-get": ["apt-get", "install", "-y"],
+    "zypper": ["zypper", "--non-interactive", "install"],
+    "pacman": ["pacman", "-S", "--needed", "--noconfirm"],
+}
+
+
+def find_pkg_manager():
+    for pm in PKG_MANAGERS:
+        if which(pm, path=":".join(SYSTEM_PATH)):
+            return pm
+    return ""
+
+
+X86_LEVELS = (
+    ("x86-64-v2", ("cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3")),
+    ("x86-64-v3", ("avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave")),
+    ("x86-64-v4", ("avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl")),
+)
+
+
+def x86_level(flags):
+    """The highest x86-64 micro-architecture level these /proc/cpuinfo flags
+    meet -- what a kernel built with -march=x86-64-vN may assume of the CPU."""
+    level = "x86-64"
+    for name, need in X86_LEVELS:
+        if not all(f in flags for f in need):
+            break
+        level = name
+    return level
+
+
+def cpulist_len(text):
+    """'0-15' -> 16, '16-23,30' -> 9."""
+    n = 0
+    for part in text.strip().split(","):
+        a, _, b = part.partition("-")
+        if a.strip().isdigit():
+            n += int(b) - int(a) + 1 if b.strip().isdigit() else 1
+    return n
+
+
+def cpu_info(root="/"):
+    text = read_text(rp(root, "proc/cpuinfo"))
+    first = text.split("\n\n", 1)[0]
+    fields = {}
+    for line in first.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fields[k.strip()] = v.strip()
+    flags = set((fields.get("flags") or fields.get("Features") or "").split())
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    # Intel's hybrid parts (Alder Lake on) register one PMU per core type.
+    core = read_text(rp(root, "sys/devices/cpu_core/cpus"))
+    atom = read_text(rp(root, "sys/devices/cpu_atom/cpus"))
+    return {"vendor": fields.get("vendor_id", ""), "model": fields.get("model name", ""),
+            "flags": flags, "threads": n, "hypervisor": "hypervisor" in flags,
+            "level": x86_level(flags) if "lm" in flags else "",
+            "hybrid": [cpulist_len(core), cpulist_len(atom)] if core.strip() and atom.strip() else None}
+
+
+def mem_total(root="/"):
+    m = re.search(r"^MemTotal:\s+(\d+) kB", read_text(rp(root, "proc/meminfo")), re.M)
+    return int(m.group(1)) * 1024 if m else 0
+
+
+def secure_boot(root="/"):
+    """'on' | 'off' | 'n/a' (not an EFI boot).  Straight from the EFI variable:
+    four attribute bytes, then the value.  No mokutil needed."""
+    if not os.path.isdir(rp(root, "sys/firmware/efi")):
+        return "n/a"
+    pat = rp(root, "sys/firmware/efi/efivars/SecureBoot-*")
+    for path in glob.glob(pat):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            return "on" if len(raw) >= 5 and raw[4] == 1 else "off"
+        except OSError:
+            pass
+    return "off"
+
+
+def parse_mounts(text):
+    out_ = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            out_.append((parts[0], parts[1].replace("\\040", " "), parts[2]))
+    return out_
+
+
+def whole_disk(name, root="/"):
+    """sda3 -> sda, md126p3 -> md126, nvme0n1p2 -> nvme0n1.  A partition's own
+    sysfs directory has no slaves/ and no md/; its disk's does.  (Reading
+    md/level on a PARTITION of an Intel RST array gave 'md:?', and no RAID
+    level was required at all.)"""
+    sysb = rp(root, "sys/class/block/" + name)
+    if os.path.exists(os.path.join(sysb, "partition")):
+        return os.path.basename(os.path.dirname(os.path.realpath(sysb)))
+    return name
+
+
+def device_drivers(path, root="/"):
+    """[(driver, module)] from a sysfs device directory up to the top of the
+    device tree, nearest first.  For a disk: its own driver (sd, nvme,
+    virtio_blk), its controller's (ahci, megaraid_sas), and whatever THAT sits
+    behind -- an Intel VMD domain, a USB host controller, the PCIe host bridge
+    of an ARM board.  module is '' where sysfs does not say: a built-in driver
+    usually has no `module` link."""
+    top = os.path.realpath(rp(root, "sys/devices"))
+    res, p = [], path
+    while p.startswith(top + os.sep):
+        drv = os.path.join(p, "driver")
+        if os.path.islink(drv):
+            mod = os.path.join(drv, "module")
+            res.append((os.path.basename(os.readlink(drv)),
+                        os.path.basename(os.readlink(mod)) if os.path.islink(mod) else ""))
+        p = os.path.dirname(p)
+    return res
+
+
+def disk_chain(disk, root="/"):
+    """-> (drivers between one whole disk and the CPU, behind an Intel VMD?).
+    NVMe with native multipathing (RHEL's default) hangs the namespace off a
+    VIRTUAL subsystem device; multipath/ lists the per-controller paths, and
+    those are what lead down to a driver.  A VMD domain is numbered from
+    0x10000 up -- five hex digits, where every ordinary PCI domain has four."""
+    sysb = rp(root, "sys/class/block/" + disk)
+    try:
+        paths = sorted(os.listdir(os.path.join(sysb, "multipath")))
+    except OSError:
+        paths = []
+    starts = [os.path.realpath(os.path.join(sysb, "multipath", n)) for n in paths] or \
+        [os.path.realpath(sysb)]
+    chain = []
+    for s in starts:
+        for d in device_drivers(s, root):
+            if d not in chain:
+                chain.append(d)
+    vmd = any(re.match(r"^pci[0-9a-f]{5,}:", part) for s in starts for part in s.split(os.sep)) \
+        or any(drv == "vmd" for drv, _ in chain)
+    return chain, vmd
+
+
+# On every path and not a choice: the USB core's own device driver, the USB hub
+# driver, the PCIe port services.  Each is part of a subsystem the controller's
+# own driver already needs.
+INFRA_DRIVERS = ("usb", "hub", "pcieport")
+# Driver names that are not the module's name.  xhci_hcd (underscore) is the PCI
+# glue in xhci-pci.ko; xhci-hcd (dash) is the platform one.  Checked BEFORE
+# dashes become underscores, which would make them one.
+DRIVER_MODULE = {"sd": "sd_mod", "sr": "sr_mod", "xhci_hcd": "xhci_pci",
+                 "xhci-hcd": "xhci_plat_hcd", "mmcblk": "mmc_block", "vbd": "xen_blkfront"}
+
+
+def module_paths(running, root="/"):
+    """module name -> where its source was in the tree that built the RUNNING
+    kernel ('drivers/ata/ahci'), from modules.dep (loadable) and
+    modules.builtin.modinfo / modules.builtin (built in).  The NEW tree is then
+    asked, through its own Makefile there, which CONFIG_ option builds it."""
+    base = rp(root, "lib/modules/" + running)
+    paths = {}
+
+    def put(rel, name=None):
+        rel = re.sub(r"\.ko(\.\w+)?$", "", rel.strip())
+        if rel.startswith("kernel/"):
+            rel = rel[len("kernel/"):]
+        if rel:
+            paths.setdefault(name or os.path.basename(rel).replace("-", "_"), rel)
+    for line in read_text(os.path.join(base, "modules.dep")).splitlines():
+        put(line.split(":", 1)[0])
+    info_ = read_text(os.path.join(base, "modules.builtin.modinfo"))
+    for m in re.finditer(r"([\w-]+)\.file=([^\x00\n]+)", info_):
+        put(m.group(2), m.group(1).replace("-", "_"))
+    for line in read_text(os.path.join(base, "modules.builtin")).splitlines():
+        put(line)
+    return paths
+
+
+def storage_stack(root="/", running=None):
+    """What this machine needs in order to mount its filesystems at boot: the
+    filesystem types of every /dev-backed mount, the block layers under them
+    (LVM, dm-crypt, md), and the DRIVERS between each disk and the CPU --
+    sd_mod, ahci, nvme, and on boards like an ASUS Z790 an Intel VMD in front
+    of the SATA controller.  A kernel that lacks any one of these builds fine,
+    installs fine, and drops to an emergency shell -- or, without VMD, cannot
+    even see the disk.  Swap counts too: resume= waits for it at boot."""
+    mounts = [m for m in parse_mounts(read_text(rp(root, "proc/mounts")))
+              if m[0].startswith("/dev/")
+              and not m[1].startswith(("/run/media", "/media", "/mnt"))]
+    swaps = [l.split()[0] for l in read_text(rp(root, "proc/swaps")).splitlines()[1:]
+             if l.startswith("/dev/") and l.split()[1:2] == ["partition"]]
+    fstypes, layers, rootfs = set(), set(), ""
+    seen, disks = set(), []
+
+    def walk(dev):
+        dev = whole_disk(dev, root)
+        if dev in seen:
+            return
+        seen.add(dev)
+        sysb = rp(root, "sys/class/block/" + dev)
+        if dev.startswith("dm-"):
+            uuid = read_text(sysb + "/dm/uuid").strip()
+            layers.add("lvm" if uuid.startswith("LVM-") else
+                       "crypt" if uuid.startswith("CRYPT-") else "dm")
+        elif re.match(r"^md\d", dev):
+            layers.add("md:" + (read_text(sysb + "/md/level").strip() or "?"))
+        try:
+            slaves = sorted(os.listdir(sysb + "/slaves"))
+        except OSError:
+            slaves = []
+        for s in slaves:
+            walk(s)
+        if not slaves and not re.match(r"^(dm-|md\d|loop|zram|ram|nbd)", dev):
+            disks.append(dev)
+
+    def block_name(src, mnt):
+        if root != "/":
+            return os.path.basename(src)
+        name = os.path.basename(os.path.realpath(src))
+        if not os.path.exists("/sys/class/block/" + name):
+            # '/dev/root': a root mounted by the kernel itself, with no initramfs,
+            # is listed under a name that is no device.  Its device NUMBER is real.
+            try:
+                st = os.stat(mnt)
+                link = "/sys/dev/block/%d:%d" % (os.major(st.st_dev), os.minor(st.st_dev))
+                if os.path.exists(link):
+                    name = os.path.basename(os.path.realpath(link))
+            except OSError:
+                pass
+        return name
+
+    for src, mnt, fstype in mounts:
+        fstypes.add(fstype)
+        if mnt == "/":
+            rootfs = fstype
+        walk(block_name(src, mnt))
+    for src in swaps:
+        walk(os.path.basename(os.path.realpath(src) if root == "/" else src))
+    paths = module_paths(running or os.uname().release, root)
+    drivers, vmd = [], False
+    for disk in disks:
+        chain, behind = disk_chain(disk, root)
+        vmd = vmd or behind
+        for drv, mod in chain:
+            if drv in INFRA_DRIVERS and not mod:
+                continue
+            name = mod or DRIVER_MODULE.get(drv) or drv.replace("-", "_")
+            entry = next((d for d in drivers if d["module"] == name), None)
+            if entry is None:
+                entry = {"driver": drv, "module": name, "path": paths.get(name, ""), "disks": []}
+                drivers.append(entry)
+            if disk not in entry["disks"]:
+                entry["disks"].append(disk)
+    return {"rootfs": rootfs, "fstypes": sorted(fstypes), "layers": sorted(layers),
+            "disks": disks, "drivers": drivers, "vmd": vmd}
+
+
+def firmware_compression(root="/"):
+    exts = set()
+    for sub in ("amdgpu", "i915", "nvidia", ""):
+        d = rp(root, "lib/firmware/" + sub)
+        try:
+            for n in os.listdir(d)[:400]:
+                if n.endswith(".xz"):
+                    exts.add("xz")
+                elif n.endswith(".zst"):
+                    exts.add("zstd")
+        except OSError:
+            pass
+    return sorted(exts)
+
+
+# NVIDIA.  nouveau needs NVIDIA's signed firmware from Maxwell's second generation
+# (GM20x) on, and from Turing on it can run the GPU through GSP firmware -- the
+# only way at all from Ada on.  Measured in 7.2.6: tu102_gsp_load_rm() defaults
+# NvGspRm to true, and without the files it falls back to its own code, which
+# cannot reclock: the card stays at its boot clocks.
+NV_FIRMWARE_FROM = ("gm2", "gp", "gv", "tu", "ga", "ad", "gb", "gh")
+NV_GSP = ("tu", "ga", "ad", "gb", "gh")
+NV_GSP_ONLY = ("ad", "gb", "gh")
+NVIDIA_FW_PKG = {"dnf": "nvidia-gpu-firmware (linux-firmware on older releases)",
+                 "yum": "linux-firmware", "apt-get": "firmware-misc-nonfree (Debian) / "
+                 "linux-firmware (Ubuntu)", "zypper": "kernel-firmware-nvidia",
+                 "pacman": "linux-firmware-nvidia"}
+NVIDIA_DKMS_PKG = "nvidia-open-dkms / kmod-nvidia-open-dkms (open, Turing and newer) or nvidia-dkms"
+
+
+def nvidia_chip(name):
+    """'tu117' out of pci.ids' 'NVIDIA Corporation TU117 [GeForce GTX 1630]': the
+    directory nouveau's firmware lives in.  Mobile and workstation parts (TU117M,
+    GA102GL) use their chip's; GK208B is a chip of its own.  pci.ids is cosmetic
+    everywhere else in this tool -- here it only says where to LOOK."""
+    m = re.search(r"\b([A-Z]{2}\d{3})(B?)[A-Z]*\s*\[", name or "")
+    return (m.group(1) + m.group(2)).lower() if m else ""
+
+
+def nonempty_dir(path):
+    try:
+        return bool(os.listdir(path))
+    except OSError:
+        return False
+
+
+def nouveau_blacklisted(root="/"):
+    """'' or where nouveau is switched off: a modprobe.d blacklist (NVIDIA's own
+    packages install one) or the kernel command line.  Both follow the machine
+    onto a NEW kernel -- grubby copies the command line to every entry."""
+    for pat in ("etc/modprobe.d/*.conf", "run/modprobe.d/*.conf", "usr/lib/modprobe.d/*.conf",
+                "lib/modprobe.d/*.conf"):
+        for path in sorted(glob.glob(rp(root, pat))):
+            for line in read_text(path).splitlines():
+                w = line.split("#", 1)[0].split()
+                if w[:2] == ["blacklist", "nouveau"] or (w[:2] == ["options", "nouveau"] and "modeset=0" in w) \
+                        or (w[:2] == ["install", "nouveau"] and w[2:3] and os.path.basename(w[2]) in ("false", "true")):
+                    return "%s: %s" % ("/" + os.path.relpath(path, root), line.strip())
+    for w in read_text(rp(root, "proc/cmdline")).split():
+        k, _, v = w.partition("=")
+        if (k in ("modprobe.blacklist", "module_blacklist", "rd.driver.blacklist")
+                and "nouveau" in v.split(",")) or (k == "nouveau.modeset" and v == "0"):
+            return "kernel command line: " + w
+    return ""
+
+
+def nvidia_state(devs, dkms_mods, running, root="/"):
+    """{} without an NVIDIA GPU.  Otherwise: each GPU's chip and what nouveau
+    would need for it, NVIDIA's own driver for the RUNNING kernel and how it got
+    there (DKMS, akmods, or a prebuilt kmod), and whether nouveau is switched off."""
+    gpus = []
+    for d in devs:
+        if d["vendor"] != 0x10de or d["kind"] != "display":
+            continue
+        chip = nvidia_chip(d["name"])
+        fw = rp(root, "lib/firmware/nvidia/" + chip) if chip else ""
+        gpus.append({"addr": d["addr"], "chip": chip, "driver": d["driver"],
+                     "needs_firmware": chip.startswith(NV_FIRMWARE_FROM),
+                     "firmware": bool(fw) and nonempty_dir(fw),
+                     "gsp_capable": chip.startswith(NV_GSP), "gsp_only": chip.startswith(NV_GSP_ONLY),
+                     "gsp": bool(fw) and nonempty_dir(os.path.join(fw, "gsp"))})
+    if not gpus:
+        return {}
+    own, base = [], rp(root, "lib/modules/" + running)
+    for dirpath, dirnames, files in os.walk(base):
+        if dirpath == base:
+            dirnames[:] = [x for x in dirnames if x not in ("build", "source")]
+        own.extend(os.path.join(dirpath, f) for f in files
+                   if re.match(r"^nvidia(-drm|-modeset|-uvm|-peermem)?\.ko", f))
+    return {"gpus": gpus, "running": running, "own_driver": sorted(own),
+            "dkms": ["%s/%s" % (m["name"], m["version"]) for m in dkms_mods
+                     if m["name"].startswith("nvidia")],
+            "akmods": bool(glob.glob(rp(root, "usr/src/akmods/*nvidia*"))),
+            "nouveau_off": nouveau_blacklisted(root)}
+
+
+def nvidia_outlook(nv, pm, release=""):
+    """-> [(ok | note | warn, text)]: who drives each NVIDIA GPU once a kernel
+    built here boots.  NVIDIA's own driver follows a machine onto a new kernel
+    only through DKMS: akmods builds against an RPM-installed kernel-devel, which
+    a kernel installed from a tree does not have, and a prebuilt kmod is made for
+    one kernel.  Where it cannot follow, nouveau takes over -- unless nouveau is
+    switched off, and then the GPU has NO driver: a bare framebuffer at best."""
+    if not nv:
+        return []
+    res, new = [], release or "the new kernel"
+    if nv["dkms"]:
+        return [("ok", "NVIDIA's driver (%s, DKMS) is rebuilt for %s when it is installed; the "
+                       "out-of-tree check says whether it compiles" % (", ".join(nv["dkms"]), new))]
+    if nv["own_driver"]:
+        how = ("akmods builds it against an RPM-installed kernel-devel, and a kernel installed "
+               "from a tree has none" if nv["akmods"] else "it was built for %s only" % nv["running"])
+        if nv["nouveau_off"]:
+            return [("warn", "NVIDIA's driver will NOT load on %s (%s), and nouveau is switched off "
+                             "(%s): this GPU will have no driver -- a bare framebuffer at best.  Install "
+                             "NVIDIA's DKMS package first (%s), or remove that blacklist so nouveau takes "
+                             "over." % (new, how, nv["nouveau_off"], NVIDIA_DKMS_PKG))]
+        res.append(("note", "NVIDIA's driver will not load on %s (%s): nouveau, built here as a "
+                            "module, takes over.  To keep NVIDIA's own: %s." % (new, how, NVIDIA_DKMS_PKG)))
+    elif nv["nouveau_off"]:
+        return [("warn", "nouveau is switched off (%s) and NVIDIA's driver is not installed: this "
+                         "GPU has no driver, on this kernel or any other" % nv["nouveau_off"])]
+    for g in nv["gpus"]:
+        label = "%s at %s" % (g["chip"].upper() or "NVIDIA GPU", g["addr"])
+        where = "/lib/firmware/nvidia/%s" % g["chip"]
+        if g["needs_firmware"] and not g["firmware"]:
+            res.append(("warn", "%s: nothing in %s -- nouveau %s.  Install %s." % (
+                label, where, "cannot drive it at all" if g["gsp_only"] else
+                "runs it without acceleration", NVIDIA_FW_PKG.get(pm, "linux-firmware"))))
+        elif g["gsp_capable"] and not g["gsp"]:
+            res.append(("warn" if g["gsp_only"] else "note",
+                        "%s: no GSP firmware (%s/gsp) -- nouveau %s" % (
+                            label, where, "cannot drive it" if g["gsp_only"] else
+                            "falls back to its own code, which cannot reclock: the card stays "
+                            "at its boot clocks")))
+        else:
+            res.append(("ok", "%s: nouveau, built as a module%s" % (
+                label, "; firmware present, GSP too" if g["gsp"] else
+                "; firmware present" if g["needs_firmware"] else "")))
+    return res
+
+
+def show_outlook(lines):
+    for kind, text in lines:
+        {"ok": ok, "note": note, "warn": warn}[kind](text)
+
+
+# dpcpp is a C++ driver: it belongs to CXX_NAME below.
+COMPILER_NAME = re.compile(r"^(gcc|clang)(-\d+(\.\d+)*)?$|^(icx|icc|amdclang|nvc|armclang)$")
+# kbuild's HOSTCXX.  It compiles the GCC plugins (against the plugin headers of
+# the chosen gcc, so it has to MATCH that gcc) and xconfig.  `c++` is left out:
+# it is g++ under a second name and a second inode.
+CXX_NAME = re.compile(r"^(g\+\+|clang\+\+)(-\d+(\.\d+)*)?$|^(icpx|dpcpp|amdclang\+\+)$")
+PYTHON_NAME = re.compile(r"^(python3(\.\d+)?|pypy3?)$")
+LLVM_TOOLS = ("ld.lld", "llvm-ar", "llvm-nm", "llvm-objcopy", "llvm-objdump",
+              "llvm-readelf", "llvm-strip")
+# Where compilers get installed without anybody adding them to PATH.
+TOOL_GLOBS = ("/usr/local/bin", "/opt/*/bin", "/opt/*/*/bin", "~/opt/*/bin", "~/.local/bin",
+              "/usr/lib/llvm-*/bin", "/usr/lib64/llvm*/bin", "/opt/rh/*/root/usr/bin",
+              "/opt/intel/oneapi/compiler/*/bin", "/opt/rocm/bin", "/opt/rocm/llvm/bin",
+              "/opt/AMD/aocc-compiler-*/bin", "/opt/nvidia/hpc_sdk/Linux_*/*/compilers/bin")
+TRIPLE_ARCH = {"ppc64le": "powerpc64le", "ppc64": "powerpc64", "armv7l": "arm", "i686": "i"}
+
+
+def numver(text):
+    """(14, 3, 1) out of a version banner.  The number after a closing paren
+    wins -- 'gcc (crosstool-NG 1.26.0) 13.2.0' -- else the first dotted one,
+    else the first integer ('kmod version 31')."""
+    m = re.search(r"\)\s+(\d+(?:\.\d+)+)", text) or re.search(r"(\d+(?:\.\d+)+)", text) \
+        or re.search(r"(\d+)", text)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def ver_ge(have, need):
+    n = max(len(have), len(need), 3)
+    pad = lambda v: tuple(v) + (0,) * (n - len(v))
+    return pad(have) >= pad(need)
+
+
+def vstr(v):
+    return ".".join(str(x) for x in v) if v else "?"
+
+
+def tool_search_dirs(root="/", home=None, path_env=None):
+    """/usr/bin first, so a system tool is met under its plain name before any
+    alias of it; then the caller's PATH, in their order; then TOOL_GLOBS."""
+    home = os.path.expanduser("~") if home is None else home
+    path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    dirs = [rp(root, "usr/bin")] + [d for d in path_env.split(":") if d]
+    for pat in TOOL_GLOBS:
+        pat = home + pat[1:] if pat.startswith("~") else rp(root, pat)
+        dirs.extend(sorted(glob.glob(pat)))
+    seen, res = set(), []
+    for d in dirs:
+        real = os.path.realpath(d)
+        if real not in seen and os.path.isdir(d):
+            seen.add(real)
+            res.append(d)
+    return res
+
+
+def scan_tool_dirs(dirs):
+    """-> (C compilers, pythons, C++ compilers): executable FILES whose names
+    look the part, one per real file PER KIND -- clang++ is a symlink to the
+    very binary clang is.  PATH entries like ~/opt/gcc-17/lib hold a DIRECTORY
+    named gcc; the isfile() is not decoration."""
+    found = {"cc": [], "py": [], "cxx": []}
+    seen = {"cc": set(), "py": set(), "cxx": set()}
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d), key=lambda n: (len(n), n))   # 'clang' before 'clang-21'
+        except OSError:
+            continue
+        for name in names:
+            key = "cc" if COMPILER_NAME.match(name) else "cxx" if CXX_NAME.match(name) \
+                else "py" if PYTHON_NAME.match(name) else None
+            if not key:
+                continue
+            path = os.path.join(d, name)
+            real = os.path.realpath(path)
+            if real in seen[key] or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            seen[key].add(real)
+            found[key].append(path)
+    return found["cc"], found["py"], found["cxx"]
+
+
+def compiler_info(path):
+    """What a compiler says it is -- and whether kbuild can use it.
+
+    kbuild supports GCC and Clang, nothing else: ICC support was REMOVED from
+    Linux in 6.2.  Intel's icx/DPC++ is LLVM-based and defines __clang__, so
+    kbuild's own probe would file it as 'Clang 22' and carry on; its banner
+    says neither 'gcc' nor 'clang', so a name test would file it as gcc.  Hence
+    Intel is looked for FIRST, and vendor forks of clang are marked as such."""
+    try:
+        p = run([path, "--version"], check=False, timeout=20)
+    except ToolError:
+        return None
+    lines = [l.strip() for l in (p.stdout or "").splitlines()
+             if l.strip() and "warning:" not in l]
+    if p.returncode != 0 or not lines:
+        return None
+    line, real = lines[0], os.path.realpath(path)
+    inst = re.search(r"^InstalledDir:\s*(\S+)", p.stdout or "", re.M)
+    low = line.lower()
+    if "intel" in low or "(ifx)" in low or "(icc)" in low:
+        kind = "intel"
+    elif "clang" in low:
+        kind = "clang"
+    elif "gcc" in low or "free software foundation" in " ".join(lines).lower():
+        kind = "gcc"
+    else:
+        kind = "other"
+    usable, why = "yes", ""
+    if real.startswith(("/usr/bin/", "/usr/lib", "/usr/libexec/")):
+        origin = "system"
+    elif "/opt/rh/" in real or "gcc-toolset" in real or "devtoolset" in real:
+        origin = "Red Hat gcc-toolset (vendor-supported)"
+    elif "/rocm" in real or os.path.basename(path) == "amdclang":
+        origin, usable = "ROCm -- AMD's fork of LLVM, built for HIP", "fork"
+        why = "a vendor fork of clang: nobody tests kernels with it"
+    elif "/aocc" in real.lower():
+        origin, usable = "AOCC -- AMD's fork of LLVM", "fork"
+        why = "a vendor fork of clang: nobody tests kernels with it"
+    elif "/opt/intel" in real:
+        origin = "Intel oneAPI"
+    elif "/opt/nvidia" in real:
+        origin = "NVIDIA HPC SDK"
+    else:
+        origin = "local build"
+    if kind == "intel":
+        usable = "no"
+        why = ("kbuild supports GCC and Clang only: ICC support was removed in Linux 6.2, "
+               "and icx/DPC++ -- LLVM underneath -- is not a supported kernel compiler")
+    elif kind == "other":
+        usable, why = "no", "neither GCC nor Clang"
+    triple = ""
+    if usable != "no":
+        try:
+            triple = (run([path, "-dumpmachine"], check=False, timeout=20).stdout or "").strip()
+        except ToolError:
+            pass
+        arch = os.uname().machine
+        if triple and not triple.startswith(TRIPLE_ARCH.get(arch, arch)):
+            usable, why = "no", "targets %s, not this machine (%s)" % (triple, arch)
+    return {"path": path, "real": real, "kind": kind, "version": line, "numver": numver(line),
+            "system": origin == "system", "origin": origin, "usable": usable, "why": why,
+            "triple": triple, "installed": inst.group(1) if inst else "",
+            "experimental": bool(re.search(r"experimental|prerelease|\dgit\b", line))}
+
+
+def compiler_works(path, extra_path=None):
+    """Can it turn a C file into an executable IN THE SCRUBBED ENVIRONMENT the
+    build will run in?  A private compiler that needs LD_LIBRARY_PATH to find
+    its own libisl works in your shell and dies at the first object here."""
+    try:
+        p = run([path, "-x", "c", "-", "-o", os.devnull], check=False, timeout=60,
+                stdin_data="int main(void) { return 0; }\n", env=scrubbed_env(extra_path))
+    except ToolError as e:
+        return False, str(e).splitlines()[0]
+    if p.returncode == 0:
+        return True, ""
+    return False, ((p.stdout or "").strip().splitlines() or ["exit %d" % p.returncode])[-1][:120]
+
+
+def llvm_companions(clang_path):
+    """-> (LLVM= argument, extra PATH dir or None), or None when the set beside
+    this clang is incomplete.  kbuild takes LLVM=1 (plain names on PATH),
+    LLVM=/dir/ (a prefix) or LLVM=-18 (a suffix: Debian's clang-18, ld.lld-18)."""
+    d, name = os.path.split(clang_path)
+    m = re.match(r"^clang(-\d+(?:\.\d+)*)$", name)
+    suffix = m.group(1) if m else ""
+    if not all(os.access(os.path.join(d, t + suffix), os.X_OK) for t in LLVM_TOOLS):
+        return None
+    on_path = os.path.realpath(d) in [os.path.realpath(x) for x in SYSTEM_PATH[:4]]
+    if suffix:
+        return "LLVM=" + suffix, None if on_path else d
+    if on_path:
+        return "LLVM=1", None
+    return "LLVM=" + d + "/", None
+
+
+def own_binutils(cc_path):
+    """The directory, when a compiler ships its own ld AND as beside it (every
+    gcc-toolset does) -- they were built and tested together."""
+    d = os.path.dirname(cc_path)
+    both = all(os.access(os.path.join(d, t), os.X_OK) for t in ("ld", "as"))
+    return d if both and os.path.realpath(d) != os.path.realpath("/usr/bin") else ""
+
+
+def _collect(cands, plain):
+    """One entry per COMPILER, not per name and not per banner.  amdclang is
+    ROCm's clang and dpcpp is icx: same banner, same InstalledDir -- one entry,
+    under the plain name.  Two installs built from one commit have the same
+    banner too, and are two compilers: InstalledDir tells them apart.  (Merging
+    on the banner alone hid exactly those.)"""
+    cands = sorted(cands, key=lambda c: os.path.basename(c) not in plain)
+    found, keys = [], set()
+    for c in cands:
+        ci = compiler_info(c)
+        if not ci:
+            continue
+        key = (ci["version"], ci["installed"]) if ci["installed"] else ("", ci["real"])
+        if key not in keys:
+            keys.add(key)
+            found.append(ci)
+    rank = {"yes": 0, "fork": 1, "no": 2}
+    found.sort(key=lambda t: (rank[t["usable"]], not t["system"], t["kind"] != "gcc",
+                              tuple(-x for x in t["numver"])))
+    return found
+
+
+def find_toolchains(dirs=None):
+    dirs = tool_search_dirs() if dirs is None else dirs
+    return _collect(scan_tool_dirs(dirs)[0], ("gcc", "clang", "icx"))
+
+
+def find_cxx(dirs=None):
+    dirs = tool_search_dirs() if dirs is None else dirs
+    return _collect(scan_tool_dirs(dirs)[2], ("g++", "clang++", "icpx"))
+
+
+def cxx_partner(cc_path):
+    """The C++ driver installed beside a C compiler: gcc-13 -> g++-13."""
+    d, name = os.path.split(cc_path)
+    m = re.match(r"^(gcc|clang)(-\d+(?:\.\d+)*)?$", name)
+    if not m:
+        return ""
+    cand = os.path.join(d, ("g++" if m.group(1) == "gcc" else "clang++") + (m.group(2) or ""))
+    return cand if os.access(cand, os.X_OK) else ""
+
+
+def find_binutils(dirs=None):
+    """Every GNU binutils set: a directory holding both ld and as."""
+    dirs = tool_search_dirs() if dirs is None else dirs
+    sets, inodes = [], set()
+    for d in sorted(dirs, key=lambda x: (os.path.realpath(x) != os.path.realpath("/usr/bin"), len(x))):
+        ld = os.path.join(d, "ld")
+        if not all(os.access(os.path.join(d, t), os.X_OK) for t in ("ld", "as")):
+            continue
+        st = os.stat(ld)
+        if (st.st_dev, st.st_ino) in inodes:
+            continue                 # <prefix>/<triple>/bin/ld is a hard link to <prefix>/bin/ld
+        inodes.add((st.st_dev, st.st_ino))
+        try:
+            line = ((run([ld, "-v"], check=False, timeout=20).stdout or "").splitlines() or [""])[0]
+        except ToolError:
+            continue
+        # STARTS with: lld's banner is "LLD 18.1.3 (compatible with GNU linkers)",
+        # and gold's is "GNU gold" -- an `ld` that is really either is not bfd.
+        if not line.startswith("GNU ld"):
+            continue
+        if any(b["version"] == line.strip() and os.path.commonpath([b["dir"], d]) not in ("/", "")
+               and os.path.dirname(b["dir"]) in d for b in sets):
+            continue                 # ...or a copy of it, under the same prefix
+        sets.append({"dir": d, "version": line.strip(), "numver": numver(line),
+                     "system": os.path.realpath(d) == os.path.realpath("/usr/bin")})
+    return sets
+
+
+def find_pythons(dirs=None):
+    dirs = tool_search_dirs() if dirs is None else dirs
+    res = []
+    # (index 1 of scan_tool_dirs: the pythons)
+    probe = ("import sys, platform; print(platform.python_implementation(), "
+             "'.'.join(str(x) for x in sys.version_info[:3]))")
+    for path in scan_tool_dirs(dirs)[1]:
+        try:
+            o = (run([path, "-c", probe], check=False, timeout=20).stdout or "").strip()
+        except ToolError:
+            continue
+        m = re.match(r"^(\w+) (\d+\.\d+\.\d+)$", o.splitlines()[-1] if o else "")
+        if not m or int(m.group(2).split(".")[0]) < 3:
+            continue
+        res.append({"path": path, "impl": m.group(1), "version": m.group(2),
+                    "numver": numver(m.group(2)),
+                    "platform": os.path.realpath(path) == os.path.realpath(PLATFORM_PYTHON)})
+    res.sort(key=lambda y: (not y["platform"], y["impl"] != "CPython",
+                            tuple(-x for x in y["numver"])))
+    return res
+
+
+MISC_TOOLS = (("make", "--version"), ("ld.bfd", "-v"), ("ld.lld", "-v"), ("ld.gold", "-v"),
+              ("mold", "-v"), ("ccache", "--version"), ("pahole", "--version"),
+              ("rustc", "--version"), ("bindgen", "--version"))
+NOT_FOR_KERNELS = {"ld.gold": "the kernel refuses gold outright",
+                   "mold": "kbuild does not support mold"}
+
+
+def find_misc_tools():
+    res = {}
+    for name, flag in MISC_TOOLS:
+        path = which(name, path=":".join(SYSTEM_PATH))
+        if path:
+            try:
+                o = run([path, flag], check=False, timeout=20).stdout or ""
+            except ToolError:
+                o = ""
+            res[name] = {"path": path, "version": (o.strip().splitlines() or [""])[0][:70]}
+    return res
+
+
+DKMS_LINE = re.compile(r"^([^/,\s]+)[/,]\s*([^,\s]+),\s*([^,\s]+),\s*[^:]+:\s*(\S+)")
+
+
+def parse_dkms_status(text):
+    mods = {}
+    for line in text.splitlines():
+        m = DKMS_LINE.match(line.strip())
+        if m:
+            name, ver, kernel, state = m.groups()
+            mods.setdefault((name, ver), []).append((kernel, state))
+    return mods
+
+
+def parse_dkms_conf(text):
+    lim = {}
+    for key in ("BUILD_EXCLUSIVE_KERNEL_MIN", "BUILD_EXCLUSIVE_KERNEL_MAX",
+                "BUILD_EXCLUSIVE_KERNEL"):
+        m = re.search(r"^%s=[\"']?([^\"'\n]+)[\"']?\s*$" % key, text, re.M)
+        if m:
+            lim[key] = m.group(1)
+    return lim
+
+
+def dkms_will_build(limits, release):
+    """Mirror dkms's own rule: skip when VER(kernel) > MAX or < MIN, or when
+    the BUILD_EXCLUSIVE_KERNEL regex does not match.  Note 6.18.52 > '6.18'."""
+    k = version_key(release)[:3]
+    if "BUILD_EXCLUSIVE_KERNEL_MAX" in limits:
+        if k > version_key(limits["BUILD_EXCLUSIVE_KERNEL_MAX"])[:3]:
+            return False, "capped at %s" % limits["BUILD_EXCLUSIVE_KERNEL_MAX"]
+    if "BUILD_EXCLUSIVE_KERNEL_MIN" in limits:
+        if k < version_key(limits["BUILD_EXCLUSIVE_KERNEL_MIN"])[:3]:
+            return False, "needs at least %s" % limits["BUILD_EXCLUSIVE_KERNEL_MIN"]
+    if "BUILD_EXCLUSIVE_KERNEL" in limits:
+        try:
+            if not re.search(limits["BUILD_EXCLUSIVE_KERNEL"], release):
+                return False, "BUILD_EXCLUSIVE_KERNEL does not match"
+        except re.error:
+            pass
+    return True, ""
+
+
+def dkms_modules(root="/"):
+    """From /var/lib/dkms itself -- <module>/<version>/<kernel>/, with a
+    kernel-<k>-<arch> symlink per INSTALLED build.  `dkms status` says the same
+    in three seconds of bash; this is every command's start-up path."""
+    base = rp(root, "var/lib/dkms")
+    try:
+        names = sorted(n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n)))
+    except OSError:
+        names = None
+    if names is None:
+        if not which("dkms", path=":".join(SYSTEM_PATH)):
+            return []
+        p = run(["dkms", "status"], check=False, env=scrubbed_env(), timeout=60)
+        return [{"name": n, "version": v, "kernels": k,
+                 "limits": parse_dkms_conf(read_text(rp(root, "usr/src/%s-%s/dkms.conf" % (n, v))))}
+                for (n, v), k in sorted(parse_dkms_status(p.stdout or "").items())]
+    mods = []
+    for name in names:
+        mdir = os.path.join(base, name)
+        installed = set()
+        for entry in os.listdir(mdir):
+            full = os.path.join(mdir, entry)
+            if entry.startswith("kernel-") and os.path.islink(full):
+                parts = os.readlink(full).split("/")
+                if len(parts) >= 2:
+                    installed.add((parts[0], parts[1]))
+        for ver in sorted(os.listdir(mdir)):
+            vdir = os.path.join(mdir, ver)
+            if os.path.islink(vdir) or not os.path.isdir(vdir) or ver == "original_module":
+                continue
+            kernels = [(k, "installed" if (ver, k) in installed else "built")
+                       for k in sorted(os.listdir(vdir))
+                       if k not in ("source", "build") and os.path.isdir(os.path.join(vdir, k))
+                       and not os.path.islink(os.path.join(vdir, k))]
+            conf = read_text(os.path.join(vdir, "source", "dkms.conf")) or \
+                read_text(rp(root, "usr/src/%s-%s/dkms.conf" % (name, ver)))
+            mods.append({"name": name, "version": ver, "kernels": kernels,
+                         "limits": parse_dkms_conf(conf)})
+    return mods
+
+
+def detect_machine():
+    osr = parse_os_release(read_text("/etc/os-release"))
+    devs = scan_pci()
+    virt = ""
+    if which("systemd-detect-virt"):
+        virt = (run(["systemd-detect-virt"], check=False).stdout or "").strip()
+    cpu = cpu_info()
+    if not virt or virt == "none":
+        virt = "yes (unidentified)" if cpu["hypervisor"] else "none"
+    tool_dirs = tool_search_dirs()
+    initramfs = next((t for t in ("dracut", "update-initramfs", "mkinitcpio")
+                      if which(t, path=":".join(SYSTEM_PATH))), "")
+    dkms = dkms_modules()
+    return {
+        "os": osr.get("PRETTY_NAME", osr.get("ID", "unknown")),
+        "os_id": osr.get("ID", ""), "os_like": osr.get("ID_LIKE", ""),
+        "arch": os.uname().machine, "running": os.uname().release,
+        "pkg_manager": find_pkg_manager(),
+        "cpu": {"vendor": cpu["vendor"], "model": cpu["model"],
+                "threads": cpu["threads"],
+                "simd": [f for f in ("avx512f", "avx2", "avx", "sse4_2") if f in cpu["flags"]][:1],
+                "level": cpu["level"], "hybrid": cpu["hybrid"]},
+        "memory": mem_total(), "virt": virt,
+        "pci": devs, "gpu_vendors": sorted(gpu_vendors_present(devs)),
+        "storage": storage_stack(running=os.uname().release),
+        "firmware_compression": firmware_compression(),
+        "secure_boot": secure_boot(),
+        "boot": {"grubby": bool(which("grubby", path=":".join(SYSTEM_PATH))),
+                 "bls": os.path.isdir("/boot/loader/entries"), "initramfs": initramfs},
+        "toolchains": find_toolchains(tool_dirs), "cxx": find_cxx(tool_dirs),
+        "binutils": find_binutils(tool_dirs),
+        "pythons": find_pythons(tool_dirs), "dkms": dkms,
+        "nvidia": nvidia_state(devs, dkms, os.uname().release),
+        "loaded_modules": len(read_text("/proc/modules").splitlines()),
+    }
+
+
+# ----------------------------------------------------------------------- .config
+
+class DotConfig(object):
+    """A kernel .config, edited in memory and written atomically.
+
+    set() REMOVES the symbol's existing line and APPENDS the new one.  Kconfig
+    resolves a choice group by 'the last =y read wins', and scripts/config
+    edits in place -- so enabling DEBUG_INFO_NONE there rewrote a line sitting
+    ABOVE the distro's DWARF selection and silently lost.  Appending makes the
+    value we set the last one read, for every choice, without special cases."""
+
+    LINE = re.compile(r"^(?:CONFIG_([A-Za-z0-9_]+)=(.*)|# CONFIG_([A-Za-z0-9_]+) is not set)\s*$")
+
+    def __init__(self, path):
+        self.path = path
+        self.lines = read_text(path).splitlines()
+
+    def _sym(self, line):
+        m = self.LINE.match(line)
+        if not m:
+            return None, None
+        if m.group(1):
+            return m.group(1), m.group(2)
+        return m.group(3), "n"
+
+    def get(self, sym):
+        """'y' | 'm' | 'n' | the unquoted value | None when absent entirely."""
+        val = None
+        for line in self.lines:
+            s, v = self._sym(line)
+            if s == sym:
+                val = v
+        if val is not None and len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = val[1:-1].replace('\\"', '"')
+        return val
+
+    def set(self, sym, rendered):
+        """rendered: 'y' 'm' 'n', or the literal right-hand side."""
+        self.lines = [l for l in self.lines if self._sym(l)[0] != sym]
+        if rendered == "n":
+            self.lines.append("# CONFIG_%s is not set" % sym)
+        else:
+            self.lines.append("CONFIG_%s=%s" % (sym, rendered))
+
+    def count(self, value):
+        return sum(1 for l in self.lines if self._sym(l)[1] == value)
+
+    def valid(self):
+        return any(self._sym(l)[0] for l in self.lines)
+
+    def write(self):
+        tmp = "%s.tmp.%d" % (self.path, os.getpid())
+        with open(tmp, "w") as f:
+            f.write("\n".join(self.lines) + "\n")
+        os.replace(tmp, self.path)
+
+
+SRCARCH = {"x86_64": "x86", "i686": "x86", "i386": "x86", "aarch64": "arm64",
+           "ppc64le": "powerpc", "ppc64": "powerpc", "s390x": "s390",
+           "riscv64": "riscv", "armv7l": "arm", "loongarch64": "loongarch"}
+KCONFIG_DEF = re.compile(r"^\s*(?:menu)?config\s+([A-Za-z0-9_]+)\s*$", re.M)
+
+
+_KCONFIG = {}
+
+
+def kconfig_symbols(tree, machine_arch):
+    """Every symbol THIS tree defines for THIS architecture.  It is what lets
+    verify tell 'not in this kernel version' (DRM_XE before 6.8 -- a note) from
+    'present, requested, and dropped' (a dependency is off -- a failure)."""
+    key = (os.path.realpath(tree), machine_arch)
+    if key not in _KCONFIG:
+        _KCONFIG[key] = _kconfig_symbols(tree, machine_arch)
+    return _KCONFIG[key]
+
+
+def _kconfig_symbols(tree, machine_arch):
+    arch = SRCARCH.get(machine_arch, machine_arch)
+    syms = set()
+    for dirpath, dirnames, filenames in os.walk(tree):
+        rel = os.path.relpath(dirpath, tree)
+        if rel == "arch":
+            dirnames[:] = [d for d in dirnames if d == arch]
+        elif rel == ".":
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("Documentation", "tools", "samples", ".git")]
+        for fn in filenames:
+            if fn.startswith("Kconfig"):
+                syms.update(KCONFIG_DEF.findall(read_text(os.path.join(dirpath, fn))))
+    return syms
+
+
+def tree_version(tree):
+    """(major, minor) from the tree's own Makefile, without running make."""
+    text = read_text(os.path.join(tree, "Makefile"))
+    v = re.search(r"^VERSION\s*=\s*(\d+)", text, re.M)
+    p = re.search(r"^PATCHLEVEL\s*=\s*(\d+)", text, re.M)
+    return (int(v.group(1)), int(p.group(1))) if v and p else (0, 0)
+
+
+LEVEL_RANK = {"x86-64": 1, "x86-64-v2": 2, "x86-64-v3": 3, "x86-64-v4": 4}
+LEVEL_MACROS = (("x86-64-v2", ("__SSE4_2__", "__POPCNT__", "__SSSE3__")),
+                ("x86-64-v3", ("__AVX2__", "__BMI__", "__BMI2__", "__FMA__", "__MOVBE__")),
+                ("x86-64-v4", ("__AVX512F__", "__AVX512BW__", "__AVX512DQ__", "__AVX512VL__")))
+LEVEL_CPUS = {"x86-64": "any x86-64 CPU", "x86-64-v2": "Nehalem / Jaguar or newer",
+              "x86-64-v3": "Haswell / Zen 1 or newer (AVX2, BMI2, MOVBE)",
+              "x86-64-v4": "an AVX-512 CPU (Skylake-X, Ice Lake, Zen 4 ...)"}
+
+
+def march_level(cc, march, env=None):
+    """The x86-64 level that code built with -march=MARCH assumes, asked of the
+    compiler itself -- the macros it predefines -- so a CPU NAME (raptorlake,
+    znver4) and 'native' are judged like x86-64-v3.  None: the compiler does not
+    accept that -march at all."""
+    try:
+        p = run([cc, "-march=" + march, "-dM", "-E", "-x", "c", "-"], stdin_data="",
+                check=False, env=env, timeout=20)
+    except ToolError:
+        return None
+    if p.returncode != 0:
+        return None
+    have = set(re.findall(r"^#define (__\w+__) 1\s*$", p.stdout or "", re.M))
+    level = "x86-64"
+    for name, need in LEVEL_MACROS:
+        if not all(x in have for x in need):
+            break
+        level = name
+    return level
+
+
+def cpu_flags(cpu, tree, arch):
+    """-> (CONFIG_X86_NATIVE_CPU?, KCFLAGS).  Upstream has ONE Kconfig switch for
+    this: X86_NATIVE_CPU, -march=native, from 6.16 on.  Everything else -- an
+    x86-64 level, a CPU by name, native on an older tree -- goes in KCFLAGS,
+    which kbuild appends AFTER its own -march=x86-64: the last -march wins, and
+    the -mno-sse -mno-avx ... that keep SIMD out of kernel code still apply (an
+    explicit -mno- beats whatever a -march implies).  gcc 14 and clang 21 both
+    take every level with -m32 too: the 32-bit vDSO is built with these flags."""
+    if cpu == "generic":
+        return False, ""
+    if cpu == "native" and "X86_NATIVE_CPU" in kconfig_symbols(tree, arch):
+        return True, ""
+    if cpu.startswith("x86-64"):
+        return False, "-march=" + cpu
+    return False, "-march=%s -mtune=%s" % (cpu, cpu)
+
+
+def apply_cpu(tc, opts, tree, arch):
+    """Put the CPU choice into the make arguments, now that the tree is known."""
+    native, flags = cpu_flags(opts["cpu"], tree, arch)
+    tc["args"] = [a for a in tc["args"] if not a.startswith("KCFLAGS=")] + \
+        (["KCFLAGS=" + flags] if flags else [])
+    tc["kcflags"] = flags
+    opts["_native_kconfig"] = native
+    return flags
+
+
+def fit_llvm_to_tree(tc, tree):
+    """kbuild learned LLVM=<prefix>/ and LLVM=-<suffix> in 5.18.  Before that ANY
+    value means LLVM=1: clang, ld.lld ... by their plain names on PATH -- the
+    SYSTEM's clang, not the one chosen.  So an older tree gets LLVM=1 with the
+    chosen clang's directory first on PATH.  LLVM= itself arrived in 5.7."""
+    arg = next((a for a in tc["args"] if a.startswith("LLVM=")), None)
+    ver = tree_version(tree)
+    if arg is None or ver == (0, 0) or ver >= (5, 18):
+        return
+    if ver < (5, 7):
+        raise ToolError("clang builds go through kbuild's LLVM=, which Linux has from 5.7 on; "
+                        "this tree is %d.%d -- build it with gcc" % ver)
+    val = arg[len("LLVM="):]
+    if val == "1":
+        return
+    if val.startswith("-"):      # Debian's clang-18 -> /usr/lib/llvm-18/bin, plain names inside
+        d = os.path.dirname(os.path.realpath(os.path.join(os.path.dirname(tc["path"]), "clang" + val)))
+    else:
+        d = val.rstrip("/")
+    if not all(os.access(os.path.join(d, t), os.X_OK) for t in ("clang", "ld.lld")):
+        raise ToolError("this %d.%d tree reads LLVM= as LLVM=1, and %s has no plain clang and "
+                        "ld.lld to put first on PATH instead" % (ver[0], ver[1], d))
+    tc["args"] = ["LLVM=1" if a == arg else a for a in tc["args"]]
+    tc["extra_path"] = ":".join([d] + ([tc["extra_path"]] if tc.get("extra_path") else []))
+    note("%d.%d predates LLVM=<dir>/: building with LLVM=1 and %s first on PATH" % (ver[0], ver[1], d))
+
+
+class Req(object):
+    """One thing asked of the config.
+    want : 'y' 'm' 'n', 'm|y' (at least a module), ('str', s) or ('val', n)
+    level: required -> unmet is fatal | wanted -> a warning | optional -> a note"""
+
+    def __init__(self, sym, want, level, why=""):
+        self.sym, self.want, self.level, self.why = sym, want, level, why
+
+    def rendered(self, current, attempt=1):
+        if self.want == "m|y":
+            # 'm' first; a bool symbol (HYPERV from 6.18 on) rejects it, and the
+            # second pass asks for 'y' instead.
+            return current if current in ("m", "y") else ("m" if attempt == 1 else "y")
+        if isinstance(self.want, tuple):
+            return '"%s"' % self.want[1] if self.want[0] == "str" else str(self.want[1])
+        return self.want
+
+    def met(self, got):
+        if self.want == "n":
+            return got in (None, "n")
+        if self.want == "m|y":
+            return got in ("m", "y")
+        if isinstance(self.want, tuple):
+            # Asked to be EMPTY (a path to a file the tarball does not ship):
+            # absent -- its parent option is off -- is every bit as good.
+            if self.want[1] == "" and got is None:
+                return True
+            return got == str(self.want[1])
+        return got == self.want
+
+    def shown(self):
+        return self.want[1] if isinstance(self.want, tuple) else self.want
+
+
+FS_SYMBOLS = {"xfs": "XFS_FS", "ext4": "EXT4_FS", "ext3": "EXT4_FS", "ext2": "EXT4_FS",
+              "btrfs": "BTRFS_FS", "vfat": "VFAT_FS", "f2fs": "F2FS_FS",
+              "bcachefs": "BCACHEFS_FS", "exfat": "EXFAT_FS", "jfs": "JFS_FS",
+              "nilfs2": "NILFS2_FS", "erofs": "EROFS_FS", "ntfs3": "NTFS3_FS"}
+MD_SYMBOLS = {"raid0": "MD_RAID0", "raid1": "MD_RAID1", "raid10": "MD_RAID10",
+              "raid4": "MD_RAID456", "raid5": "MD_RAID456", "raid6": "MD_RAID456"}
+# Kept alive under --modules trimmed.  localmodconfig keeps what is LOADED NOW;
+# none of these is loaded on a healthy bare-metal box, and each is what you
+# reach for on the day it is not healthy: a USB stick, a rescue ISO, a VM.
+RESCUE_SYMBOLS = ("USB_STORAGE", "USB_UAS", "BLK_DEV_LOOP", "ISO9660_FS", "SQUASHFS",
+                  "VFAT_FS", "NLS_CODEPAGE_437", "NLS_ISO8859_1", "NLS_UTF8", "EXT4_FS",
+                  "XFS_FS", "BLK_DEV_NVME", "SATA_AHCI", "BLK_DEV_DM", "VIRTIO_PCI",
+                  "VIRTIO_BLK", "VIRTIO_NET", "SCSI_VIRTIO", "HID_GENERIC", "USB_HID")
+PREEMPT_CHOICE = {"none": "PREEMPT_NONE", "voluntary": "PREEMPT_VOLUNTARY",
+                  "full": "PREEMPT", "lazy": "PREEMPT_LAZY"}
+HZ_CHOICE = ("100", "250", "300", "1000")
+
+
+def gpu_vendors_for(arch):
+    """Intel's GPU drivers (i915) are x86-only: on an ARM or POWER box a REQUIRED
+    DRM_I915 can never come out as asked, and the build was refused for it."""
+    return {"amd", "nvidia", "intel"} if arch in ("x86_64", "i686", "i386") else {"amd", "nvidia"}
+
+
+def resolve_gpu(selection, detected, arch=None):
+    """-> (set of vendors, explanation)."""
+    possible = gpu_vendors_for(arch or os.uname().machine)
+    sel = (selection or "auto").strip().lower()
+    if sel == "auto":
+        if detected:
+            return set(detected) & possible, "detected"
+        return set(possible), \
+            "none detected (headless, VM or unknown) -- all vendors, so it boots anywhere"
+    if sel == "all":
+        return set(possible), "all, as asked"
+    vendors = set()
+    for v in sel.split(","):
+        v = v.strip()
+        if v in ("amd", "intel"):
+            vendors.add(v)
+        elif v in ("nvidia", "nv"):
+            vendors.add("nvidia")
+        elif v not in ("vm", "none", ""):
+            raise ToolError("unknown GPU vendor '%s' (use: auto all none amd nvidia intel)" % v)
+    if vendors - possible:
+        raise ToolError("Intel's GPU drivers (i915, xe) exist for x86 only, not for %s"
+                        % (arch or os.uname().machine))
+    return vendors, "as asked"
+
+
+_MAKEFILE_OBJS = {}
+
+
+def makefile_objects(path):
+    """{object: [CONFIG symbols]} from one Makefile's `obj-$(CONFIG_X) += a.o b.o`
+    lines -- the same reading streamline_config.pl (localmodconfig) does."""
+    if path not in _MAKEFILE_OBJS:
+        objs = {}
+        text = read_text(path).replace("\\\n", " ")
+        for m in re.finditer(r"^[ \t]*obj-\$\(CONFIG_([A-Za-z0-9_]+)\)[ \t]*[:+]?=(.*)$", text, re.M):
+            for tok in m.group(2).split():
+                if tok.endswith(".o"):
+                    objs.setdefault(tok[:-2].replace("-", "_"), []).append(m.group(1))
+        _MAKEFILE_OBJS[path] = objs
+    return _MAKEFILE_OBJS[path]
+
+
+def symbol_for_module(tree, name, rel=""):
+    """-> the CONFIG symbols that build module `name` in THIS tree: from the
+    Makefile in the directory the running kernel had it in, else from any
+    Makefile under drivers/ or block/ that names it (files move between
+    versions).  One symbol is an answer; several are not."""
+    obj = os.path.basename(rel).replace("-", "_") if rel else name
+    if rel:
+        for mk in ("Makefile", "Kbuild"):
+            syms = makefile_objects(os.path.join(tree, os.path.dirname(rel), mk)).get(obj)
+            if syms:
+                return sorted(set(syms))
+    found = set()
+    for top in ("drivers", "block"):
+        for dirpath, _, files in os.walk(os.path.join(tree, top)):
+            for mk in ("Makefile", "Kbuild"):
+                if mk in files:
+                    found.update(makefile_objects(os.path.join(dirpath, mk)).get(obj, ()))
+    return sorted(found)
+
+
+def disk_requests(tree, machine):
+    """-> ([(symbol, module, disks)], [modules that no single option builds]):
+    the drivers between this machine's disks and its CPU, as options of THIS
+    tree.  A VMD domain is required even if its driver was not seen by name."""
+    st = machine.get("storage") or {}
+    res, unknown = [], []
+    for d in st.get("drivers", []):
+        syms = symbol_for_module(tree, d["module"], d.get("path", ""))
+        if len(syms) == 1:
+            if syms[0] not in [s for s, _, _ in res]:
+                res.append((syms[0], d["module"], d["disks"]))
+        else:
+            unknown.append("%s%s" % (d["module"], " (any of %s)" % ", ".join(syms) if syms else ""))
+    if st.get("vmd") and "VMD" not in [s for s, _, _ in res]:
+        res.append(("VMD", "vmd", st.get("disks", [])))
+    return res, unknown
+
+
+def build_requests(opts, vendors, machine, disk=(), base=None):
+    """disk: from disk_requests().  base: the config being worked on, for the
+    one request that depends on what is already there (--debug-info on)."""
+    R = []
+    arch = machine.get("arch") or os.uname().machine
+    x86 = arch in ("x86_64", "i686", "i386")
+
+    def add(sym, want, level, why=""):
+        R.append(Req(sym, want, level, why))
+
+    # GPU-compute plumbing.  DEPENDENCIES, not preferences: HSA_AMD_SVM needs
+    # DEVICE_PRIVATE, HSA_AMD_P2P needs PCI_P2PDMA, both need ZONE_DEVICE, and
+    # ZONE_DEVICE needs memory hotplug -- which a distro config has and
+    # `make defconfig` does not, so from that base the whole chain used to
+    # vanish without a line in .config to show for it.
+    add("MEMORY_HOTPLUG", "y", "wanted", "ZONE_DEVICE depends on it")
+    add("MEMORY_HOTREMOVE", "y", "wanted", "ZONE_DEVICE depends on it")
+    add("ZONE_DEVICE", "y", "required", "device memory; under HMM, P2P, UVM")
+    add("DEVICE_PRIVATE", "y", "required", "HSA_AMD_SVM / nouveau SVM depend on it")
+    add("PCI_P2PDMA", "y", "required", "GPU peer-to-peer over PCIe")
+    add("DRM_ACCEL", "y", "wanted", "the subsystem both NPUs live under")
+
+    # Out-of-tree modules -- DKMS -- must be buildable and loadable.
+    add("MODULES", "y", "required", "no modules, no DKMS")
+    add("MODULE_UNLOAD", "y", "wanted")
+    add("MODULE_SIG_FORCE", "n", "required", "or no unsigned DKMS module will load")
+
+    # A console before any GPU driver binds, and the VM / BMC adapters: a few
+    # hundred KB that separate 'boots on my machine' from 'boots anywhere'.
+    # localmodconfig switches DRM itself off on a headless box (no DRM module
+    # loaded), and every driver below then fails for want of its parent.
+    add("DRM", "m|y", "required", "parent of every graphics driver")
+    add("SYSFB_SIMPLEFB", "y", "wanted")
+    add("DRM_SIMPLEDRM", "m", "required", "EFI/VESA framebuffer -- the rescue console")
+    add("DRM_FBDEV_EMULATION", "y", "wanted")
+    add("FRAMEBUFFER_CONSOLE", "y", "wanted")
+    add("DRM_VIRTIO_GPU", "m", "required", "QEMU/KVM")
+    for sym in ("DRM_QXL", "DRM_BOCHS", "DRM_AST", "DRM_MGAG200", "DRM_UDL"):
+        add(sym, "m", "wanted")
+    add("HYPERV", "m|y", "optional", "DRM_HYPERV depends on it")
+    for sym in ("DRM_VMWGFX", "DRM_HYPERV", "DRM_EFIDRM", "DRM_VESADRM"):
+        add(sym, "m", "optional")
+
+    # Firmware arrives compressed on every current distro (.xz on EL and Fedora,
+    # .zst on Ubuntu and Arch).  Without the matching decompressor the driver
+    # loads, asks for firmware, and gets nothing -- the GPU, and just as much the
+    # Wi-Fi (iwlwifi), the network card (r8169) and Bluetooth.  So not only when
+    # a GPU is asked for: `--gpu none` used to leave these to chance.
+    have = machine.get("firmware_compression", [])
+    add("FW_LOADER", "y", "required")
+    add("FW_LOADER_COMPRESS", "y", "required" if have else "wanted", "distro firmware is compressed")
+    add("FW_LOADER_COMPRESS_XZ", "y", "required" if "xz" in have else "wanted")
+    add("FW_LOADER_COMPRESS_ZSTD", "y", "required" if "zstd" in have else "wanted")
+    if x86:
+        add("MICROCODE", "y", "wanted", "CPU microcode loaded early, from the initramfs")
+    if (machine.get("cpu") or {}).get("hybrid"):
+        # P-cores and E-cores (Alder Lake and later): without these the scheduler
+        # treats all of them alike and long jobs land on E-cores.
+        add("SCHED_MC_PRIO", "y", "wanted", "hybrid CPU: P-cores first (ITMT)")
+        add("INTEL_HFI_THERMAL", "y", "wanted", "hybrid CPU: the hardware's own placement hints")
+    if "amd" in vendors:
+        add("DRM_AMDGPU", "m", "required", "MODULE, never built-in -- see the file header")
+        add("DRM_AMD_DC", "y", "required", "atomic KMS, DP/HDMI audio")
+        add("DRM_AMDGPU_USERPTR", "y", "required", "ROCm, GL/Vulkan interop")
+        add("DRM_AMDGPU_SI", "y", "wanted")
+        add("DRM_AMDGPU_CIK", "y", "wanted")
+        add("HSA_AMD", "y", "required", "KFD: /dev/kfd, ROCm's way in")
+        add("HSA_AMD_SVM", "y", "required", "HIP managed memory")
+        # Up to 6.x HSA_AMD_P2P also depends on DMABUF_MOVE_NOTIFY.  7.x dropped
+        # the symbol, so a 7.x config carried back to an LTS tree lacks it and
+        # P2P silently disappears.  On 7.x this is a 'not in this version' note.
+        add("DMABUF_MOVE_NOTIFY", "y", "optional", "HSA_AMD_P2P depends on it before 7.x")
+        add("HSA_AMD_P2P", "y", "required", "GPU-to-GPU transfers")
+        add("AMD_IOMMU", "y", "optional", "x86 only; DRM_ACCEL_AMDXDNA needs it")
+        add("DRM_ACCEL_AMDXDNA", "m", "optional", "Ryzen AI NPU; 6.14+")
+    if "nvidia" in vendors:
+        # A module even if NVIDIA's own driver is the plan: that stack needs
+        # nouveau absent at load time, and only a module can be blacklisted.
+        add("DRM_NOUVEAU", "m", "required")
+    if "intel" in vendors:
+        add("DRM_I915", "m", "required")
+        add("DRM_XE", "m", "optional", "6.8+")
+        add("DRM_ACCEL_IVPU", "m", "optional", "Meteor Lake+ NPU")
+
+    # What this machine needs to mount its own disks -- first the drivers the
+    # disks are reached through, then what is on them.
+    for sym, mod, disks in disk:
+        add(sym, "m|y", "required",
+            "Intel VMD sits in front of %s: without it they are invisible" % ",".join(disks)
+            if sym == "VMD" else "%s: %s is reached through it" % (mod, ",".join(disks)))
+    st = machine.get("storage", {})
+    for fs in st.get("fstypes", []):
+        if fs in FS_SYMBOLS:
+            add(FS_SYMBOLS[fs], "m|y", "required", "a mounted filesystem here is %s" % fs)
+        if fs == "vfat":
+            for nls in ("NLS_CODEPAGE_437", "NLS_ISO8859_1", "NLS_ASCII", "NLS_UTF8"):
+                add(nls, "m|y", "wanted", "vfat mount options")
+    for layer in st.get("layers", []):
+        if layer in ("lvm", "dm", "crypt"):
+            add("BLK_DEV_DM", "m|y", "required", "storage here sits on device-mapper")
+        if layer == "crypt":
+            add("DM_CRYPT", "m|y", "required", "storage here is dm-crypt")
+        if layer.startswith("md:"):
+            add("BLK_DEV_MD", "m|y", "required", "storage here is md raid")
+            if layer[3:] in MD_SYMBOLS:
+                add(MD_SYMBOLS[layer[3:]], "m|y", "required", layer)
+    if opts["modules"] == "trimmed":
+        for sym in RESCUE_SYMBOLS + tuple(opts.get("keep_symbols", ())):
+            add(sym, "m|y", "wanted", "rescue set, kept through the trim")
+
+    # Things that break a distro config carried to an upstream tree: signing
+    # keys, revocation lists and the SBAT file all live in the distro's source
+    # package, and each is a hard stop late in the build.  WERROR is right for
+    # the one compiler a distro tests and wrong for every other pairing.
+    add("SYSTEM_TRUSTED_KEYS", ("str", ""), "required")
+    add("SYSTEM_REVOCATION_KEYS", ("str", ""), "required")
+    add("EFI_SBAT_FILE", ("str", ""), "wanted")
+    add("WERROR", "n", "required")
+    add("FRAME_WARN", ("val", opts["frame_warn"]), "wanted",
+        "amdgpu's DML files build ~2.4K frames")
+
+    # The running kernel should carry its own config.  Its absence is what made
+    # the old script lose its base config on the second use.
+    add("IKCONFIG", "y", "wanted")
+    add("IKCONFIG_PROC", "y", "wanted", "/proc/config.gz")
+
+    if opts.get("secure_boot", "on") == "on":
+        # shim boots a SIGNED PE image, so the kernel must BE one (EFI_STUB).  Under
+        # lockdown only signed modules load: the in-tree ones are signed at
+        # modules_install with the tree's own throw-away key, whose certificate is
+        # compiled in (what distros do); DKMS signs with the machine's MOK key,
+        # which the kernel trusts only with the MACHINE keyring.  MODULE_SIG_FORCE
+        # stays off -- lockdown enforces when Secure Boot is on, and with it off an
+        # unsigned out-of-tree module must still load.
+        add("EFI", "y", "required", "Secure Boot is a UEFI feature")
+        add("EFI_STUB", "y", "required", "shim verifies and boots a PE image")
+        add("MODULE_SIG", "y", "required", "lockdown loads signed modules only")
+        add("MODULE_SIG_ALL", "y", "required", "sign every module at modules_install")
+        add("MODULE_SIG_SHA512", "y", "wanted")
+        add("MODULE_SIG_KEY", ("str", "certs/signing_key.pem"), "wanted",
+            "kbuild generates this key per tree; a distro path here is a missing file")
+        add("SECURITY_LOCKDOWN_LSM", "y", "wanted")
+        add("SECURITY_LOCKDOWN_LSM_EARLY", "y", "wanted")
+        add("LOCK_DOWN_IN_EFI_SECURE_BOOT", "y", "optional", "a distro patch, not upstream")
+        add("SECONDARY_TRUSTED_KEYRING", "y", "wanted")
+        add("INTEGRITY_PLATFORM_KEYRING", "y", "wanted", "firmware db keys")
+        add("INTEGRITY_MACHINE_KEYRING", "y", "wanted", "MOK keys: DKMS-signed modules load")
+        add("LOAD_UEFI_KEYS", "y", "wanted")
+        add("KEXEC_SIG", "y", "optional")
+
+    if opts["debug_info"] == "off":
+        for sym in ("DEBUG_INFO_BTF", "DEBUG_INFO_BTF_MODULES",
+                    "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT", "DEBUG_INFO_DWARF4",
+                    "DEBUG_INFO_DWARF5"):
+            add(sym, "n", "optional")
+        # Before 5.18 there is no DEBUG_INFO_NONE: DEBUG_INFO itself is the switch
+        # (5.15 LTS).  From 5.18 on it has no prompt and follows the choice below.
+        add("DEBUG_INFO", "n", "optional")
+        add("DEBUG_INFO_NONE", "y", "required", "else 10x module size, far slower build")
+    elif opts["debug_info"] == "on":
+        # DWARF in the kernel.  This used to mean "whatever the base has" -- and
+        # when the base is this tree's own .config from an earlier `off` run,
+        # that is DEBUG_INFO_NONE.  A DWARF version the base already chose stays.
+        add("DEBUG_KERNEL", "y", "wanted", "the debug-info choice lives under it")
+        add("DEBUG_INFO", "y", "wanted", "before 5.18 the DWARF choice lives under it")
+        add("DEBUG_INFO_NONE", "n", "required", "--debug-info on")
+        if base is None or not any(base.get(s) == "y" for s in (
+                "DEBUG_INFO_DWARF4", "DEBUG_INFO_DWARF5", "DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT")):
+            add("DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT", "y", "required", "--debug-info on")
+    elif opts["debug_info"] == "btf":
+        add("DEBUG_KERNEL", "y", "wanted", "the debug-info choice lives under it")
+        add("DEBUG_INFO", "y", "wanted", "before 5.18 the DWARF choice lives under it")
+        # BTF is made FROM DWARF by pahole, so DWARF has to exist at build time;
+        # modules are stripped of it at install (INSTALL_MOD_STRIP keeps .BTF).
+        # Without BTF a kernel with BPF_LSM logs 'bpf-restrict-fs: Failed to
+        # load BPF object' from systemd on every boot, and bpftrace and every
+        # CO-RE tool (Cilium, Falco, Tetragon agents) cannot run.
+        for sym in ("DEBUG_INFO_NONE", "DEBUG_INFO_REDUCED", "DEBUG_INFO_SPLIT",
+                    "DEBUG_INFO_DWARF4", "DEBUG_INFO_DWARF5"):
+            add(sym, "n", "optional")
+        add("DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT", "y", "required", "BTF is generated from DWARF")
+        add("DEBUG_INFO_BTF", "y", "required", "systemd BPF filters, bpftrace, CO-RE tools")
+        add("DEBUG_INFO_BTF_MODULES", "y", "wanted")
+    if opts["preempt"] != "keep":
+        for key, sym in sorted(PREEMPT_CHOICE.items()):
+            if key != opts["preempt"]:
+                add(sym, "n", "optional")
+        add(PREEMPT_CHOICE[opts["preempt"]], "y", "wanted", "preemption model")
+    if opts["hz"] != "keep":
+        for hz in HZ_CHOICE:
+            if hz != opts["hz"]:
+                add("HZ_" + hz, "n", "optional")
+        add("HZ_" + opts["hz"], "y", "wanted", "timer frequency")
+    if opts["cpu"] == "native" and opts.get("_native_kconfig", True):
+        # Required, not wanted: as `wanted` an old clang turned it into a warning
+        # and a GENERIC kernel.  The tree makes it depend on CC_HAS_MARCH_NATIVE,
+        # which clang before 19.1 does not get (it miscompiled networking code).
+        add("X86_NATIVE_CPU", "y", "required", "-march=native: gcc, or clang 19.1 or newer")
+    else:
+        add("X86_NATIVE_CPU", "n", "optional")
+
+    add("LOCALVERSION", ("str", opts["localversion"]), "required")
+    add("LOCALVERSION_AUTO", "n", "required")
+    return R
+
+
+def verify_requests(cfg, reqs, symbols):
+    """-> list of (req, got, status): ok | fail | warn | note | absent."""
+    res = []
+    for r in reqs:
+        got = cfg.get(r.sym)
+        if r.met(got):
+            res.append((r, got, "ok"))
+        elif r.sym not in symbols:
+            res.append((r, got, "absent"))
+        else:
+            res.append((r, got, {"required": "fail", "wanted": "warn"}.get(r.level, "note")))
+    return res
+
+
+def config_series(path):
+    """'6.12' from the '# Linux/x86 6.12.0 Kernel Configuration' header, or ''."""
+    try:
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", errors="replace") as f:
+            head = "".join(f.readline() for _ in range(6))
+    except (OSError, IOError, EOFError):
+        return ""
+    m = re.search(r"^# Linux/\S+ (\d+\.\d+)", head, re.M)
+    return m.group(1) if m else ""
+
+
+def richest(paths):
+    """The candidate with the most modules.  /boot also holds configs THIS tool
+    installed for trimmed kernels; 'newest' would pick one of those."""
+    return max(paths, key=lambda p: (DotConfig(p).count("m"),
+                                     version_key(os.path.basename(p)[7:])))
+
+
+def find_base_config(tree, mode, running=None, root="/", target_series="",
+                     skip_own=False, want_full=False):
+    """-> (kind, path, label).  kind: file | gz | defconfig.
+
+    The chain is long on purpose.  /boot/config-$(uname -r) and /proc/config.gz
+    cover a DISTRO kernel.  They do not cover a kernel built by a tool like
+    this one: EL's `make install` does not copy the config to /boot.  That
+    kernel's config is in its build tree, which /lib/modules/<rel>/build still
+    points at.  Falling through to defconfig silently is how you build a kernel
+    without your root filesystem in it, so that never happens unasked.
+
+    skip_own : the tree's .config came from a TRIMMED run and this one is full.
+    want_full: prefer a full distro config over a running kernel that is trimmed."""
+    rel = running or os.uname().release
+    own = os.path.join(tree, ".config")
+    if mode == "defconfig":
+        return "defconfig", "", "make defconfig (asked for)"
+    if mode not in ("auto", "running", "distro"):
+        path = os.path.expanduser(mode)
+        if not os.path.isfile(path):
+            raise ToolError("--config-base %s is not a readable file (expected auto, "
+                            "running, defconfig or a path)" % mode)
+        return ("gz" if path.endswith(".gz") else "file"), path, path
+    if mode == "auto" and not skip_own and os.path.isfile(own) and DotConfig(own).valid():
+        return "file", own, "the .config already in this tree"
+    chain = ["boot/config-" + rel, "proc/config.gz",
+             "lib/modules/%s/build/.config" % rel, "lib/modules/%s/config" % rel,
+             "usr/src/kernels/%s/.config" % rel,
+             "usr/src/linux-headers-%s/.config" % rel]
+    others = [c for c in glob.glob(rp(root, "boot/config-*")) if DotConfig(c).valid()]
+    mine = ""
+    for c in chain:
+        path = rp(root, c)
+        if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+            continue
+        if skip_own and os.path.realpath(path) == os.path.realpath(own):
+            continue
+        if path.endswith(".gz") or DotConfig(path).valid():
+            mine = path
+            break
+    # A config from the SAME series as the tree lines up symbol for symbol.  One
+    # from a different series loses every option renamed or re-parented between
+    # them -- carrying 7.2 back to 6.12 drops HYPERV, DMABUF_MOVE_NOTIFY and
+    # with it GPU peer-to-peer.  So a same-series distro config beats the
+    # running kernel's, unless the user says `--config-base running`.
+    if mode == "auto" and target_series and (not mine or config_series(mine) != target_series):
+        close = [c for c in others if config_series(c) == target_series]
+        if want_full and close:
+            # ...but not a TRIMMED one -- this tool writes /boot/config-<rel> for
+            # every kernel it installs, trimmed ones too, and a "full" build seeded
+            # from 140 modules is a trimmed build that says it is full.
+            fullest = DotConfig(richest(others)).count("m")
+            close = [c for c in close if DotConfig(c).count("m") * 2 >= fullest]
+        if close:
+            best = richest(close)
+            return "file", best, (
+                "%s  (a %s config, like this tree%s; --config-base running overrides)"
+                % (best, target_series,
+                   " -- the running kernel's is %s" % config_series(mine) if mine else ""))
+    if mode == "auto" and want_full and mine and not mine.endswith(".gz") and others:
+        best = richest(others)
+        if DotConfig(mine).count("m") * 2 < DotConfig(best).count("m"):
+            return "file", best, ("%s  (the running kernel's config is a trimmed one; "
+                                  "this is the fullest here)" % best)
+    if mine:
+        return ("gz" if mine.endswith(".gz") else "file"), mine, \
+            "%s (the running kernel's)" % mine
+    if others:
+        best = richest(others)
+        return "file", best, \
+            "%s (NOT the running kernel's -- the fullest distro config found)" % best
+    raise ToolError("no base config found for %s.\n  Looked in /boot, /proc/config.gz, "
+                    "/lib/modules/%s and /usr/src.\n  Pass --config-base <file>, or "
+                    "--config-base defconfig if you really mean a bare defconfig."
+                    % (rel, rel))
+
+
+class Make(object):
+    """make, in one tree, with one toolchain and one scrubbed environment.
+    The toolchain arguments go on EVERY call: Kconfig's cc-option tests run the
+    compiler, so an olddefconfig without LLVM= resolves the config for gcc,
+    verify approves it, and the build then quietly re-resolves it for clang."""
+
+    def __init__(self, tree, toolchain, jobs):
+        self.tree, self.tc, self.jobs = tree, toolchain, jobs
+        self.env = scrubbed_env(toolchain.get("extra_path"))
+
+    def argv(self, targets, parallel=False):
+        cmd = ["make"] + (["-j%d" % self.jobs] if parallel else [])
+        return cmd + list(self.tc["args"]) + list(targets)
+
+    def call(self, targets, extra_env=None, check=True, stdin_data=None):
+        env = dict(self.env)
+        env.update(extra_env or {})
+        return run(self.argv(targets), cwd=self.tree, env=env, check=check,
+                   stdin_data=stdin_data)
+
+    def value(self, target):
+        return (self.call(["-s", target]).stdout or "").strip().splitlines()[-1]
+
+
+def _find_lld(ci, machine):
+    cands = [os.path.join(os.path.dirname(ci["path"]), "ld.lld"),
+             which("ld.lld", path=":".join(SYSTEM_PATH)) or ""]
+    cands += [os.path.join(os.path.dirname(t["path"]), "ld.lld")
+              for t in machine.get("toolchains", []) if t["kind"] == "clang"]
+    return next((c for c in cands if c and os.access(c, os.X_OK)), "")
+
+
+def resolve_toolchain(opts, machine=None):
+    """The user's choices -> one compiler, one set of make arguments, one PATH.
+
+    Four independent choices: the COMPILER (--cc, or --toolchain llvm), the
+    BINUTILS (--binutils auto | gnu | llvm | <dir with ld and as>), the LINKER
+    (--linker default | bfd | lld) and the PYTHON kbuild's scripts run under.
+    'auto' binutils means: what was built to go with that compiler -- LLVM's
+    own for a clang that has the full set beside it, a gcc-toolset's own, and
+    the system's otherwise."""
+    machine = machine if isinstance(machine, dict) else {}
+    if opts["cc"]:
+        want = os.path.expanduser(opts["cc"])
+        path = want if os.sep in want else (which(want) or "")
+        if not path or not os.path.exists(path):
+            raise ToolError("--cc %s: no such compiler.  (Falling back to the system "
+                            "gcc without saying so is how a build ends up made by a "
+                            "compiler nobody chose.)" % opts["cc"])
+        path = os.path.abspath(path)
+    elif opts["toolchain"] == "llvm":
+        prefix = os.path.expanduser(opts["llvm_prefix"])
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        path = (prefix + "clang") if prefix else (which("clang", path=":".join(SYSTEM_PATH)) or "")
+    else:
+        path = "/usr/bin/gcc" if os.path.exists("/usr/bin/gcc") else \
+            (which("gcc", path=":".join(SYSTEM_PATH)) or "")
+    ci = compiler_info(path) if path else None
+    if not ci:
+        raise ToolError("no working compiler at %s" % (path or "/usr/bin/gcc"))
+    if ci["usable"] == "no":
+        raise ToolError("%s cannot build a kernel: %s.\n  (%s)" % (path, ci["why"], ci["version"]))
+    if opts["toolchain"] == "llvm" and ci["kind"] != "clang":
+        raise ToolError("--toolchain llvm, but %s is %s" % (path, ci["version"]))
+    kind, args, extra = ci["kind"], [], []
+
+    binutils = opts.get("binutils", "auto")
+    llvm = llvm_companions(ci["path"]) if kind == "clang" else None
+    if binutils == "auto":
+        binutils = ("llvm" if llvm else "gnu") if kind == "clang" else (own_binutils(path) or "gnu")
+    if binutils == "llvm":
+        if kind != "clang":
+            raise ToolError("--binutils llvm needs clang as the compiler; %s is gcc" % path)
+        if not llvm:
+            d = os.path.dirname(ci["path"])
+            raise ToolError("no complete LLVM tool set beside %s (missing: %s) -- use "
+                            "--binutils gnu" % (path, " ".join(
+                                t for t in LLVM_TOOLS if not os.access(os.path.join(d, t), os.X_OK))))
+        # HOSTLDFLAGS: tools/lib/bpf is built non-PIC by gcc and linked by an
+        # ld.lld that defaults to PIE; resolve_btfids dies on R_X86_64_32.
+        args = [llvm[0], "HOSTLDFLAGS=-no-pie"]
+        if llvm[1]:
+            extra.append(llvm[1])
+        ci["binutils_label"] = "LLVM (%s)" % llvm[0]
+    else:
+        if binutils != "gnu":
+            bdir = os.path.abspath(os.path.expanduser(binutils))
+            if not all(os.access(os.path.join(bdir, t), os.X_OK) for t in ("ld", "as")):
+                raise ToolError("--binutils %s: no ld and as in that directory (expected "
+                                "auto, gnu, llvm or a binutils bin directory)" % binutils)
+            if os.path.realpath(bdir) != os.path.realpath("/usr/bin"):
+                extra.append(bdir)
+        sysgcc = ci["real"] == os.path.realpath("/usr/bin/gcc")
+        if not sysgcc or extra:
+            # By absolute path.  A directory put ahead of /usr/bin for its ld may
+            # hold a `gcc` of its own, and a bare CC=gcc would silently become it.
+            args.append("CC=" + ci["path"])
+        if extra and kind == "gcc":
+            args.append("HOSTCC=" + ("/usr/bin/gcc" if os.path.exists("/usr/bin/gcc") else ci["path"]))
+        ci["binutils_label"] = "GNU (%s)" % (extra[0] if extra else "system")
+
+    linker = opts.get("linker", "default")
+    if linker == "lld" and binutils != "llvm":
+        lld = _find_lld(ci, machine)
+        if not lld:
+            raise ToolError("--linker lld: no ld.lld found on this system")
+        args.append("LD=" + lld)
+    elif linker == "bfd" and binutils == "llvm":
+        args.append("LD=ld.bfd")
+
+    ci["python"] = ""
+    if opts.get("python"):
+        py = os.path.abspath(os.path.expanduser(opts["python"]))
+        try:
+            o = (run([py, "-c", "import sys; print(sys.version_info[0])"], check=False,
+                     env=scrubbed_env(), timeout=20).stdout or "").strip()
+        except ToolError:
+            o = ""
+        if o != "3":
+            raise ToolError("--python %s does not run as a Python 3 in a clean environment"
+                            % opts["python"])
+        args.append("PYTHON3=" + py)
+        ci["python"] = py
+
+    partner = cxx_partner(ci["path"])
+    if opts.get("cxx"):
+        want = os.path.expanduser(opts["cxx"])
+        cxx = want if os.sep in want else (which(want) or "")
+        xi = compiler_info(cxx) if cxx and os.path.exists(cxx) else None
+        if not xi:
+            raise ToolError("--cxx %s: no such compiler" % opts["cxx"])
+        if xi["usable"] == "no":
+            raise ToolError("%s cannot be kbuild's C++ compiler: %s.\n  (%s)"
+                            % (cxx, xi["why"], xi["version"]))
+        cxx = os.path.abspath(cxx)
+        args.append("HOSTCXX=" + cxx)
+        if kind == "gcc" and partner and os.path.realpath(cxx) != os.path.realpath(partner):
+            ci["cxx_note"] = ("GCC plugins are compiled by this against %s's plugin headers; "
+                              "the matching one is %s" % (os.path.basename(ci["path"]), partner))
+    elif binutils == "llvm":
+        cxx = partner or "clang++"          # kbuild sets HOSTCXX=clang++ itself under LLVM=
+    elif kind == "gcc" and partner and ci["real"] != os.path.realpath("/usr/bin/gcc"):
+        # A gcc that is not the system's: ITS g++ builds ITS plugins.
+        cxx = partner
+        args.append("HOSTCXX=" + cxx)
+    else:
+        cxx = which("g++", path=":".join(extra + SYSTEM_PATH)) or ""
+    ci["cxx"] = cxx
+
+    if opts.get("ccache") == "on":
+        cc = which("ccache", path=":".join(SYSTEM_PATH))
+        if not cc:
+            raise ToolError("--ccache on, but ccache is not installed")
+        args = [a for a in args if not a.startswith("CC=")] + ["CC=%s %s" % (cc, ci["path"])]
+    ci["args"], ci["extra_path"] = args, (":".join(extra) or None)
+    ci["binutils"], ci["linker"], ci["ccache"] = binutils, linker, opts.get("ccache") == "on"
+
+    good, why = compiler_works(ci["path"], ci["extra_path"])
+    if not good:
+        raise ToolError("%s cannot build an executable in the clean environment the "
+                        "build runs in:\n      %s\n  If it needs LD_LIBRARY_PATH to find its "
+                        "own libraries, that is the cause." % (ci["path"], why))
+    ci["cpu"], ci["cpu_level"], ci["kcflags"] = opts.get("cpu", "generic"), "", ""
+    if ci["cpu"] == "native" and kind == "clang" and tuple(ci["numver"][:2]) < (19, 1):
+        # What the tree's own Kconfig refuses from 6.16 on (CC_HAS_MARCH_NATIVE): the
+        # KCFLAGS route for older trees must not slip past it.
+        raise ToolError("--cpu native with clang %s: the kernel itself refuses -march=native "
+                        "before clang 19.1 (an internal compiler error in networking code, "
+                        "llvm-project#72026).  Use gcc, a newer clang, or --cpu x86-64-v3."
+                        % vstr(ci["numver"]))
+    if ci["cpu"] != "generic":
+        if os.uname().machine != "x86_64":
+            raise ToolError("--cpu %s: CPU tuning is for x86_64 only; this is %s"
+                            % (ci["cpu"], os.uname().machine))
+        ci["cpu_level"] = march_level(ci["path"], ci["cpu"], scrubbed_env(ci["extra_path"]))
+        if ci["cpu_level"] is None:
+            raise ToolError("%s does not accept -march=%s.  x86-64-v2/v3/v4 need gcc 11 or clang "
+                            "12; for CPU names see `gcc -Q --help=target` or `clang "
+                            "--print-supported-cpus`." % (ci["path"], ci["cpu"]))
+    return ci
+
+
+def describe_tools(tc):
+    """What the build will REALLY run, asked of the tools themselves in the
+    environment the build will have.  -> [(label, text)]"""
+    env = scrubbed_env(tc.get("extra_path"))
+    path = env["PATH"]
+
+    def banner(argv):
+        try:
+            o = run(argv, check=False, env=env, timeout=20).stdout or ""
+        except ToolError:
+            return "NOT FOUND"
+        return ([l for l in o.splitlines() if l.strip()] or ["?"])[0].strip()[:60]
+    rows = []
+    if tc["kind"] == "clang":
+        rows.append(("assembler", "clang's integrated assembler"))
+    else:
+        name = (run([tc["path"], "-print-prog-name=as"], check=False, env=env).stdout or "as").strip()
+        full = name if os.sep in name else (which(name, path=path) or name)
+        rows.append(("assembler", "%s  (%s)" % (os.path.realpath(full), banner([full, "--version"]))))
+    ld = next((a[3:] for a in tc["args"] if a.startswith("LD=")), "")
+    if not ld:
+        arg = next((a[5:] for a in tc["args"] if a.startswith("LLVM=")), None)
+        if arg is None:
+            ld = "ld"
+        else:
+            ld = "ld.lld" if arg == "1" else "ld.lld" + arg if arg.startswith("-") else arg + "ld.lld"
+    full = ld if os.sep in ld else (which(ld, path=path) or ld)
+    rows.append(("linker", "%s  (%s)" % (full, banner([full, "-v"]))))
+    py = tc.get("python") or which("python3", path=path) or "python3"
+    rows.append(("python3", "%s  (%s)" % (py, banner([py, "--version"]))))
+    mk = which("make", path=path) or "make"
+    rows.append(("make", "%s  (%s)" % (mk, banner([mk, "--version"]))))
+    cxx = tc.get("cxx", "")
+    full = cxx if os.sep in cxx else (which(cxx, path=path) or "") if cxx else ""
+    rows.append(("c++ (host)", "%s  (%s)" % (full, banner([full, "--version"])) if full else
+                 "NONE FOUND -- GCC plugins and xconfig cannot be built"))
+    if tc.get("cxx_note"):
+        rows.append(("", tc["cxx_note"]))
+    if tc.get("ccache"):
+        rows.append(("ccache", "on"))
+    tc["_ld"], tc["_python"] = full, py
+    return rows
+
+
+REQ_RELEVANT = ("bash", "bc", "bindgen", "binutils", "bison", "Clang/LLVM", "flex", "GNU awk",
+                "GNU C", "GNU make", "GNU tar", "kmod", "openssl", "pahole", "Python", "Rust")
+
+
+def parse_requirements(text):
+    """The 'Current Minimal Requirements' table in a tree's own
+    Documentation/process/changes.rst -> [(program, minimum, check command)].
+    The tree says what IT needs; nothing here hardcodes a version."""
+    rows, rulers = [], 0
+    for line in text.splitlines():
+        if re.match(r"^=+\s+=+\s+=+\s*$", line):
+            rulers += 1
+            if rulers == 3:
+                break
+        elif rulers == 2:
+            parts = re.split(r"\s{2,}", line.strip(), maxsplit=2)
+            if len(parts) == 3:
+                rows.append(tuple(parts))
+    return rows
+
+
+def check_tree_requirements(tree, tc, verbose=False, need_pahole=True):
+    """-> number of blocking problems.  Checks the tools that were CHOSEN --
+    this compiler, this ld, this python -- not whatever answers to `gcc`."""
+    rows = parse_requirements(read_text(os.path.join(tree, "Documentation/process/changes.rst")))
+    if not rows:
+        return 0
+    if "_ld" not in tc:
+        describe_tools(tc)
+    env = scrubbed_env(tc.get("extra_path"))
+    problems, fine, absent = 0, [], []
+    for prog, minimum, cmd in rows:
+        if not prog.startswith(REQ_RELEVANT):
+            continue                      # e2fsprogs, GRUB, iptables: runtime, not build
+        optional = "(optional)" in prog
+        name = prog.replace("(optional)", "").strip()
+        if name == "pahole" and not need_pahole:
+            optional = True               # --debug-info off: kbuild never runs it
+        argv = shlex.split(cmd.split("||")[0])
+        if name == "GNU C":
+            if tc["kind"] != "gcc":
+                continue
+            argv = [tc["path"], "--version"]
+        elif name == "Clang/LLVM":
+            if tc["kind"] != "clang":
+                continue
+            argv, optional = [tc["path"], "--version"], False
+        elif name == "binutils":
+            if "lld" in os.path.basename(tc["_ld"]):
+                continue                  # LLD answers to the Clang/LLVM row
+            argv = [tc["_ld"], "-v"]
+        elif name == "Python":
+            argv = [tc["_python"], "--version"]
+        try:
+            o = run(argv, check=False, env=env, timeout=20)
+            have = numver(o.stdout or "") if o.returncode == 0 else ()
+        except ToolError:
+            have = ()
+        need = numver(minimum)
+        if not have:
+            if optional:
+                absent.append(name)
+            else:
+                problems += 1
+                bad("%s: not found (this tree needs >= %s; checked with `%s`)"
+                    % (name, minimum, " ".join(argv)))
+        elif not ver_ge(have, need):
+            if optional:
+                absent.append("%s (%s < %s)" % (name, vstr(have), minimum))
+            else:
+                problems += 1
+                bad("%s %s is too old: this tree needs >= %s  (`%s`)"
+                    % (name, vstr(have), minimum, " ".join(argv)))
+        else:
+            fine.append("%s %s" % (name, vstr(have)))
+            if verbose:
+                ok("%-20s %-10s (needs >= %s)" % (name, vstr(have), minimum))
+    if fine and not verbose:
+        ok("%d build tools meet this tree's own minimums (changes.rst)" % len(fine))
+    if absent:
+        note("optional, not available: %s" % ", ".join(absent))
+    return problems
+
+
+COMPRESSORS = (("KERNEL_GZIP", "gzip"), ("KERNEL_BZIP2", "bzip2"), ("KERNEL_LZMA", "lzma"),
+               ("KERNEL_XZ", "xz"), ("KERNEL_LZO", "lzop"), ("KERNEL_LZ4", "lz4"),
+               ("KERNEL_ZSTD", "zstd"), ("MODULE_COMPRESS_GZIP", "gzip"),
+               ("MODULE_COMPRESS_XZ", "xz"), ("MODULE_COMPRESS_ZSTD", "zstd"))
+
+
+def check_compressors(cfg, path):
+    """The config picks how the image and the modules are compressed; the binary
+    has to exist.  Found here, this costs a second.  Found by the build, it is
+    the very last step, after every object has been compiled."""
+    missing = [(sym, tool) for sym, tool in COMPRESSORS
+               if cfg.get(sym) == "y" and not which(tool, path=path)]
+    for sym, tool in missing:
+        bad("CONFIG_%s=y, but there is no `%s` on this machine" % (sym, tool))
+    return len(missing)
+
+
+HOLD = ".config.elkt-hold"
+HOLD_NONE = ".config.elkt-hold.none"
+STAGING = ".config.elkt-staging"
+
+
+def lsmod_file(path, root="/"):
+    with open(path, "w") as f:
+        f.write("Module                  Size  Used by\n")
+        for line in read_text(rp(root, "proc/modules")).splitlines():
+            p = line.split()
+            if len(p) >= 3:
+                f.write("%-23s %s  %s\n" % (p[0], p[1], p[2]))
+
+
+def recover_held_config(tree):
+    """Undo whatever a run killed inside trim_to_loaded() left behind.  Called
+    before ANYTHING reads, backs up or cleans the tree's .config."""
+    real = os.path.join(tree, ".config")
+    hold, none = os.path.join(tree, HOLD), os.path.join(tree, HOLD_NONE)
+    if os.path.exists(hold):
+        os.replace(hold, real)
+        note("restored the .config an interrupted run had set aside")
+    elif os.path.exists(none) and os.path.exists(real):
+        # That run had NO .config of its own: what sits there is its unverified
+        # staging copy, and `auto` would adopt it as the user's.
+        os.unlink(real)
+        note("removed an unverified .config left by an interrupted run")
+    if os.path.exists(none):
+        os.unlink(none)
+
+
+def trim_to_loaded(mk, staging):
+    """`make localmodconfig` against the staged config.  That target hardcodes
+    '.config' (streamline_config.pl ignores KCONFIG_CONFIG), so the tree's real
+    .config is held aside for the duration and put back in a finally -- and a
+    marker says so when there was none, for the kill the finally never sees."""
+    tree = mk.tree
+    real, hold = os.path.join(tree, ".config"), os.path.join(tree, HOLD)
+    none = os.path.join(tree, HOLD_NONE)
+    lsmod = os.path.join(tree, ".elkt-lsmod")
+    had = os.path.exists(real)
+    if had:
+        os.replace(real, hold)
+    else:
+        open(none, "w").close()
+    try:
+        shutil.copyfile(staging, real)
+        lsmod_file(lsmod)
+        # oldconfig underneath asks about every new symbol; feed it Enters.
+        mk.call(["localmodconfig"], extra_env={"LSMOD": lsmod}, stdin_data="\n" * 20000)
+        os.replace(real, staging)
+    finally:
+        if os.path.exists(lsmod):
+            os.unlink(lsmod)
+        if had:
+            os.replace(hold, real)
+        else:
+            if os.path.exists(real):
+                os.unlink(real)
+            os.unlink(none)
+
+
+def configure(tree, opts, machine, mk, vendors):
+    """Everything happens in a STAGING file via KCONFIG_CONFIG.  The tree's
+    .config is replaced only by a config that passed verification, so a failed
+    run leaves nothing behind for the next run to adopt as 'the user's'."""
+    recover_held_config(tree)
+    staging = os.path.join(tree, STAGING)
+    kenv = {"KCONFIG_CONFIG": STAGING}
+    kind, path, label = find_base_config(tree, opts["config_base"],
+                                         target_series=series_of(mk.value("kernelversion")),
+                                         skip_own=opts.get("_skip_own", False),
+                                         want_full=opts["modules"] == "full")
+    info("base        : %s" % label)
+    if kind == "defconfig":
+        if os.path.exists(staging):
+            os.unlink(staging)
+        mk.call(["defconfig"], extra_env=kenv)
+    elif kind == "gz":
+        with gzip.open(path, "rb") as src, open(staging, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    else:
+        shutil.copyfile(path, staging)
+    if not DotConfig(staging).valid():
+        raise ToolError("the base config %s has no CONFIG_ lines in it" % label)
+
+    mk.call(["olddefconfig"], extra_env=kenv)
+    before = DotConfig(staging)
+    if opts["modules"] == "trimmed":
+        trim_to_loaded(mk, staging)
+        after = DotConfig(staging)
+        info("trimmed     : %d -> %d modules (to what is loaded now)"
+             % (before.count("m"), after.count("m")))
+
+    symbols = kconfig_symbols(tree, machine["arch"])
+    disk, unknown = disk_requests(tree, machine)
+    if disk:
+        info("disk path   : %s" % ", ".join("%s (%s)" % (s, m) for s, m, _ in disk))
+    for u in unknown:
+        note("no single option of this tree builds %s -- not enforced" % u)
+    reqs = build_requests(opts, vendors, machine, disk, DotConfig(staging))
+    results = []
+    for attempt in (1, 2):
+        cfg = DotConfig(staging)
+        for r in reqs:
+            if r.sym in symbols:
+                cfg.set(r.sym, r.rendered(cfg.get(r.sym), attempt))
+        cfg.write()
+        mk.call(["olddefconfig"], extra_env=kenv)
+        results = verify_requests(DotConfig(staging), reqs, symbols)
+        # A second pass catches a symbol whose prompt only became visible once
+        # the first pass had switched its dependency on.
+        if all(s == "ok" or s == "absent" for _, _, s in results):
+            break
+    return staging, reqs, results, symbols
+
+
+def report_verify(results):
+    fails, seen = 0, set()
+    for r, got, status in results:
+        if (r.sym, status) in seen:
+            continue                 # asked twice (a disk driver that is in the rescue set too)
+        seen.add((r.sym, status))
+        shown = "CONFIG_%-28s" % r.sym
+        gots = "<absent>" if got is None else got
+        if status == "ok":
+            if r.want != "n" and r.level != "optional":
+                ok("%s = %s" % (shown, gots if r.want == "m|y" else r.shown() or '""'))
+        elif status == "absent":
+            if r.want != "n":
+                note("%s not in this kernel version%s"
+                     % (shown, "  (%s)" % r.why if r.why else ""))
+        elif status == "fail":
+            fails += 1
+            bad("%s want %s, got %s%s" % (shown, r.shown() or '""', gots,
+                                          "  -- " + r.why if r.why else ""))
+        elif status == "warn":
+            warn("CONFIG_%s: wanted %s, got %s%s"
+                 % (r.sym, r.shown() or '""', gots, "  (%s)" % r.why if r.why else ""))
+        elif r.want != "n":
+            note("%s wanted %s, got %s" % (shown, r.shown(), gots))
+    return fails
+
+
+def drop_staging_litter(staging):
+    for extra in (staging + ".old", staging + ".tmp"):
+        if os.path.exists(extra):
+            os.unlink(extra)
+
+
+def commit_config(tree, staging):
+    real = os.path.join(tree, ".config")
+    if os.path.exists(real):
+        shutil.copy2(real, os.path.join(tree, ".config.elkt-prev"))
+    os.replace(staging, real)
+    drop_staging_litter(staging)
+
+
+# ------------------------------------------------------------------------- state
+
+def state_dir(opts):
+    d = os.path.abspath(os.path.expanduser(opts.get("state_dir") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or "~/.local/state", TOOL)))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+class State(object):
+    """One INI section per SOURCE TREE, flushed whole and atomically on every
+    change, so the record survives the kill -9 it exists to detect."""
+
+    def __init__(self, path):
+        self.path = path
+        self.cp = configparser.RawConfigParser()
+        self.cp.optionxform = str
+        if os.path.isfile(path):
+            try:
+                self.cp.read(path)
+            except configparser.Error:
+                warn("%s is unreadable -- starting a fresh state file" % path)
+                self.cp = configparser.RawConfigParser()
+
+    def get(self, tree):
+        return dict(self.cp.items(tree)) if self.cp.has_section(tree) else {}
+
+    def trees(self):
+        return self.cp.sections()
+
+    def update(self, tree, **kv):
+        # Lock, RE-READ, apply, write.  Flushing the snapshot taken at start-up
+        # would let a second instance, building another tree, write 'building'
+        # back over this tree's 'built' -- and the next run would mrproper it.
+        with open(self.path + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fresh = configparser.RawConfigParser()
+            fresh.optionxform = str
+            try:
+                fresh.read(self.path)
+            except configparser.Error:
+                fresh = configparser.RawConfigParser()
+                fresh.optionxform = str
+            if not fresh.has_section(tree):
+                fresh.add_section(tree)
+            for k, v in kv.items():
+                fresh.set(tree, k, str(v))
+            tmp = "%s.tmp.%d" % (self.path, os.getpid())
+            with open(tmp, "w") as f:
+                f.write("# %s -- build state, one [section] per source tree.  "
+                        "Safe to delete.\n" % TOOL)
+                fresh.write(f)
+            os.replace(tmp, self.path)
+            self.cp = fresh
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+_TREE_LOCKS = []
+
+
+def lock_tree(tree):
+    """One instance per tree, for the life of the process.  The state file cannot
+    tell a LIVE 'building' from a run that was killed -- it records no pid -- so
+    without this a second `build` on a tree that is compiling reads the live
+    record as a kill -9 and runs mrproper under the running make.  A flock dies
+    with its process: there is no stale lock to clean up."""
+    if os.environ.get("ELKT_TREE_LOCKED"):
+        return              # the `sign` a tree's own GNUmakefile runs, under `package`
+    try:
+        f = open(os.path.join(tree, ".elkt-lock"), "a")
+    except (OSError, IOError):
+        return              # a tree we cannot write to is not one we will build in
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        f.close()
+        raise ToolError("another %s is working in %s right now -- wait for it, or use "
+                        "another tree (--workdir)" % (TOOL, tree))
+    _TREE_LOCKS.append(f)
+
+
+def serving_conflict(tree, serving, localversion, cc_version):
+    """'' or why building THIS in a tree that serves installed kernels would
+    break them.  /lib/modules/<rel>/build is what DKMS and every vendor
+    installer compile against: a different LOCALVERSION there gives their
+    modules the wrong vermagic, a different compiler gives the wrong flags --
+    for a kernel that may be the default boot entry.  The protection used to
+    stop at mrproper."""
+    if not serving:
+        return ""
+    cfg = DotConfig(os.path.join(tree, ".config"))
+    was_lv, was_cc = cfg.get("LOCALVERSION"), cfg.get("CC_VERSION_TEXT")
+    diff = []
+    if was_lv is not None and was_lv.strip('"') != localversion:
+        diff.append("LOCALVERSION %s -> %s" % (was_lv.strip('"') or "(none)", localversion or "(none)"))
+    if was_cc and cc_version and was_cc.strip('"') != cc_version:
+        diff.append("compiler %s -> %s" % (was_cc.strip('"')[:40], cc_version[:40]))
+    if not diff:
+        return ""
+    return ("this tree is the build directory of installed kernel(s) %s, and this run would "
+            "turn it into a different kernel (%s).\n  Their /lib/modules/<release>/build would "
+            "then describe the wrong kernel, and DKMS or a vendor installer would build modules "
+            "they refuse to load.\n  Build this one in its own tree:  --workdir <another "
+            "directory>   (or --clean force, if those kernels are going away)"
+            % (", ".join(serving), "; ".join(diff)))
+
+
+def in_service(tree, root="/"):
+    """Releases whose /lib/modules/<rel>/build is THIS tree.  DKMS compiles
+    against that link; mrproper here breaks every out-of-tree build for an
+    installed -- possibly the running -- kernel until a rebuild succeeds."""
+    rels = []
+    for link in glob.glob(rp(root, "lib/modules/*/build")):
+        if os.path.realpath(link) == os.path.realpath(tree):
+            rels.append(os.path.basename(os.path.dirname(link)))
+    return sorted(rels)
+
+
+def decide_clean(mode, has_objects, status, stage, serving):
+    """-> (clean?, why).  Raises when asked to clean a tree that is in service.
+
+    auto cleans in exactly one case: a run that recorded 'building' and never
+    recorded an end -- kill -9, OOM, power loss -- where make had no chance to
+    delete a half-written object.  A failure we SAW (compile error, ^C) left
+    the tree consistent; make removes its partial target and kbuild's .cmd
+    files decide the rest, so the retry is incremental.  And a failure AFTER
+    the build -- a sudo prompt that timed out overnight -- says nothing about
+    the tree at all; the old script answered it with mrproper."""
+    if mode not in ("auto", "always", "never", "force"):
+        raise ToolError("--clean must be auto, always, never or force")
+    if mode == "never":
+        return False, "--clean never"
+    if not has_objects and mode == "auto":
+        return False, "no object files present -- nothing to clean"
+    want, why = False, ""
+    if mode in ("always", "force"):
+        want, why = True, "--clean " + mode
+    elif status == "building":
+        want, why = True, ("the last run recorded 'building' and never recorded an "
+                           "end (kill -9, OOM or power loss)")
+    elif status == "configuring":
+        return False, "the last run died while configuring; no object was touched"
+    elif status == "failed":
+        return False, ("the last run failed at stage '%s' where make could tidy up; "
+                       "retrying incrementally" % (stage or "?"))
+    elif status in ("built", "installing", "installed", "configured"):
+        return False, "the last run finished cleanly (%s); incremental is correct" % status
+    else:
+        return False, "objects present, no record of them -- building incrementally"
+    if want and serving and mode != "force":
+        msg = ("this tree is the DKMS build directory of installed kernel(s) %s; "
+               "cleaning it would break out-of-tree module builds for them"
+               % ", ".join(serving))
+        if mode == "always":
+            raise ToolError(msg + ".\n  Use --clean force if that is really intended.")
+        return False, msg + " -- NOT cleaning"
+    return want, why
+
+
+def clean_tree(mk, tree, restore=True):
+    """mrproper, without losing the configuration to it."""
+    real = os.path.join(tree, ".config")
+    keepas = None
+    if os.path.isfile(real):
+        # The FIRST backup keeps the plain name: by the second clean .config
+        # may no longer be the user's original.
+        keepas = os.path.join(tree, ".config.before-clean")
+        if os.path.exists(keepas):
+            keepas += "." + time.strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(real, keepas)
+        info("saved       : .config -> %s" % os.path.basename(keepas))
+    try:
+        mk.call(["mrproper"])
+    finally:
+        # Cleaning is about build PRODUCTS; mrproper deleting .config is
+        # incidental.  Restore the copy made a moment ago -- by ITS name, not the
+        # fixed one, which on a second clean is an OLDER config -- and in a
+        # finally, so an interrupted mrproper does not lose it either.
+        if keepas and restore and not os.path.exists(real):
+            shutil.copy2(keepas, real)
+
+
+# ------------------------------------------------------------------------- build
+
+STEP = re.compile(r"^\s{2}([A-Z][A-Z0-9_.]*(?: \[M\])?)\s+(\S+)")
+# 'error:' with the colon -- the bare word is also a file name (linux/can/error.h
+# goes past twice in every build).
+ERRORISH = re.compile(r"(\berror:|\*\*\* |undefined reference|No rule to make target|"
+                      r"No space left|Permission denied|cannot find -l|Killed\b)")
+
+
+def error_summary(log_path, limit=12):
+    """The FIRST real errors.  The tail of a -j24 build is twenty-three other
+    jobs finishing; the line that matters is hundreds above it."""
+    hits = []
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                if ERRORISH.search(line) and "warning:" not in line:
+                    hits.append("%7d: %s" % (n, line.rstrip()))
+                    if len(hits) >= limit:
+                        break
+    except OSError:
+        pass
+    return hits
+
+
+def fit_line(text, cols=None):
+    """A line redrawn with \\r has to fit on ONE terminal row.  \\r returns to the
+    start of the LAST wrapped row only, so a longer line leaves a copy of itself
+    behind on every redraw -- a hundred-character status in an 80-column
+    terminal scrolled the whole build past as thousands of fragments."""
+    cols = cols or shutil.get_terminal_size((80, 24)).columns
+    return text[:max(cols - 1, 20)]
+
+
+def run_build(mk, log_path, verbose=False, targets=(), extra_env=None):
+    if os.path.exists(log_path):
+        os.replace(log_path, log_path + ".prev")
+    started = time.time()
+    steps = warnings = shown_warn = 0
+    last, beat, drawn = "", started, 0.0
+    env = dict(mk.env)
+    env.update(extra_env or {})
+    proc = subprocess.Popen(mk.argv(list(targets), parallel=True), cwd=mk.tree, env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, universal_newlines=True,
+                            errors="replace", bufsize=1)
+
+    def status_line():
+        el = int(time.time() - started)
+        return fit_line("  [%02d:%02d:%02d] %6d steps  %s" % (el // 3600, el // 60 % 60,
+                                                             el % 60, steps, last))
+    try:
+        with open(log_path, "w") as log:
+            for line in proc.stdout:
+                log.write(line)
+                text = line.rstrip("\n")
+                m = STEP.match(text)
+                if m:
+                    steps += 1
+                    last = "%s %s" % (m.group(1), m.group(2))
+                if verbose:
+                    out(text)
+                    continue
+                important = False
+                if "warning:" in text:
+                    warnings += 1
+                    shown_warn += 1
+                    important = shown_warn <= 15
+                    if shown_warn == 16:
+                        text, important = "  (further warnings go to the log only)", True
+                elif ERRORISH.search(text) or text.startswith("Kernel:"):
+                    important = True
+                if important:
+                    if UI.tty:
+                        sys.stdout.write("\r\033[K")
+                    out(text)
+                if UI.tty:
+                    if important or time.time() - drawn >= 0.1:    # ten redraws a second is plenty
+                        drawn = time.time()
+                        sys.stdout.write("\r\033[K" + status_line())
+                        sys.stdout.flush()
+                elif time.time() - beat >= 120:
+                    beat = time.time()
+                    out(status_line())
+        rc = proc.wait()
+    except BaseException:
+        # ^C reached make too (same process group); SIGTERM, SIGHUP and our own
+        # errors (disk full on the log) did not.  Ask it to stop -- make removes
+        # its partial targets on SIGTERM -- and KEEP DRAINING the pipe, or its
+        # parting output blocks it until the timeout.
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=60)
+        except (subprocess.TimeoutExpired, ValueError):
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        if UI.tty:
+            sys.stdout.write("\r\033[K")
+    return rc, {"steps": steps, "warnings": warnings, "seconds": int(time.time() - started)}
+
+
+def module_names(path):
+    names = set()
+    for line in read_text(path).splitlines():
+        base = os.path.basename(line.strip())
+        if base:
+            names.add(re.sub(r"\.(ko|o)(\.\w+)?$", "", base).replace("-", "_"))
+    return names
+
+
+def module_coverage(tree, root="/"):
+    """Every module loaded on this machine now, checked against what the build
+    produced (as .ko or built-in).  The general form of 'will this boot HERE':
+    it would have caught a defconfig kernel with no XFS before any reboot did."""
+    built = module_names(os.path.join(tree, "modules.order")) | \
+        module_names(os.path.join(tree, "modules.builtin"))
+    missing, oot = [], []
+    for line in read_text(rp(root, "proc/modules")).splitlines():
+        name = line.split()[0] if line.split() else ""
+        if not name or name in built:
+            continue
+        taint = read_text(rp(root, "sys/module/%s/taint" % name)).strip()
+        (oot if "O" in taint or "E" in taint else missing).append(name)
+    loaded = len(read_text(rp(root, "proc/modules")).splitlines())
+    return {"loaded": loaded, "missing": sorted(missing), "out_of_tree": sorted(oot)}
+
+
+OOT_C = """#include <linux/module.h>
+#include <linux/init.h>
+static int __init elkt_probe_init(void) { return 0; }
+static void __exit elkt_probe_exit(void) { }
+module_init(elkt_probe_init);
+module_exit(elkt_probe_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("enterprise_linux_kernel_tool out-of-tree build probe");
+"""
+
+
+def oot_probe(tree, env, make_args, jobs=4):
+    """Compile a ten-line module against the tree, the way DKMS will: through
+    `make -C <tree> M=<dir>`.  -> (ok, vermagic or the failing output)."""
+    # kbuild rejects M= paths with spaces, colons or %; $TMPDIR may have them,
+    # and a refusal here would read as "DKMS will not compile".
+    base = None if not re.search(r"[\s:%]", tempfile.gettempdir()) else "/tmp"
+    d = tempfile.mkdtemp(prefix="elkt-oot-", dir=base)
+    try:
+        with open(os.path.join(d, "elkt_probe.c"), "w") as f:
+            f.write(OOT_C)
+        with open(os.path.join(d, "Makefile"), "w") as f:
+            f.write("obj-m := elkt_probe.o\n")
+        p = run(["make", "-j%d" % jobs, "-C", tree, "M=" + d] + list(make_args) + ["modules"],
+                env=env, check=False, timeout=900)
+        ko = os.path.join(d, "elkt_probe.ko")
+        if p.returncode != 0 or not os.path.isfile(ko):
+            lines = [l for l in (p.stdout or "").splitlines() if l.strip()]
+            return False, "\n".join(lines[-12:])
+        vm = ""
+        modinfo = which("modinfo", path=":".join(SYSTEM_PATH))
+        if modinfo:
+            vm = (run([modinfo, "-F", "vermagic", ko], check=False).stdout or "").strip()
+        return True, vm
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def dkms_make_args(tree, dkms_script=None):
+    """What THIS machine's dkms adds to its make command for this tree: None
+    without dkms, [] for an older one.  dkms 3.x reads the kernel's config and,
+    for a clang-built kernel, appends LLVM=1 -- so it builds with the clang on
+    ROOT's PATH, which need not be the clang that built the kernel."""
+    script = dkms_script or which("dkms", path=":".join(SYSTEM_PATH))
+    if not script:
+        return None
+    if "CONFIG_CC_IS_CLANG" in read_text(script) and \
+            DotConfig(os.path.join(tree, ".config")).get("CC_IS_CLANG") == "y":
+        return ["LLVM=1"]
+    return []
+
+
+def dkms_check(tree, toolchain, machine, release=""):
+    """Two questions, kept apart.  Will DKMS compile against this tree -- run
+    the way THIS dkms runs it?  And will a PLAIN `make -C <tree> M=...`, which
+    is how Intel's sep5, VirtualBox and vendor installers build?  -> False only
+    when something on this machine actually NEEDS the one that fails: a DKMS
+    module that will be built for this release, or an out-of-tree module loaded
+    right now.  A deliberate choice of compiler is not an error by itself."""
+    say("Out-of-tree (DKMS) build check")
+    if not os.path.isfile(os.path.join(tree, "Module.symvers")):
+        note("Module.symvers is missing -- the tree is not fully built; modpost "
+             "will complain, the compile itself is still a fair test")
+    pin = read_text(os.path.join(tree, PIN_FILE))
+    if pin.startswith(PIN_MARK):
+        if "\noverride " in pin or "\nexport PATH" in pin:
+            note("this tree pins its toolchain (%s): whatever a caller passes, builds "
+                 "through it use %s" % (PIN_FILE, toolchain["path"]))
+        m = re.search(r"^export KCFLAGS := (.*)$", pin, re.M)
+        if m:
+            note("this tree hands its CPU flags to builds that set none (%s): KCFLAGS=%s"
+                 % (PIN_FILE, m.group(1)))
+    env = dkms_env(machine["pkg_manager"])
+    extra = dkms_make_args(tree)
+    plain_ok, plain_out = oot_probe(tree, env, [])
+    dkms_ok, dkms_out = oot_probe(tree, env, extra) if extra else (plain_ok, plain_out)
+    will_build = [m for m in machine.get("dkms", [])
+                  if release and dkms_will_build(m["limits"], release)[0]]
+    loaded_oot = module_coverage(tree)["out_of_tree"]
+    needed = bool(will_build or loaded_oot)
+    how = ("dkms here adds %s for a clang-built kernel: ROOT's clang, not necessarily yours"
+           % " ".join(extra)) if extra else "root's PATH, system compiler"
+
+    def show(text):
+        for l in text.splitlines():
+            if "error" in l.lower() or "***" in l or "You are using" in l:
+                info("     | " + l.strip()[:150])
+
+    if extra is None:
+        note("no dkms on this machine")
+    elif dkms_ok:
+        ok("a module compiles the way dkms will run it  (%s)" % how)
+        if release and dkms_out and not dkms_out.startswith(release + " "):
+            warn("vermagic '%s' does not start with %s" % (dkms_out, release))
+    else:
+        (bad if needed else warn)("a module does NOT compile the way dkms will run it  (%s):" % how)
+        show(dkms_out)
+    if plain_ok:
+        if extra is None or extra:
+            ok("a plain `make -C <tree> M=...` compiles too")
+    else:
+        warn("a PLAIN out-of-tree build fails -- `make -C /lib/modules/%s/build M=...`, the way "
+             "Intel's sep5, VirtualBox and vendor installers build.  It runs gcc against a "
+             "kernel built by %s:" % (release or "<release>", toolchain["kind"]))
+        show(plain_out)
+    if not (dkms_ok and plain_ok) and toolchain["args"]:
+        good2, _ = oot_probe(tree, scrubbed_env(toolchain.get("extra_path")), toolchain["args"])
+        if good2:
+            envargs = [shlex.quote(a) for a in toolchain["args"]
+                       if a.startswith(("CC=", "LLVM=", "LD="))]
+            if toolchain.get("extra_path"):
+                envargs.insert(0, shlex.quote("PATH=%s:/usr/sbin:/usr/bin" % toolchain["extra_path"]))
+            info("The kernel is fine: the probe compiles with its own toolchain.  Put it in the")
+            info("environment of whatever builds the module -- kbuild reads it from there:")
+            info("    sudo env %s <the build command, e.g. dkms autoinstall -k %s>"
+                 % (" ".join(envargs), release or "<release>"))
+    if not needed and not (dkms_ok and plain_ok):
+        note("nothing here needs it today -- no DKMS module will be built for %s and no "
+             "out-of-tree module is loaded -- so this does not block an install"
+             % (release or "this kernel"))
+    elif needed and not dkms_ok:
+        bad("needed by: %s" % ", ".join(["%s/%s" % (m["name"], m["version"]) for m in will_build]
+                                        + loaded_oot))
+    for m in machine.get("dkms", []):
+        if not release:
+            continue
+        will, why = dkms_will_build(m["limits"], release)
+        label = "%s/%s" % (m["name"], m["version"])
+        if not will:
+            note("%s: DKMS will skip %s cleanly (%s)" % (label, release, why))
+            if m["name"] == "amdgpu":
+                info("     the in-tree amdgpu built here serves the GPU instead")
+        elif m["name"] == "amdgpu":
+            warn("%s has no kernel cap: DKMS will try to build it for %s.  Vendor "
+                 "amdgpu-dkms targets older enterprise kernels; against a newer one "
+                 "it usually fails, noisily but harmlessly -- the in-tree driver is "
+                 "the newer of the two.  To make DKMS skip it:\n"
+                 "      echo 'BUILD_EXCLUSIVE_KERNEL_MAX=\"%s.999\"' | sudo tee -a "
+                 "/usr/src/%s-%s/dkms.conf\n"
+                 "  (DKMS skips kernels that sort ABOVE the cap, and 6.12.5 sorts above "
+                 "'6.12' -- hence .999, to keep every release of the series it works on.)"
+                 % (label, release,
+                    series_of(max([k for k, _ in m["kernels"]] or [machine["running"]],
+                                  key=version_key)), m["name"], m["version"]))
+        else:
+            note("%s: DKMS will rebuild it for %s at install time" % (label, release))
+    return dkms_ok or not needed
+
+
+def post_build_checks(tree, toolchain, machine, vendors, release):
+    say("Post-build checks")
+    problems = 0
+    ok("kernel release: %s" % release)
+    cov = module_coverage(tree)
+    if cov["missing"]:
+        share = 100.0 * len(cov["missing"]) / max(cov["loaded"], 1)
+        warn("%d of the %d modules loaded right now have no counterpart in this build:\n"
+             "      %s%s" % (len(cov["missing"]), cov["loaded"],
+                             " ".join(cov["missing"][:24]),
+                             " ..." if len(cov["missing"]) > 24 else ""))
+        if share > 25:
+            bad("that is %.0f%% of them -- this config was not made for this machine" % share)
+            problems += 1
+    else:
+        ok("all %d modules loaded right now exist in this build" % cov["loaded"])
+    if cov["out_of_tree"]:
+        note("out-of-tree modules loaded now (DKMS must rebuild them): %s"
+             % " ".join(cov["out_of_tree"]))
+    tcfg = DotConfig(os.path.join(tree, ".config"))
+    if tcfg.get("DEBUG_INFO_BTF") != "y" and tcfg.get("BPF_LSM") == "y":
+        note("BTF is off but BPF_LSM is on: systemd will log 'bpf-restrict-fs: Failed "
+             "to load BPF object' at boot, and bpftrace / CO-RE tools will not run.  "
+             "--debug-info btf fixes that, for a slower build.")
+    built = module_names(os.path.join(tree, "modules.order"))
+    for vendor, mod in (("amd", "amdgpu"), ("nvidia", "nouveau"), ("intel", "i915")):
+        if vendor in vendors:
+            if mod in built:
+                ok("%s built as a module" % mod)
+            else:
+                bad("%s was requested as a module and was not built" % mod)
+                problems += 1
+    if "nvidia" in vendors:
+        show_outlook(nvidia_outlook(machine.get("nvidia"), machine["pkg_manager"], release))
+    if not dkms_check(tree, toolchain, machine, release):
+        problems += 1
+    return problems
+
+
+# ------------------------------------------------------------ the toolchain pin
+
+PIN_FILE = "GNUmakefile"
+PIN_MARK = "# elkt-toolchain-pin"
+PINNED_VARS = ("LLVM", "CC", "LD", "AR", "NM", "OBJCOPY", "OBJDUMP", "READELF", "STRIP",
+               "HOSTCC", "HOSTCXX", "HOSTAR", "HOSTLD")
+
+
+def pin_text(tc, sign=False):
+    """A GNUmakefile that makes THIS TREE build everything that comes through it
+    with the toolchain the kernel was built with -- '' when that is simply the
+    system's.
+
+    GNU make reads GNUmakefile before Makefile.  So `make -C
+    /lib/modules/<rel>/build M=...` -- DKMS, Intel's sep5, VirtualBox, a vendor
+    installer -- lands here first, whatever it passes or forgets to pass.  That
+    is the whole problem with a kernel built by a private clang: root's builds
+    fall back to gcc, or (dkms 3.x, helpfully adding LLVM=1) to root's OLDER
+    clang, and both choke on flags the kernel's config recorded.
+
+    Two things make it stick.  `override` beats a command-line LLVM=1 in this
+    make.  But kbuild immediately re-invokes itself with `-f Makefile`, which
+    does NOT read this file -- so the caller's definitions are taken out of
+    MAKEOVERRIDES and the pinned ones put in, which is how make hands
+    command-line variables down.  ELKT_NO_PIN=1 switches it all off, and it
+    switches itself off where the compiler does not exist (another machine)."""
+    pins = []
+    for a in tc["args"]:
+        k, _, v = a.partition("=")
+        if k in PINNED_VARS:
+            pins.append((k, tc["path"] if k == "CC" and tc.get("ccache") else v))
+    extra = tc.get("extra_path") or ""
+    kcflags = tc.get("kcflags") or ""
+    if not pins and not extra and not sign and not kcflags:
+        return ""
+    esc = lambda v: v.replace("$", "$$")
+    lines = [PIN_MARK + " -- written by %s; safe to delete." % TOOL,
+             "# This tree was built with:  %s" % tc["version"]]
+    if pins or extra:
+        lines += ["# Every build that comes through this directory uses the same toolchain.",
+                  "# Switch off with ELKT_NO_PIN=1 in the environment.",
+                  "ifeq ($(ELKT_NO_PIN),)",
+                  "ifneq ($(wildcard %s),)" % esc(tc["path"]),
+                  # make keeps a command-line value with a blank in it as `CC=ccache\ gcc`
+                  # -- TWO words to filter-out, which took the first and left the second
+                  # behind as a goal of the sub-make ("Nothing to be done for 'gcc'",
+                  # exit 0, nothing built).  Hide escaped blanks while filtering.
+                  "elkt-sp := @@elkt-sp@@",
+                  "MAKEOVERRIDES := $(subst $(elkt-sp),\\ ,$(filter-out $(addsuffix =%%,%s),"
+                  "$(subst \\ ,$(elkt-sp),$(MAKEOVERRIDES))))" % " ".join(PINNED_VARS)]
+    for k, v in pins:
+        lines += ["override %s := %s" % (k, esc(v)), "MAKEOVERRIDES += %s=%s" % (k, esc(v))]
+    # The ones NOT pinned must not arrive from the caller's ENVIRONMENT either: a
+    # shell that exports LLVM= (found on the machine this was written on) would
+    # turn a gcc-built tree's module builds into clang ones.  unexport keeps them
+    # out of the sub-make, where the work happens; kbuild's own defaults apply.
+    if pins or extra:
+        loose = [v for v in PINNED_VARS if v not in [k for k, _ in pins]]
+        lines.append("unexport %s" % " ".join(loose))
+        if extra:
+            lines.append("export PATH := %s:$(PATH)" % esc(extra))
+        lines += ["endif", "endif"]
+    if kcflags:
+        # Not under ELKT_NO_PIN: these are not the caller's business either way.
+        # A make run by hand, or a package build, gets the CPU flags the tree was
+        # built with -- instead of recompiling all of it generic.  A caller's own
+        # KCFLAGS wins; the tool's makes pass theirs explicitly.
+        lines += ["# Built for: KCFLAGS=%s (--cpu)" % kcflags,
+                  "ifeq ($(origin KCFLAGS),undefined)",
+                  "export KCFLAGS := %s" % esc(kcflags),
+                  "endif"]
+    lines.append("include Makefile")
+    if sign:
+        # WHY HERE.  `make binrpm-pkg` / `bindeb-pkg` run a plain, goal-less `make`
+        # in this directory as their build step -- with a NEW build number
+        # (scripts/build-version increments on every call), so vmlinux is relinked
+        # and bzImage rewritten: a signature put there beforehand is gone, and the
+        # package ships an UNSIGNED kernel.  Measured, not assumed.  So the
+        # goal-less make itself ends by signing.  Builds with a goal, and
+        # out-of-tree builds (M=), are left exactly as they were.
+        tool = esc(os.path.abspath(__file__))
+        lines += ["# Secure Boot: a goal-less `make` here ends by signing the image again.",
+                  "ifeq ($(KBUILD_EXTMOD)$(M)$(MAKECMDGOALS)$(ELKT_NO_SIGN),)",
+                  "ifneq ($(wildcard %s),)" % tool,
+                  ".DEFAULT_GOAL := elkt-all",
+                  ".PHONY: elkt-all",
+                  "elkt-all: __all",
+                  "\t@ELKT_HOOK=1 %s -I %s sign --source $(CURDIR)" % (PLATFORM_PYTHON, tool),
+                  "endif", "endif"]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def pin_toolchain(tree, tc, sign=False):
+    """Write, refresh or REMOVE the pin -- on every build, because a stale pin
+    would quietly overrule the compiler chosen this time.  -> True when pinned."""
+    path = os.path.join(tree, PIN_FILE)
+    ours = os.path.isfile(path) and read_text(path).startswith(PIN_MARK)
+    if os.path.exists(path) and not ours:
+        warn("%s exists and is not ours -- leaving it alone; the toolchain is NOT pinned" % path)
+        return False
+    text = pin_text(tc, sign)
+    if not text:
+        if ours:
+            os.unlink(path)
+        return False
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+# ------------------------------------------------------------------- secure boot
+
+def keys_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                        TOOL, "keys")
+
+
+def signing_key(create=True):
+    """YOUR Secure Boot key: made once, kept, used for every image.  Persistent on
+    purpose -- a machine enrols a CERTIFICATE in MOK once, and everything signed
+    by that key boots on it afterwards.  That is also what you hand out with a
+    kernel other people download: the .der, never the .key.
+    RSA 2048 / SHA-256, as the distro and Microsoft Secure Boot certificates are:
+    shim takes larger keys, some firmware does not."""
+    base = os.path.join(keys_dir(), "secureboot")
+    k = {"key": base + ".key", "crt": base + ".crt", "der": base + ".der"}
+    if all(os.path.isfile(v) for v in k.values()):
+        return k
+    if os.path.isfile(k["key"]):
+        # NEVER make a new key over an existing one: machines have enrolled its
+        # certificate, and the old key would be gone for good.  A missing .der
+        # (moved to a USB stick to enrol it elsewhere) is derived again; a
+        # missing .crt is for the owner to restore -- a new certificate for the
+        # old key would not be the one those machines trust.
+        if not os.path.isfile(k["crt"]):
+            raise ToolError("%s exists but %s does not.  Restore the certificate from your "
+                            "backup -- not making a new key over the one machines already "
+                            "trust.  (To really start again, move the .key away first.)"
+                            % (k["key"], k["crt"]))
+        run(["openssl", "x509", "-in", k["crt"], "-outform", "DER", "-out", k["der"]],
+            env=scrubbed_env())
+        os.chmod(k["der"], 0o644)
+        note("%s was missing -- derived again from the certificate" % k["der"])
+        return k
+    if not create:
+        return None
+    os.makedirs(keys_dir(), exist_ok=True)
+    os.chmod(keys_dir(), 0o700)
+    who = re.sub(r"[^\w@.-]", "_", "%s@%s" % (os.environ.get("USER", "builder"),
+                                              os.uname().nodename))[:44]      # CN <= 64 in all
+    old = os.umask(0o077)
+    try:
+        run(["openssl", "req", "-new", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+             "-days", "3650", "-subj", "/CN=%s kernel signing key/" % who,
+             "-addext", "basicConstraints=critical,CA:FALSE",
+             "-addext", "keyUsage=critical,digitalSignature",
+             "-addext", "extendedKeyUsage=codeSigning",
+             "-keyout", k["key"], "-out", k["crt"]], env=scrubbed_env())
+        run(["openssl", "x509", "-in", k["crt"], "-outform", "DER", "-out", k["der"]],
+            env=scrubbed_env())
+    finally:
+        os.umask(old)
+    os.chmod(k["der"], 0o644)
+    os.chmod(k["crt"], 0o644)
+    info("made a Secure Boot signing key: %s  (keep the .key private; back it up)" % k["key"])
+    return k
+
+
+def key_cn(k):
+    o = run(["openssl", "x509", "-in", k["crt"], "-noout", "-subject", "-nameopt", "multiline"],
+            env=scrubbed_env(), check=False).stdout or ""
+    m = re.search(r"commonName\s*=\s*(.+)", o)
+    return m.group(1).strip() if m else ""
+
+
+def image_path(tree, arch=None):
+    arch = arch or os.uname().machine
+    rel = {"x86_64": "arch/x86/boot/bzImage"}.get(arch)
+    return os.path.join(tree, rel) if rel else ""
+
+
+def signing_tools():
+    path = ":".join(SYSTEM_PATH)
+    if which("sbsign", path=path):
+        return "sbsign"
+    if all(which(t, path=path) for t in ("pesign", "certutil", "pk12util", "openssl")):
+        return "pesign"
+    return ""
+
+
+def image_signers(image):
+    path = ":".join(SYSTEM_PATH)
+    if which("pesign", path=path):
+        return run(["pesign", "-S", "-i", image], check=False, env=scrubbed_env()).stdout or ""
+    if which("sbverify", path=path):
+        return run(["sbverify", "--list", image], check=False, env=scrubbed_env()).stdout or ""
+    return ""
+
+
+def _cert_digests(pem):
+    return set(hashlib.sha256(base64.b64decode(b)).hexdigest() for b in re.findall(
+        r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem or "", re.S))
+
+
+def image_signed_by(image, k):
+    """Does IMAGE carry a signature made with k's CERTIFICATE?  Compared by the
+    certificate's SHA-256, not by the name in it: two keys made on one machine
+    have the same CN, and an image signed by the other one is, to shim and to
+    the person who enrolled this .der, not signed at all."""
+    if not (k and image and os.path.isfile(image) and os.path.isfile(k["crt"])):
+        return False
+    ours = _cert_digests(read_text(k["crt"]))
+    if not ours:
+        return False
+    path, env = ":".join(SYSTEM_PATH), scrubbed_env()
+    if which("pesign", path=path) and which("openssl", path=path):
+        d = tempfile.mkdtemp(prefix="elkt-sig-")
+        try:
+            for n in range(8):                       # an image can carry several signatures
+                p7 = os.path.join(d, "sig%d.p7" % n)
+                p = run(["pesign", "-i", image, "-u", str(n), "-e", p7], check=False, env=env)
+                if p.returncode != 0 or not os.path.isfile(p7) or not os.path.getsize(p7):
+                    break
+                pem = run(["openssl", "pkcs7", "-inform", "DER", "-in", p7, "-print_certs"],
+                          check=False, env=env).stdout
+                if ours & _cert_digests(pem):
+                    return True
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return False
+    if which("sbverify", path=path):
+        return run(["sbverify", "--cert", k["crt"], image], check=False, env=env).returncode == 0
+    return False
+
+
+def sign_image(tree, k):
+    """-> 'signed' | 'already'.  The signed image REPLACES bzImage (the unsigned
+    one is kept beside it), because `make install` installs that file."""
+    img = image_path(tree)
+    if not img:
+        raise ToolError("image signing is implemented for x86_64 only, so far")
+    if not os.path.isfile(img):
+        raise ToolError("%s does not exist -- build first" % img)
+    if image_signed_by(img, k):
+        return "already"
+    tool = signing_tools()
+    if not tool:
+        raise ToolError("no signing tool: install sbsigntools, or pesign + nss-tools")
+    signed, env = img + ".signed", scrubbed_env()
+    if os.path.exists(signed):
+        os.unlink(signed)
+    if tool == "sbsign":
+        run(["sbsign", "--key", k["key"], "--cert", k["crt"], "--output", signed, img], env=env)
+    else:
+        # pesign signs from an NSS database only: a throw-away one, made for this.
+        db = tempfile.mkdtemp(prefix="elkt-nss-")
+        try:
+            p12 = os.path.join(db, "k.p12")
+            run(["certutil", "-N", "-d", "sql:" + db, "--empty-password"], env=env)
+            run(["openssl", "pkcs12", "-export", "-inkey", k["key"], "-in", k["crt"],
+                 "-name", "elkt", "-out", p12, "-passout", "pass:"], env=env)
+            run(["pk12util", "-d", "sql:" + db, "-i", p12, "-W", ""], env=env)
+            run(["pesign", "-n", "sql:" + db, "-c", "elkt", "-s", "-i", img, "-o", signed], env=env)
+        finally:
+            shutil.rmtree(db, ignore_errors=True)
+    if not image_signed_by(signed, k):
+        raise ToolError("signed %s but cannot find this key's signature in it -- NOT using it" % img)
+    shutil.copy2(img, img + ".unsigned")
+    os.replace(signed, img)
+    return "signed"
+
+
+def mok_enrolled(k):
+    """True / False / None (cannot tell: no mokutil, or not an EFI boot)."""
+    mok = which("mokutil", path=":".join(SYSTEM_PATH))
+    if not mok or not os.path.isdir("/sys/firmware/efi"):
+        return None
+    o = run([mok, "--test-key", k["der"]], check=False, env=scrubbed_env()).stdout or ""
+    return True if "already enrolled" in o else False if "not enrolled" in o else None
+
+
+def secure_boot_sign(tree, machine):
+    say("Secure Boot signing")
+    # Run by a tree's GNUmakefile (under rpmbuild), this must use the key that
+    # exists -- never quietly make another one where a changed environment points.
+    k = signing_key(create=not os.environ.get("ELKT_HOOK"))
+    if not k:
+        raise ToolError("no signing key in %s -- not making one from inside a build" % keys_dir())
+    how = sign_image(tree, k)
+    ok("%s %s with '%s'" % (os.path.relpath(image_path(tree), tree),
+                            "is signed" if how == "signed" else "was already signed", key_cn(k)))
+    enrolled = mok_enrolled(k)
+    if enrolled:
+        ok("that certificate is enrolled in this machine's MOK list")
+    else:
+        note("to boot it with Secure Boot ON, a machine must trust the certificate -- once:")
+        info("       sudo mokutil --import %s      (choose a one-time password)" % k["der"])
+        info("       reboot; in the blue MOK Manager screen: Enroll MOK, that password")
+        info("     Anyone you give this kernel to needs that .der file too -- never the .key.")
+    return k
+
+
+# ----------------------------------------------------------------------- install
+
+class SudoKeepalive(object):
+    """Ask for the password ONCE, up front, and keep the ticket warm.  A prompt
+    that appears at the end of an unattended build times out after five
+    minutes, and the install 'fails' at 3 a.m. for no reason."""
+
+    def __init__(self):
+        self._stop = threading.Event()
+
+    def start(self):
+        if run(["sudo", "-v"], interactive=True, check=False).returncode != 0:
+            raise ToolError("sudo authentication failed")
+        t = threading.Thread(target=self._loop)
+        t.daemon = True
+        t.start()
+
+    def _loop(self):
+        while not self._stop.wait(50):
+            subprocess.call(["sudo", "-n", "-v"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop(self):
+        self._stop.set()
+
+
+def sudo(cmd, check=True, capture=False, dry=False):
+    if dry:
+        info("would run: sudo " + " ".join(shlex.quote(c) for c in cmd))
+        return None
+    return run(["sudo"] + cmd, check=check, capture=capture, interactive=not capture)
+
+
+def install_preflight(machine, opts, release="", tree=""):
+    """Everything that can refuse an install, checked BEFORE the long part when
+    `build --install` is used, and again with the real release afterwards."""
+    if release and release == machine["running"] and not opts["yes"]:
+        raise ToolError("the release being installed (%s) is the kernel running now.\n"
+                        "  Installing over it replaces the modules of a live kernel.  "
+                        "Change --localversion, or pass --yes to do it anyway." % release)
+    if machine["secure_boot"] == "on":
+        k = signing_key(create=False)
+        img = image_path(tree) if tree else ""
+        signed = image_signed_by(img, k)
+        if tree and not signed and not opts["allow_unsigned"]:
+            raise ToolError("Secure Boot is ON here and this image is not signed: shim will "
+                            "refuse it.\n  Run `%s.py sign --source %s`, or pass --allow-unsigned."
+                            % (TOOL, tree))
+        if k and mok_enrolled(k) is False and not opts["yes"]:
+            raise ToolError("Secure Boot is ON here and your signing certificate is not enrolled:"
+                            "\n      sudo mokutil --import %s\n  then reboot and enrol it in the "
+                            "MOK Manager.  --yes installs anyway (it will not boot until then)."
+                            % k["der"])
+    ok("Secure Boot here: %s" % machine["secure_boot"])
+    lvl, here = opts.get("_cpu_level") or "", (machine.get("cpu") or {}).get("level") or ""
+    if lvl and here and LEVEL_RANK.get(lvl, 0) > LEVEL_RANK.get(here, 0) and not opts["yes"]:
+        raise ToolError("this kernel is built for %s, and this CPU is %s: it would not boot here.\n"
+                        "  Install it on a machine it was built for (`package` makes an RPM, a deb "
+                        "or a tarball), or --yes." % (lvl, here))
+    if not machine["boot"]["initramfs"] and not opts["yes"]:
+        raise ToolError("no initramfs generator here (dracut, update-initramfs, mkinitcpio).\n"
+                        "  `make install` would install a kernel with no initramfs, and a root "
+                        "on %s%s needs modules from one.  Install one, or --yes to go ahead."
+                        % (machine["storage"]["rootfs"] or "this filesystem",
+                           " over " + ",".join(machine["storage"]["layers"])
+                           if machine["storage"]["layers"] else ""))
+    ok("initramfs generator: %s" % (machine["boot"]["initramfs"] or "none (--yes given)"))
+    if free_bytes("/boot") < BOOT_NEED:
+        raise ToolError("/boot has %s free; a kernel plus initramfs needs about %s.  %s"
+                        % (human(free_bytes("/boot")), human(BOOT_NEED),
+                           FREE_BOOT.get(machine["pkg_manager"], "Remove a kernel you no longer use.")))
+    ok("/boot has %s free" % human(free_bytes("/boot")))
+
+
+def grubby_default(dry=False):
+    """The default kernel's path, or ''.  grubby exits 0 with junk when it
+    cannot read grubenv (unprivileged it prints a grep error, then '/boot'), and
+    stderr is merged in -- so only a line that names an existing FILE counts."""
+    p = sudo(["grubby", "--default-kernel"], check=False, capture=True, dry=dry)
+    for line in reversed((p.stdout or "").splitlines() if p else []):
+        line = line.strip()
+        if line.startswith("/") and os.path.isfile(line):
+            return line
+    return ""
+
+
+def set_default(path, dry=False):
+    """-> True only when grubby afterwards REPORTS that path as the default."""
+    sudo(["grubby", "--set-default", path], check=False, dry=dry)
+    return dry or grubby_default() == path
+
+
+CHECK_CAVEATS = "/usr/libexec/microcode_ctl/check_caveats"
+
+
+def microcode_force_needed(machine, release, running=None):
+    """'' or the override that makes EL's microcode_ctl put Intel microcode into
+    RELEASE's initramfs.  Its check compares kernel versions the way RHEL numbers
+    them; '7.2.6-elkt' passes no comparison, so the main `intel` caveat -- which
+    asks only for early-load support, there since 4.10 -- is dropped and the
+    kernel runs on the BIOS's microcode.  Measured 2026-10-08: `check_caveats -e
+    -c intel` gives ok_cfgs intel for the running 6.12.0-211 and fail_cfgs intel
+    for 7.2.6-xeon-haswell-all-gpu-server-latency.  Forced (the per-kernel
+    override its README documents) only when the running kernel passes and the
+    new one is 4.10 or later: then the version string is the only difference."""
+    if (machine.get("cpu") or {}).get("vendor") != "GenuineIntel" \
+            or not os.access(CHECK_CAVEATS, os.X_OK) or version_key(release)[:2] < (4, 10):
+        return ""
+
+    def passes(kver):
+        try:
+            o = run([CHECK_CAVEATS, "-e", "-k", kver, "-c", "intel"], check=False,
+                    env=scrubbed_env(), timeout=60).stdout or ""
+        except ToolError:
+            return False
+        return bool(re.search(r"^ok_cfgs\b.*\bintel\b", o, re.M))
+    if passes(release) or not passes(running or machine["running"]):
+        return ""
+    return "/lib/firmware/%s/force-early-intel" % release
+
+
+def install_kernel(tree, mk, machine, vendors, release, opts, state):
+    dry = opts["dry_run"]
+    say("Install preflight")
+    install_preflight(machine, opts, release, tree)
+    grubby = machine["boot"]["grubby"]
+    keep = SudoKeepalive()
+    if not dry:
+        keep.start()
+    try:
+        old_default = grubby_default(dry) if grubby else ""
+        if old_default:
+            info("default boot entry now: %s" % old_default)
+        elif grubby and not dry:
+            warn("grubby could not name the current default boot entry, so it cannot be put "
+                 "back afterwards: installkernel may leave the NEW kernel as the default.")
+
+        say("Installing modules and kernel (sudo)")
+        if not dry:
+            state.update(tree, status="installing", stage="install")
+        # sudo resets the environment; the toolchain arguments ride on the
+        # command line so a clang-built tree is not re-probed with gcc.
+        tcfg = DotConfig(os.path.join(tree, ".config"))
+        strip = ["INSTALL_MOD_STRIP=1"] if tcfg.get("DEBUG_INFO_BTF") == "y" \
+            and state.get(tree).get("debug_info") == "btf" else []
+        installed = False
+        for m in machine.get("dkms") or []:
+            will, why = dkms_will_build(m.get("limits") or {}, release)
+            if not will:
+                note("dkms will now say it SKIPS %s for this kernel (BUILD_EXCLUSIVE: %s).  That is "
+                     "expected, not an error: the kernel's own in-tree module is used." % (m["name"], why))
+        force = microcode_force_needed(machine, release)
+        if force:
+            # Before `make install`: that is when dracut builds the initramfs.
+            note("microcode_ctl would leave the CPU microcode out of %s's initramfs -- its version "
+                 "check does not understand that name.  Telling it to apply its main Intel "
+                 "caveat to this kernel too: %s" % (release, force))
+            sudo(["mkdir", "-p", os.path.dirname(force)], check=False, dry=dry)
+            sudo(["touch", force], check=False, dry=dry)
+        try:
+            sudo(mk.argv(["-C", tree] + strip + ["modules_install"], parallel=True), dry=dry)
+            sudo(mk.argv(["-C", tree, "install"]), dry=dry)
+            installed = True
+        finally:
+            # In a finally because of WHEN installkernel moves the default: before
+            # it runs dracut.  A `make install` that dies there (a full /boot, a
+            # failing hook) has already pointed the machine at a kernel with no
+            # initramfs -- the one failure that must not also skip the restore.
+            # --set-default asks for the new kernel as default once it is
+            # INSTALLED; it is no reason to leave a half-installed one there.
+            if old_default and not dry and (not opts["set_default"] or not installed) \
+                    and grubby_default() != old_default:
+                if set_default(old_default):
+                    ok("default boot entry put back to %s" % old_default)
+                else:
+                    warn("could NOT put the default boot entry back to %s -- check "
+                         "`sudo grubby --default-kernel` before you reboot." % old_default)
+        # Always, overwriting: EL's installkernel does not do this, its absence
+        # is how the NEXT build loses its base config, and a stale one from an
+        # earlier install of the same release would be worse than none.
+        p = sudo(["install", "-m", "0644", os.path.join(tree, ".config"),
+                  "/boot/config-" + release], check=False, dry=dry)
+        if p is not None and p.returncode != 0:
+            warn("could not write /boot/config-%s; keep %s/.config safe" % (release, tree))
+
+        if opts["set_default"]:
+            if not grubby:
+                note("no grubby here: set the default entry with your bootloader's own tool")
+            elif set_default("/boot/vmlinuz-" + release, dry):
+                ok("default boot entry is now %s, as asked" % release)
+            else:
+                warn("grubby did not accept /boot/vmlinuz-%s as the default" % release)
+        elif grubby:
+            if not old_default and not dry:
+                warn("check the default before you reboot:  sudo grubby --default-kernel")
+            info("pick %s from the boot menu; once it has proved itself:" % release)
+            info("    sudo grubby --set-default=/boot/vmlinuz-%s" % release)
+        else:
+            note("no grubby here: check which entry your bootloader now defaults to")
+        if not dry:
+            state.update(tree, status="installed", stage="done", finished=now())
+        post_install_checks(tree, machine, vendors, release, dry)
+    finally:
+        keep.stop()
+
+
+def post_install_checks(tree, machine, vendors, release, dry=False):
+    say("Post-install checks")
+    if dry:
+        info("(dry run -- nothing was installed, nothing to check)")
+        return
+    img = next((i for i in ("/boot/initramfs-%s.img" % release,
+                            "/boot/initrd.img-%s" % release) if os.path.exists(i)), "")
+    lister = next((t for t in ("lsinitrd", "lsinitramfs")
+                   if which(t, path=":".join(SYSTEM_PATH))), "")
+    if not img:
+        warn("no initramfs found for %s in /boot -- do not reboot into it yet" % release)
+    elif lister:
+        p = sudo([lister, img], check=False, capture=True)
+        listing = p.stdout or ""
+        ucode = {"GenuineIntel": "GenuineIntel.bin", "AuthenticAMD": "AuthenticAMD.bin"}.get(
+            (machine.get("cpu") or {}).get("vendor"))
+        if ucode and listing:
+            if "kernel/x86/microcode/" + ucode in listing:
+                ok("CPU microcode is in %s: it loads before anything else runs"
+                   % os.path.basename(img))
+            else:
+                warn("no CPU microcode in %s: this kernel runs on whatever microcode the BIOS "
+                     "carries -- see `doctor`" % os.path.basename(img))
+        for vendor, fw in (("amd", "amdgpu"), ("intel", "i915"), ("nvidia", "nvidia")):
+            if vendor not in vendors:
+                continue
+            n = len(re.findall(r"firmware/%s" % fw, listing))
+            if n:
+                ok("%d %s firmware files in %s" % (n, fw, os.path.basename(img)))
+            elif vendor not in (machine.get("gpu_vendors") or []):
+                # --gpu all BUILDS every vendor's driver; dracut packs firmware only
+                # for hardware that is present.  No such GPU here: nothing is missing.
+                info("no %s firmware in the initramfs -- expected: this machine has no %s GPU"
+                     % (fw, vendor))
+            elif vendor != "nvidia":
+                warn("no %s firmware in %s -- install linux-firmware and regenerate "
+                     "the initramfs BEFORE rebooting" % (fw, img))
+    build = "/lib/modules/%s/build" % release
+    if os.path.exists(build):
+        ok("%s -> %s  (DKMS can build)" % (build, os.path.realpath(build)))
+    else:
+        warn("%s is missing; DKMS cannot build against this kernel" % build)
+    # FILE names keep their hyphens (virtio-gpu.ko); only the module NAME uses
+    # underscores.  Compare normalised, or 40% of modules are 'missing'.
+    have = set()
+    for dirpath, _, files in os.walk("/lib/modules/%s" % release):
+        for fn in files:
+            if ".ko" in fn:
+                have.add(fn.split(".ko")[0].replace("-", "_"))
+    cfg = DotConfig(os.path.join(tree, ".config"))
+    for mod, sym in (("amdgpu", "DRM_AMDGPU"), ("nouveau", "DRM_NOUVEAU"),
+                     ("i915", "DRM_I915"), ("xe", "DRM_XE"),
+                     ("simpledrm", "DRM_SIMPLEDRM"), ("virtio_gpu", "DRM_VIRTIO_GPU")):
+        val = cfg.get(sym)
+        if mod in have:
+            ok("%-11s installed as a module" % mod)
+        elif val == "y":
+            ok("%-11s built into the kernel image" % mod)
+        elif val == "m":
+            warn("%s: CONFIG_%s=m but no %s.ko was installed -- a real failure" % (mod, sym, mod))
+    if machine.get("dkms"):
+        p = run(["dkms", "status", "-k", release], check=False, env=scrubbed_env())
+        for line in (p.stdout or "").strip().splitlines():
+            info("dkms: " + line + ("   (registered, not built for this kernel -- its own limit; "
+                                    "the in-tree module loads instead)"
+                                    if line.rstrip().endswith(": added") else ""))
+    say("Done.  Keep your current kernel in the boot menu until %s is proven." % release)
+
+
+# ------------------------------------------------------------------ options / UI
+
+DEFAULTS = {
+    "kernel": "stable", "source": "", "workdir": "~/src", "gpu": "auto",
+    "toolchain": "gcc", "cc": "", "llvm_prefix": "", "config_base": "auto",
+    "modules": "full", "cpu": "generic", "preempt": "keep", "hz": "keep",
+    "debug_info": "off", "localversion": "-elkt", "frame_warn": "8192",
+    "jobs": "0", "clean": "auto", "binutils": "auto", "linker": "default",
+    "python": "", "ccache": "off", "cxx": "", "secure_boot": "on",
+}
+PROFILE_KEYS = sorted(DEFAULTS)
+CHOICES = {
+    "toolchain": ("gcc", "llvm"), "modules": ("full", "trimmed"),
+    "linker": ("default", "bfd", "lld"), "ccache": ("off", "on"), "secure_boot": ("on", "off"),
+    "preempt": ("keep",) + tuple(sorted(PREEMPT_CHOICE)),
+    "hz": ("keep",) + HZ_CHOICE, "debug_info": ("off", "btf", "on"),
+    "clean": ("auto", "always", "never", "force"),
+}
+
+
+PROFILE_HEADER = "# %s profile" % TOOL
+PROFILE_FLAGS = ("install", "set_default")      # saved too, so a reused profile asks NOTHING
+
+
+def profiles_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                        TOOL, "profiles")
+
+
+def profile_path(name, must_exist=False):
+    """A bare name lives in the profiles directory; anything with a slash is a
+    path.  (Bare names used to be written into whatever the current directory
+    was, where nothing ever looked for them again.)"""
+    name = os.path.expanduser(name)
+    if os.sep in name:
+        return name
+    base = os.path.join(profiles_dir(), name)
+    if must_exist:
+        # The profiles directory FIRST: a file that happens to have the same name
+        # in whatever directory you stand in used to win over the profile you saved.
+        found = next((c for c in (base, base + ".ini") if os.path.isfile(c)), "")
+        if not found and os.path.isfile(name):
+            found = name             # earlier versions wrote bare names to the current directory
+        return found or base + ".ini"
+    return base if base.endswith(".ini") else base + ".ini"
+
+
+def load_profile(path):
+    path = profile_path(path, must_exist=True)
+    cp = configparser.RawConfigParser()
+    try:
+        read = cp.read(path)
+    except configparser.Error:
+        read = []
+    if not read:
+        raise ToolError("cannot read profile %s" % path)
+    if not cp.has_section("build"):
+        raise ToolError("profile %s has no [build] section" % path)
+    return dict((k, v) for k, v in cp.items("build") if k in DEFAULTS or k in PROFILE_FLAGS)
+
+
+def profile_summary(v):
+    cc = v.get("cc") or (v.get("llvm_prefix", "") and v["llvm_prefix"] + "clang") or \
+        ("system clang" if v.get("toolchain") == "llvm" else "system gcc")
+    return "%s | %s | %s modules | cpu %s | %s%s" % (
+        v.get("kernel", "stable"), cc.replace(os.path.expanduser("~"), "~"),
+        v.get("modules", "full"), v.get("cpu", "generic"), v.get("localversion", ""),
+        " | installs" if v.get("install") == "yes" else "")
+
+
+def list_profiles(extra_dirs=None):
+    """Newest first.  The profiles directory, plus -- because that is where
+    earlier versions put them -- the current directory and the tool's own: any
+    small file that starts with the profile header, whatever it is called."""
+    if extra_dirs is None:
+        extra_dirs = [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+    found, seen = [], set()
+    for d in [profiles_dir()] + list(extra_dirs):
+        try:
+            names = sorted(os.listdir(d))[:500]
+        except OSError:
+            continue
+        for n in names:
+            path = os.path.join(d, n)
+            real = os.path.realpath(path)
+            try:
+                if real in seen or not os.path.isfile(path) or os.path.getsize(path) > 8192:
+                    continue
+                with open(path, "r", errors="replace") as f:
+                    if not f.readline().startswith(PROFILE_HEADER):
+                        continue
+                vals = load_profile(path)
+            except (OSError, ToolError):
+                continue
+            seen.add(real)
+            found.append({"name": n[:-4] if n.endswith(".ini") else n, "path": path, "dir": d,
+                          "mtime": os.path.getmtime(path), "values": vals,
+                          "summary": profile_summary(vals)})
+    found.sort(key=lambda pr: -pr["mtime"])
+    return found
+
+
+def choose_profile(profs):
+    """The FIRST thing the wizard shows.  -> {path, name, as_is} or None (new)."""
+    if not profs:
+        return None
+    say("Saved profiles")
+    for i, pr in enumerate(profs, 1):
+        out("  %2d) %-24s %s   %s" % (i, pr["name"], time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(pr["mtime"])), pr["summary"]))
+        if pr["dir"] != profiles_dir():
+            out("        (in %s)" % pr["dir"])
+    out("   n) new -- answer the questions")
+    while True:
+        ans = ask("profile", "1")
+        if ans.lower() in ("n", "new"):
+            return None
+        pick = profs[int(ans) - 1] if ans.isdigit() and 1 <= int(ans) <= len(profs) else \
+            next((pr for pr in profs if pr["name"] == ans), None)
+        if pick:
+            break
+        out("  a number from the list, a profile's name, or n")
+    how = ask("use it as it is, or edit it? (u/e)", "u")
+    return {"path": pick["path"], "name": pick["name"], "as_is": not how.lower().startswith("e")}
+
+
+def save_profile(path, opts):
+    cp = configparser.RawConfigParser()
+    cp.add_section("build")
+    for k in PROFILE_KEYS:
+        # What was asked, not what it resolved to HERE: a profile is for other
+        # machines, where -j24 and /home/<me>/src are both wrong.
+        cp.set("build", k, str(opts.get("_raw", {}).get(k, opts[k])))
+    for k in PROFILE_FLAGS:
+        cp.set("build", k, "yes" if opts.get(k) else "no")
+    path = profile_path(path)
+    if os.path.dirname(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("%s.  Replay with:  %s.py build --profile %s\n"
+                % (PROFILE_HEADER, TOOL, os.path.basename(path)[:-4]
+                   if os.path.dirname(path) == profiles_dir() else path))
+        cp.write(f)
+    info("profile saved: %s" % path)
+
+
+def validate_options(opts):
+    """For values from the command line, a profile AND the wizard alike."""
+    for k, allowed in CHOICES.items():
+        if opts[k] not in allowed:
+            raise ToolError("%s must be one of: %s (got '%s')" % (k, " ".join(allowed), opts[k]))
+    # Any -march the compiler knows; resolve_toolchain() asks it.  Here: the shape.
+    opts["cpu"] = str(opts["cpu"]).strip().lower()
+    if not re.match(r"^[a-z0-9][a-z0-9_.+-]*$", opts["cpu"]):
+        raise ToolError("--cpu takes generic, native, x86-64-v2, x86-64-v3, x86-64-v4 or a CPU "
+                        "name the compiler knows (raptorlake, znver4 ...) -- got '%s'" % opts["cpu"])
+    lv = opts["localversion"]
+    if lv and lv[0] not in "-+._":
+        # kbuild glues it straight on: 'machine-native' gives 7.2.6machine-native.
+        opts["localversion"] = "-" + lv
+        note("LOCALVERSION '%s' has no separator -- using '-%s'" % (lv, lv))
+    if not re.match(r"^[-+.\w]*$", opts["localversion"]):
+        raise ToolError("LOCALVERSION may only contain letters, digits, - + . _  (got '%s')"
+                        % opts["localversion"])
+    if not re.match(r"^\d+$", str(opts["frame_warn"])):
+        raise ToolError("--frame-warn must be a number")
+
+
+def merge_options(args):
+    """Command line beats profile beats built-in default."""
+    opts = dict(DEFAULTS)
+    prof = load_profile(args.profile) if getattr(args, "profile", None) else {}
+    opts.update((k, v) for k, v in prof.items() if k in DEFAULTS)
+    for k in DEFAULTS:
+        v = getattr(args, k, None)
+        if v is not None:
+            opts[k] = v
+    validate_options(opts)
+    # What THIS command line (or its profile) chose, as opposed to defaults: a
+    # command run on a built tree takes everything else from the tree's record.
+    opts["_given"] = set(k for k in DEFAULTS if getattr(args, k, None) is not None or k in prof)
+    for k in ("yes", "verbose", "require_pgp", "install", "set_default", "configure_only",
+              "allow_unsigned", "dry_run", "install_deps", "json"):
+        opts[k] = bool(getattr(args, k, False))
+    for k in PROFILE_FLAGS:
+        opts[k] = opts[k] or prof.get(k) == "yes"
+    opts["state_dir"] = getattr(args, "state_dir", None)
+    opts["save_profile"] = getattr(args, "save_profile", None)
+    opts["keep_symbols"] = [s.upper().replace("CONFIG_", "")
+                            for s in (getattr(args, "keep_symbol", None) or [])]
+    opts["_raw"] = dict((k, opts[k]) for k in ("jobs", "workdir", "source"))
+    opts["workdir"] = os.path.abspath(os.path.expanduser(opts["workdir"]))
+    if opts["source"]:
+        opts["source"] = os.path.realpath(os.path.expanduser(opts["source"]))
+    try:
+        jobs = int(opts["jobs"])
+    except ValueError:
+        raise ToolError("--jobs must be a number")
+    opts["jobs"] = jobs if jobs > 0 else cpu_info()["threads"]
+    return opts
+
+
+def ask(prompt, default=""):
+    try:
+        ans = input("%s [%s]: " % (prompt, default)).strip()
+    except EOFError:
+        ans = ""
+    return ans or default
+
+
+def ask_choice(title, options, default):
+    """options: list of (key, label).  Accepts the number or the key."""
+    if default not in [k for k, _ in options]:
+        options = list(options) + [(default, "as given on the command line / in the profile")]
+    out("\n" + _c("1", title))
+    for i, (key, label) in enumerate(options, 1):
+        out("  %2d) %-12s %s%s" % (i, key, label, "   <- default" if key == default else ""))
+    while True:
+        ans = ask("choose", default)
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            return options[int(ans) - 1][0]
+        if ans in [k for k, _ in options]:
+            return ans
+        out("  please answer with a number or one of the keys")
+
+
+def compiler_tags(t, machine, check=True):
+    tags = [t["origin"]]
+    if t["experimental"]:
+        tags.append("an experimental build")
+    if t["usable"] == "no":
+        return tags, False
+    if t["usable"] == "fork":
+        tags.append("NOT RECOMMENDED: " + t["why"])
+    if t["kind"] == "clang":
+        tags.append("full LLVM tool set beside it" if llvm_companions(t["path"])
+                    else "no LLVM binutils beside it (would use GNU ld)")
+    elif own_binutils(t["path"]):
+        own = [b for b in machine.get("binutils", []) if b["dir"] == own_binutils(t["path"])]
+        tags.append("brings its own binutils%s" % (" " + vstr(own[0]["numver"]) if own else ""))
+    works = True
+    if check:
+        works, why = compiler_works(t["path"], own_binutils(t["path"]) or None)
+        if not works:
+            tags.append("BROKEN in a clean environment: " + why)
+    return tags, works
+
+
+def show_compilers(machine, numbered=False, check=True, key="toolchains"):
+    """-> the selectable ones, in the order they were numbered."""
+    pick = []
+    for t in machine.get(key, []):
+        tags, works = compiler_tags(t, machine, check)
+        label = "   -"
+        if works and t["usable"] != "no":
+            pick.append(t)
+            label = "%3d)" % len(pick) if numbered else "    "
+        fam = {"gcc": "g++", "clang": "clang++"}.get(t["kind"], t["kind"]) if key == "cxx" else t["kind"]
+        what = "%s %s" % (fam, vstr(t["numver"])) if t["usable"] != "no" \
+            else t["version"][:58]          # say what it calls itself: "... DPC++/C++ Compiler"
+        out(" %s %-52s %s" % (label, t["path"], what))
+        out("        %s" % "; ".join(tags))
+        if t["usable"] == "no":
+            out("        cannot build a kernel: %s" % t["why"])
+    return pick
+
+
+def wizard_toolchain(opts, machine):
+    out("\n" + _c("1", "Compilers found on this system"))
+    if not machine["toolchains"]:
+        # A fresh box: nothing to choose from until the dependencies are in.
+        out("  none yet -- keeping --toolchain %s" % opts["toolchain"])
+        return
+    pick = show_compilers(machine, numbered=True)
+    out("        or type the path of a compiler that is not listed")
+    out("  DKMS and every other out-of-tree module build runs as root with the SYSTEM")
+    out("  compiler.  A kernel built by anything else can leave them unable to compile;")
+    out("  the post-build check tells you, before anything is installed.")
+    asked = bool(opts["cc"] or opts["llvm_prefix"] or opts["toolchain"] != DEFAULTS["toolchain"])
+    default = "keep" if asked else "1"
+    if asked:
+        out("  keep) what was asked for: %s" % (opts["cc"] or opts["llvm_prefix"] + "clang"
+                                                 or "--toolchain " + opts["toolchain"]))
+    while True:
+        ans = ask("compiler", default)
+        if ans == "keep":
+            break
+        if ans.isdigit() and 1 <= int(ans) <= len(pick):
+            chosen = pick[int(ans) - 1]
+        else:
+            chosen = compiler_info(os.path.expanduser(ans)) if os.sep in ans else None
+            if not chosen or chosen["usable"] == "no":
+                out("  %s" % ("cannot build a kernel with that: " + chosen["why"] if chosen
+                              else "a number from the list, or the full path of a gcc or clang"))
+                continue
+        opts["toolchain"] = "llvm" if chosen["kind"] == "clang" else "gcc"
+        opts["llvm_prefix"] = ""
+        opts["cc"] = "" if chosen["real"] == os.path.realpath("/usr/bin/gcc") else chosen["path"]
+        opts["binutils"] = "auto"        # a new compiler: start from what goes with it
+        opts["cxx"] = ""
+        break
+
+    tc = resolve_toolchain(opts, machine)
+    if len(machine.get("cxx", [])) > 1:
+        out("\n" + _c("1", "C++ compilers found on this system"))
+        usable = show_compilers(machine, key="cxx")
+        out("  The kernel itself is C.  kbuild uses a C++ compiler (HOSTCXX) for the GCC")
+        out("  plugins -- compiled against the chosen gcc's plugin headers, so it should be")
+        out("  the g++ that came with that gcc -- and for xconfig.")
+        keys = [("auto", "the one beside the C compiler: %s" % (tc["cxx"] or "none found"))] + \
+               [(x["path"], "%s %s" % (x["kind"], vstr(x["numver"]))) for x in usable]
+        ans = ask_choice("C++ compiler", keys, opts["cxx"] or "auto")
+        opts["cxx"] = "" if ans == "auto" else ans
+        tc = resolve_toolchain(opts, machine)
+    out("\n" + _c("1", "Build tools that go with %s" % tc["path"]))
+    for label, text in describe_tools(tc):
+        out("  %-10s %s" % (label, text))
+    if ask("change any of these? (y/n)", "n").lower().startswith("y"):
+        sets = [("gnu" if b["system"] else b["dir"],
+                 "GNU binutils %s%s" % (vstr(b["numver"]), "  (system)" if b["system"] else ""))
+                for b in machine.get("binutils", [])]
+        if tc["kind"] == "clang" and llvm_companions(tc["path"]):
+            sets.append(("llvm", "LLVM's own: ld.lld, llvm-ar, llvm-nm, llvm-objcopy ..."))
+        if len(sets) > 1:
+            opts["binutils"] = ask_choice("Binutils (assembler, linker, ar, nm, objcopy)",
+                                          sets, tc["binutils"])
+        if _find_lld(tc, machine):
+            opts["linker"] = ask_choice("Linker", [
+                ("default", "what goes with the binutils chosen above"),
+                ("bfd", "GNU ld.bfd"),
+                ("lld", "LLVM's ld.lld%s" % ("" if tc["kind"] == "clang" else
+                                             " -- rarely tested with gcc-built kernels"))],
+                opts["linker"])
+        pys = machine.get("pythons", [])
+        if len(pys) > 1:
+            keys = [("default" if y["platform"] else y["path"],
+                     "%s %s%s%s" % (y["impl"], y["version"],
+                                    "  (the platform interpreter)" if y["platform"] else "",
+                                    "" if y["impl"] == "CPython" else "  -- not CPython: untested with kbuild"))
+                    for y in pys]
+            ans = ask_choice("Python for kbuild's scripts", keys, opts["python"] or "default")
+            opts["python"] = "" if ans == "default" else ans
+        if which("ccache", path=":".join(SYSTEM_PATH)):
+            opts["ccache"] = ask_choice("Compiler cache", [
+                ("off", "every object is compiled"),
+                ("on", "ccache: a rebuild after a clean reuses what it can")], opts["ccache"])
+        resolve_toolchain(opts, machine)          # say so NOW if the combination cannot work
+    while True:
+        ans = ask("\nparallel make jobs", str(opts["jobs"]))
+        if ans.isdigit() and int(ans) > 0:
+            opts["jobs"] = int(ans)
+            break
+        out("  a positive number")
+
+
+def wizard(opts, machine, latest, rels):
+    say("Kernel")
+    rows = [r for r in rels if r["moniker"] != "linux-next"]
+    for i, r in enumerate(rows, 1):
+        out("  %2d) %-9s %-12s %s%s%s" % (
+            i, r["moniker"], r["version"], r["date"], "   EOL" if r["eol"] else "",
+            "   <- default (latest stable)" if r["version"] == latest else ""))
+    out("      or type any version (6.12.9) or series (6.12 = its newest release)")
+    default = str(next((i for i, r in enumerate(rows, 1) if r["version"] == latest), 1))
+    if opts["kernel"] != DEFAULTS["kernel"]:
+        default = opts["kernel"]            # --kernel / profile: Enter keeps it
+    ans = ask("kernel", default)
+    opts["kernel"] = rows[int(ans) - 1]["version"] \
+        if ans.isdigit() and 1 <= int(ans) <= len(rows) else ans
+
+    det = ", ".join(machine["gpu_vendors"]) or "none"
+    opts["gpu"] = ask_choice("GPU drivers (detected: %s)" % det, [
+        ("auto", "what was detected; every vendor if nothing was"),
+        ("all", "AMD + NVIDIA + Intel: one kernel for mixed hardware"),
+        ("amd", "AMD only"), ("nvidia", "NVIDIA only (nouveau, as a module)"),
+        ("intel", "Intel only"), ("none", "VM / BMC / rescue drivers only")], opts["gpu"])
+
+    wizard_toolchain(opts, machine)
+
+    opts["modules"] = ask_choice("Module set", [
+        ("full", "everything the base config has -- boots on other hardware too"),
+        ("trimmed", "only what is loaded now (%d) + GPU + rescue set: a far "
+                    "shorter build, for THIS machine" % machine["loaded_modules"])],
+        opts["modules"])
+    if machine["arch"] == "x86_64":
+        here = machine["cpu"].get("level") or "x86-64"
+        hyb = machine["cpu"].get("hybrid")
+        rows = [("generic", "runs on any x86-64 CPU")]
+        for lvl in ("x86-64-v2", "x86-64-v3", "x86-64-v4"):
+            rows.append((lvl, LEVEL_CPUS[lvl] + (
+                "" if LEVEL_RANK[lvl] <= LEVEL_RANK.get(here, 1) else "   -- NOT this CPU: would not boot here")))
+        rows.append(("native", "-march=native: this exact kind of CPU only"))
+        opts["cpu"] = ask_choice("CPU tuning (this CPU: %s%s; a CPU name such as raptorlake is "
+                                 "accepted by --cpu too)" % (here, ", hybrid P+E cores" if hyb else ""),
+                                 rows, opts["cpu"])
+    opts["preempt"] = ask_choice("Preemption model", [
+        ("keep", "whatever the base config says"),
+        ("none", "throughput: servers, batch"), ("voluntary", "the desktop/server middle"),
+        ("full", "lowest latency: desktop, audio"),
+        ("lazy", "full preemption, fewer needless switches (6.13+)")], opts["preempt"])
+    opts["hz"] = ask_choice("Timer frequency", [
+        ("keep", "whatever the base config says"), ("100", "servers"),
+        ("250", "balanced"), ("300", "video-friendly"), ("1000", "desktop, low latency")],
+        opts["hz"])
+    opts["debug_info"] = ask_choice("Debug info", [
+        ("off", "no DWARF, no BTF: fastest build -- but systemd's BPF filters, "
+                "bpftrace and CO-RE agents will not work"),
+        ("btf", "BTF kept, DWARF stripped at install: slower build, everything works"),
+        ("on", "whatever the base config has, untouched: for kernel debugging")],
+        opts["debug_info"])
+    opts["secure_boot"] = ask_choice("Secure Boot", [
+        ("on", "a Secure-Boot-ready config, and the kernel image signed with your own key; "
+               "a machine enrols your certificate once (mokutil) and it boots with SB enabled"),
+        ("off", "unsigned: boots only where Secure Boot is disabled")], opts["secure_boot"])
+    opts["localversion"] = ask("\nLOCALVERSION suffix (release becomes e.g. 7.2.6%s)"
+                               % opts["localversion"], opts["localversion"])
+    opts["install"] = ask("\nInstall after a successful build? (y/n)",
+                          "y" if opts["install"] else "n").lower().startswith("y")
+    if opts["install"]:
+        opts["set_default"] = ask("Make it the default boot entry? (y/n)",
+                                  "y" if opts["set_default"] else "n").lower().startswith("y")
+    prof = ask("\nSave these answers as a profile (a name; empty = no)",
+               opts.get("_profile_name", ""))
+    if prof:
+        opts["save_profile"] = prof
+    validate_options(opts)          # typed answers get the same scrutiny as flags
+    return opts
+
+
+# ---------------------------------------------------------------------- commands
+
+def cmd_kernels(args):
+    latest, rels = get_releases()
+    if args.series:
+        sums, _ = get_series_sums(int(args.series.split(".")[0]))
+        vers = sorted([v for v in sums if series_of(v) == args.series], key=version_key)
+        if args.json:
+            out(json.dumps(vers))
+            return 0
+        say("kernel.org: %d releases in the %s series" % (len(vers), args.series))
+        for i in range(0, len(vers), 8):
+            out("  " + "  ".join("%-10s" % v for v in vers[i:i + 8]))
+        return 0
+    if args.json:
+        out(json.dumps({"latest_stable": latest, "releases": rels}, indent=2))
+        return 0
+    say("kernel.org right now")
+    for r in rels:
+        tag = "EOL" if r["eol"] else ""
+        if r["version"] == latest:
+            tag = "latest stable"
+        if r["moniker"] == "linux-next":
+            tag = "no tarball -- not buildable here"
+        out("  %-10s %-14s %-11s %s" % (r["moniker"], r["version"], r["date"], tag))
+    out("\n  --kernel stable | longterm | mainline | 6.12 | 6.12.9"
+        "      kernels --series 6.12 lists every point release")
+    return 0
+
+
+def show_machine(m):
+    say("This machine")
+    info("os          : %s  (%s, %s)" % (m["os"], m["arch"], m["pkg_manager"] or "no known package manager"))
+    info("running     : %s" % m["running"])
+    hyb = m["cpu"].get("hybrid")
+    info("cpu         : %s  x%d  %s%s%s" % (
+        m["cpu"]["model"] or m["cpu"]["vendor"] or "?", m["cpu"]["threads"],
+        " ".join(m["cpu"]["simd"]), "  " + m["cpu"]["level"] if m["cpu"].get("level") else "",
+        "  hybrid: %d P-core threads + %d E-cores" % tuple(hyb) if hyb else ""))
+    info("memory      : %s     virtualisation: %s" % (human(m["memory"]), m["virt"]))
+    for d in m["pci"]:
+        info("%-12s: %s [%04x:%04x] %s%s" % (
+            d["kind"], d["addr"], d["vendor"], d["device"], d["name"] or
+            OTHER_VIDEO.get(d["vendor"], ""), "  driver=" + d["driver"] if d["driver"] else ""))
+    if not m["pci"]:
+        info("display     : none found")
+    st = m["storage"]
+    info("storage     : root is %s; filesystems %s; layers %s"
+         % (st["rootfs"] or "?", ",".join(st["fstypes"]) or "-", ",".join(st["layers"]) or "none"))
+    if st.get("drivers"):
+        info("disk path   : %s: %s%s" % (",".join(st["disks"]), " <- ".join(
+            d["module"] for d in st["drivers"]), "   [Intel VMD in front: a kernel without "
+                                                 "CONFIG_VMD cannot see these disks]" if st.get("vmd") else ""))
+    for g in (m.get("nvidia") or {}).get("gpus", []):
+        info("nvidia      : %s at %s, driven by %s now; firmware %s%s" % (
+            g["chip"].upper() or "?", g["addr"], g["driver"] or "nothing",
+            "present" if g["firmware"] else "MISSING" if g["needs_firmware"] else "not needed",
+            ", GSP too" if g["gsp"] else ""))
+    nv = m.get("nvidia") or {}
+    if nv.get("own_driver"):
+        info("              NVIDIA's own driver installed (%s)" % (
+            "DKMS: " + ", ".join(nv["dkms"]) if nv["dkms"] else "akmods" if nv["akmods"]
+            else "a prebuilt kmod for %s" % nv["running"]))
+    if nv.get("nouveau_off"):
+        info("              nouveau switched off -- %s" % nv["nouveau_off"])
+    info("firmware    : compressed as %s" % (",".join(m["firmware_compression"]) or "not compressed / not found"))
+    info("secure boot : %s     boot: %s%s, %s" % (
+        m["secure_boot"], "grubby" if m["boot"]["grubby"] else "no grubby",
+        "+BLS" if m["boot"]["bls"] else "", m["boot"]["initramfs"] or "no initramfs tool found"))
+    for t in m["toolchains"]:
+        info("compiler    : %-46s %s %s%s" % (
+            t["path"], t["kind"], vstr(t["numver"]),
+            "" if t["system"] else "   [%s]" % ("unusable" if t["usable"] == "no" else "not system")))
+    info("c++         : %s" % ("   ".join("%s %s%s" % (x["kind"] if x["usable"] != "no" else "intel",
+                                                       vstr(x["numver"]),
+                                                       "" if x["usable"] != "no" else " (unusable)")
+                                          for x in m.get("cxx", [])) or "none found"))
+    info("binutils    : %s" % ("   ".join("%s in %s" % (vstr(b["numver"]), b["dir"])
+                                          for b in m.get("binutils", [])) or "none found"))
+    info("python3     : %s" % ("   ".join("%s %s%s" % (y["impl"], y["version"],
+                                                       " (platform)" if y["platform"] else "")
+                                          for y in m.get("pythons", [])) or "none found"))
+    info("              (`toolchains` shows all of this in full)")
+    for d in m["dkms"]:
+        lim = d["limits"].get("BUILD_EXCLUSIVE_KERNEL_MAX")
+        info("dkms        : %s/%s on %d kernel(s)%s" % (
+            d["name"], d["version"], len(d["kernels"]), ", capped at %s" % lim if lim else ""))
+    info("modules     : %d loaded" % m["loaded_modules"])
+
+
+def cmd_toolchains(args):
+    opts = merge_options(args)
+    machine = detect_machine()
+    if opts["json"]:
+        out(json.dumps({"compilers": machine["toolchains"], "binutils": machine["binutils"],
+                        "cxx": machine["cxx"], "pythons": machine["pythons"],
+                        "tools": find_misc_tools()},
+                       indent=2, default=list))
+        return 0
+    say("Compilers")
+    show_compilers(machine)
+    say("C++ compilers  (kbuild's HOSTCXX: it builds the GCC plugins and xconfig)")
+    show_compilers(machine, key="cxx")
+    say("GNU binutils sets  (a directory with both ld and as)")
+    for b in machine["binutils"]:
+        info("%-46s %s%s" % (b["dir"], b["version"], "   [system]" if b["system"] else ""))
+    say("Python 3 interpreters")
+    for y in machine["pythons"]:
+        info("%-46s %-8s %s%s" % (y["path"], y["impl"], y["version"],
+                                  "   [platform -- the default for kbuild's scripts]"
+                                  if y["platform"] else ""))
+    say("Other build tools")
+    tools = find_misc_tools()
+    for name, _ in MISC_TOOLS:
+        if name in tools:
+            info("%-10s %-24s %s%s" % (name, tools[name]["path"], tools[name]["version"],
+                                       "   [%s]" % NOT_FOR_KERNELS[name]
+                                       if name in NOT_FOR_KERNELS else ""))
+        else:
+            info("%-10s -" % name)
+    say("What the current options resolve to")
+    tc = resolve_toolchain(opts, machine)
+    info("compiler    : %s" % tc["version"])
+    info("              %s  [%s]" % (tc["path"], tc["origin"]))
+    for label, text in describe_tools(tc):
+        info("%-12s: %s" % (label, text))
+    info("make args   : %s" % (" ".join(shlex.quote(a) for a in tc["args"]) or "(none needed)"))
+    if tc.get("extra_path"):
+        info("PATH        : %s:/usr/bin:..." % tc["extra_path"])
+    tree = opts["source"]
+    if not tree:
+        state = State(os.path.join(state_dir(opts), "state.ini"))
+        known = [t for t in state.trees() if os.path.isdir(t)]
+        tree = known[-1] if known else ""
+    if tree:
+        say("Checked against %s's own requirements" % os.path.basename(tree))
+        return 1 if check_tree_requirements(tree, tc, verbose=True) else 0
+    return 0
+
+
+def cmd_profiles(args):
+    profs = list_profiles()
+    say("Saved profiles  (%s)" % profiles_dir())
+    if not profs:
+        info("none yet -- the wizard offers to save one")
+    for pr in profs:
+        out("  %-24s %s   %s" % (pr["name"], time.strftime("%Y-%m-%d %H:%M",
+                                                          time.localtime(pr["mtime"])), pr["summary"]))
+        if pr["dir"] != profiles_dir():
+            out("      (in %s)" % pr["dir"])
+    out("\n  build --profile <name>   replays one without a single question")
+    return 0
+
+
+def cmd_detect(args):
+    m = detect_machine()
+    if args.json:
+        out(json.dumps(m, indent=2, default=list))
+    else:
+        show_machine(m)
+    return 0
+
+
+NEEDED_TOOLS = ("make", "flex", "bison", "bc", "perl", "tar", "xz", "openssl", "rsync",
+                "cpio", "depmod")
+NEEDED_HEADERS = (("openssl/opensslv.h", "openssl-devel / libssl-dev"),
+                  ("libelf.h", "elfutils-libelf-devel / libelf-dev"))
+
+
+BOOT_NEED = 400 << 20
+# The packages, named for the package manager in front of you -- not a list of
+# every distribution's names to pick from.
+SIGN_DEPS = {"dnf": "pesign nss-tools", "yum": "pesign nss-tools", "apt-get": "sbsigntool",
+             "zypper": "pesign mozilla-nss-tools", "pacman": "sbsigntools"}
+MICROCODE_PKG = {"dnf": ("microcode_ctl", "amd-ucode-firmware"), "yum": ("microcode_ctl", "linux-firmware"),
+                 "apt-get": ("intel-microcode", "amd64-microcode"),
+                 "zypper": ("ucode-intel", "ucode-amd"), "pacman": ("intel-ucode", "amd-ucode")}
+PAHOLE_PKG = {"dnf": "dwarves", "yum": "dwarves", "apt-get": "dwarves", "zypper": "dwarves",
+              "pacman": "pahole"}
+MENUCONFIG_PKG = {"dnf": "ncurses-devel", "yum": "ncurses-devel", "apt-get": "libncurses-dev",
+                  "zypper": "ncurses-devel", "pacman": "ncurses"}
+REGEN_INITRAMFS = {"dracut": "sudo dracut -f --regenerate-all",
+                   "update-initramfs": "sudo update-initramfs -u -k all", "mkinitcpio": "sudo mkinitcpio -P"}
+FREE_BOOT = {"dnf": "List the kernels with `rpm -q kernel-core`; remove an old one with "
+                    "`sudo dnf remove kernel-core-<version>`.",
+             "yum": "Remove an old kernel: `sudo yum remove kernel-<version>`.",
+             "apt-get": "Remove old kernels: `sudo apt autoremove --purge`.",
+             "zypper": "Remove old kernels: `sudo zypper purge-kernels`."}
+NOT_FOR_TREES = ("vfat", "exfat", "msdos", "ntfs", "ntfs3", "fuseblk", "iso9660", "squashfs", "udf")
+
+
+def fs_type(path):
+    """The filesystem type a path lives on: the longest mount point above it."""
+    p = os.path.realpath(path)
+    while p and not os.path.exists(p):
+        p = os.path.dirname(p)
+    best, fs = "", ""
+    for _, mnt, fstype in parse_mounts(read_text("/proc/mounts")):
+        if (p == mnt or p.startswith(mnt.rstrip("/") + "/")) and len(mnt) >= len(best):
+            best, fs = mnt, fstype
+    return fs
+
+
+def pkg_line(pm, pkgs):
+    return "sudo %s %s" % (" ".join(INSTALL_CMD[pm]), pkgs) if pm in INSTALL_CMD else ""
+
+
+def roomy_places(need):
+    """[(directory, free)] where a build could go instead: writable, on a disk
+    filesystem that can hold a kernel tree (symlinks, case-sensitive names),
+    with `need` free.  Your home first, then every mounted one."""
+    cands = [os.path.expanduser("~"), "/var/tmp"]
+    for src, mnt, fstype in parse_mounts(read_text("/proc/mounts")):
+        if src.startswith("/dev/") and fstype not in NOT_FOR_TREES and not mnt.startswith("/boot"):
+            cands.append(mnt)
+    seen, res = set(), []
+    for c in cands:
+        try:
+            dev = os.stat(c).st_dev
+        except OSError:
+            continue
+        if dev in seen or not os.access(c, os.W_OK):
+            continue
+        seen.add(dev)
+        if free_bytes(c) >= need:
+            res.append((c, free_bytes(c)))
+    return res
+
+
+def doctor(opts, machine, toolchain=None, quiet_ok=False):
+    """-> number of blocking problems."""
+    say("Preflight")
+    problems = 0
+    if os.geteuid() == 0:
+        raise ToolError("do not run this as root.  The build runs as you; only the "
+                        "install steps use sudo.")
+    path = ":".join(SYSTEM_PATH)
+    missing = [t for t in NEEDED_TOOLS if not which(t, path=path)]
+    if opts.get("debug_info") in ("btf", "on") and not which("pahole", path=path):
+        missing.append("pahole")
+    cc = (toolchain or {}).get("path") or "/usr/bin/gcc"
+    for header, pkg in NEEDED_HEADERS:
+        p = run([cc, "-E", "-x", "c", "-"], stdin_data="#include <%s>\n" % header,
+                check=False, env=scrubbed_env()) if os.path.exists(cc) else None
+        if p is None or p.returncode != 0:
+            missing.append("%s (%s)" % (header, pkg))
+    if opts.get("secure_boot", "on") == "on" and not signing_tools():
+        missing.append("a signing tool (sbsigntools, or pesign + nss-tools)")
+    pm = machine["pkg_manager"]
+    if missing:
+        problems += 1
+        bad("missing: " + ", ".join(missing))
+        if pm:
+            info("     " + pkg_line(pm, BUILD_DEPS[pm] + (
+                " " + SIGN_DEPS[pm] if opts.get("secure_boot", "on") == "on" else "")))
+    elif not quiet_ok:
+        ok("build tools and headers present")
+    if not quiet_ok:
+        # Named up front, before anyone needs them: on a fresh install neither is there.
+        if opts.get("debug_info") == "off" and not which("pahole", path=path):
+            note("pahole is not installed: `--debug-info btf` will need it  (%s)"
+                 % (pkg_line(pm, PAHOLE_PKG.get(pm, "pahole")) or "package dwarves / pahole"))
+        p = run([cc, "-E", "-x", "c", "-"], stdin_data="#include <ncurses.h>\n",
+                check=False, env=scrubbed_env()) if os.path.exists(cc) else None
+        if p is not None and p.returncode != 0:
+            note("no ncurses headers: `make menuconfig` will not start -- the build does not need it  (%s)"
+                 % (pkg_line(pm, MENUCONFIG_PKG.get(pm, "ncurses")) or "ncurses development files"))
+    # Measured: a full 2500-module tree without debug info is 4.7 GB built, plus
+    # the tarball.  DWARF multiplies that several times over.
+    need = (4 if opts.get("modules") == "trimmed" else 10) << 30
+    if opts.get("debug_info") in ("btf", "on"):
+        need *= 4
+    have = free_bytes(opts["workdir"])
+    if have < need:
+        problems += 1
+        bad("%s has %s free; this build wants about %s" % (opts["workdir"], human(have), human(need)))
+        alt = roomy_places(need)
+        if alt:
+            info("     room elsewhere: %s" % "   ".join(
+                "--workdir %s (%s free)" % (os.path.join(d, "src") if d == os.path.expanduser("~")
+                                            else d, human(f)) for d, f in alt[:3]))
+        else:
+            info("     no writable disk filesystem here has that much free")
+    elif not quiet_ok:
+        ok("%s free in %s" % (human(have), opts["workdir"]))
+    if os.path.isdir("/boot") and free_bytes("/boot") < BOOT_NEED:
+        msg = "/boot has %s free; installing a kernel needs about %s" % (
+            human(free_bytes("/boot")), human(BOOT_NEED))
+        if opts.get("install"):
+            problems += 1
+            bad(msg)
+        else:
+            warn(msg + " -- before `install`, make room")
+        info("     " + FREE_BOOT.get(pm, "Remove a kernel you no longer use."))
+    if re.search(r"[\s:]", opts["workdir"]):
+        problems += 1
+        bad("kbuild cannot work in a path containing spaces or colons: %s" % opts["workdir"])
+    if fs_type(opts["workdir"]) in NOT_FOR_TREES:
+        # A USB stick as it comes, or the EFI partition: the tarball itself fails
+        # to extract (it holds symlinks), or names that differ only in case clash.
+        problems += 1
+        bad("%s is on %s: a kernel tree needs symlinks and case-sensitive names -- use "
+            "--workdir on a Linux filesystem" % (opts["workdir"], fs_type(opts["workdir"])))
+    traps = env_traps()
+    if traps and not quiet_ok:
+        note("your shell exports things that would leak into a build; every make "
+             "here runs in a scrubbed environment instead:")
+        for t in traps:
+            info("       " + t)
+    fwdirs = {"amd": "amdgpu", "intel": "i915", "nvidia": "nvidia"}
+    for vendor in machine.get("gpu_vendors", []):
+        if not glob.glob("/lib/firmware/%s/*" % fwdirs[vendor]) and vendor != "nvidia":
+            warn("a %s GPU is present but /lib/firmware/%s is empty: no kernel, however "
+                 "well configured, can start it.  Install linux-firmware."
+                 % (vendor.upper(), fwdirs[vendor]))
+    # Measured on kernel builds: ~1 GB per job is comfortable, DWARF doubles it.
+    per_job = 2 if opts.get("debug_info") in ("btf", "on") else 1
+    if machine["memory"] and opts.get("jobs") and \
+            machine["memory"] < opts["jobs"] * per_job * (1 << 30) * 0.75:
+        fit = max(1, int(machine["memory"] * 0.75 / (per_job << 30)))
+        warn("-j%d with %s of RAM: a kernel build wants about %d GB per job%s.  The OOM "
+             "killer ends such builds as 'make was killed by signal 9'.  --jobs %d fits."
+             % (opts["jobs"], human(machine["memory"]), per_job,
+                " with debug info" if per_job == 2 else "", fit))
+    ucode = {"GenuineIntel": "intel-ucode", "AuthenticAMD": "amd-ucode"}.get(machine["cpu"]["vendor"])
+    caveats = ucode == "intel-ucode" and os.access(CHECK_CAVEATS, os.X_OK)
+    if ucode and not quiet_ok and caveats and not glob.glob("/lib/firmware/%s/*" % ucode):
+        # EL: microcode_ctl keeps /lib/firmware/intel-ucode empty ON PURPOSE and hands
+        # microcode out kernel by kernel, after its own checks -- which a kernel
+        # built here fails by its name alone.  `install` sees to that.
+        note("CPU microcode comes from microcode_ctl here, kernel by kernel; `install` makes it "
+             "cover a kernel built here too, and checks the new initramfs for it")
+    elif ucode and not quiet_ok and not glob.glob("/lib/firmware/%s/*" % ucode) \
+            and not os.path.exists("/boot/%s.img" % ucode):         # Arch loads it from /boot
+        pkg = MICROCODE_PKG.get(pm, ("intel-microcode", "amd64-microcode"))[ucode != "intel-ucode"]
+        warn("/lib/firmware/%s is empty: no CPU microcode update loads here, on ANY kernel -- the "
+             "fixes for errata and security flaws that came after this BIOS.  Install it, then "
+             "rebuild the initramfs:\n      %s%s" % (
+                 ucode, pkg_line(pm, pkg) or "install " + pkg,
+                 " && " + REGEN_INITRAMFS[machine["boot"]["initramfs"]]
+                 if machine["boot"]["initramfs"] in REGEN_INITRAMFS else ""))
+    if machine["secure_boot"] == "on":
+        if opts.get("secure_boot", "on") == "on":
+            note("Secure Boot is ON here: the image is signed with your key (%s); this machine "
+                 "must trust its certificate once -- the build says how" % keys_dir())
+        else:
+            warn("Secure Boot is ON here, and --secure-boot off builds an UNSIGNED image: it "
+                 "will not boot on this machine")
+    return problems
+
+
+def install_deps(pm, dry=False, sign=False):
+    if not pm:
+        raise ToolError("no known package manager; install the build dependencies yourself")
+    say("Installing build dependencies (sudo %s)" % pm)
+    # Best-effort on purpose: one third-party repo with a bad GPG key makes dnf
+    # exit 1 having installed everything asked of it.  Preflight is the gate.
+    p = sudo(INSTALL_CMD[pm] + BUILD_DEPS[pm].split() + (SIGN_DEPS[pm].split() if sign else []),
+             check=False, dry=dry)
+    if p is not None and p.returncode != 0:
+        warn("%s exited %d -- continuing; preflight decides whether anything is missing"
+             % (pm, p.returncode))
+
+
+def resolve_tree(opts, fetch):
+    """-> (tree, target).  With fetch=False nothing is downloaded (plan)."""
+    if opts["source"]:
+        if not os.path.isfile(os.path.join(opts["source"], "Makefile")):
+            raise ToolError("no kernel source at %s" % opts["source"])
+        return opts["source"], None
+    latest, rels = get_releases()
+    cache = {}
+
+    def sums_for(major):
+        if major not in cache:
+            cache[major] = get_series_sums(major)
+        return cache[major]
+    target = resolve_kernel(opts["kernel"], latest, rels, sums_for)
+    info("kernel      : %s%s%s" % (target["version"],
+                                   "  (%s)" % target["moniker"] if target["moniker"] else "",
+                                   "  EOL -- no more fixes upstream" if target["eol"] else ""))
+    if fetch:
+        return os.path.realpath(fetch_source(target, opts["workdir"], opts["require_pgp"])), target
+    return os.path.join(opts["workdir"], "linux-" + target["version"]), target
+
+
+def show_plan(opts, machine, toolchain, vendors, why, tree):
+    say("Plan")
+    info("tree        : %s%s" % (tree, "" if os.path.isdir(tree) else "  (will be downloaded)"))
+    info("gpu drivers : %s  (%s) + VM/BMC/rescue, always" % (" ".join(sorted(vendors)) or "none", why))
+    info("compiler    : %s" % toolchain["version"])
+    info("              %s  [%s]" % (toolchain["path"], toolchain["origin"]))
+    for label, text in describe_tools(toolchain):
+        info("%-12s: %s" % (label, text))
+    if toolchain["args"]:
+        info("make args   : %s" % " ".join(shlex.quote(a) for a in toolchain["args"]))
+    if toolchain["usable"] == "fork":
+        warn("%s -- %s." % (toolchain["path"], toolchain["why"]))
+    if not toolchain["system"] or toolchain["experimental"]:
+        warn("%s is not the system compiler%s.  DKMS builds as root with the system "
+             "one; mixing compilers between a kernel and its modules is the usual "
+             "reason DKMS stops compiling." % (
+                 toolchain["path"], " and calls itself experimental" if toolchain["experimental"] else ""))
+    info("modules     : %s     cpu: %s     preempt: %s     hz: %s     debug info: %s"
+         % (opts["modules"], opts["cpu"], opts["preempt"], opts["hz"], opts["debug_info"]))
+    if opts["cpu"] != "generic":
+        if opts.get("_native_kconfig"):
+            how = "CONFIG_X86_NATIVE_CPU (-march=native)"
+        elif toolchain.get("kcflags"):
+            how = "KCFLAGS=" + toolchain["kcflags"]
+        elif opts["cpu"] == "native":         # `plan`: the tree may not be here yet
+            how = "CONFIG_X86_NATIVE_CPU from 6.16 on, KCFLAGS=-march=native before"
+        else:
+            how = "KCFLAGS=" + cpu_flags(opts["cpu"], "", machine["arch"])[1]
+        lvl, here = toolchain.get("cpu_level") or "", machine["cpu"].get("level") or ""
+        info("cpu tuning  : %s, through %s -- needs %s" % (opts["cpu"], how, LEVEL_CPUS.get(lvl, lvl)))
+        if lvl and here and LEVEL_RANK.get(lvl, 0) > LEVEL_RANK.get(here, 0):
+            warn("this kernel needs %s and THIS machine is %s: it will not boot here (fine for "
+                 "the machine it is meant for; `install` refuses it here)" % (lvl, here))
+    if (machine.get("nvidia") or {}).get("gpus"):
+        if "nvidia" not in vendors:
+            note("an NVIDIA GPU is here, and --gpu %s does not ask for nouveau: it is built only "
+                 "if the base config has it" % opts["gpu"])
+        show_outlook(nvidia_outlook(machine["nvidia"], machine["pkg_manager"]))
+    info("secure boot : %s" % ("ON -- Secure-Boot-ready config; image signed with your key (%s)"
+                               % (keys_dir() + "/secureboot.*")
+                               if opts["secure_boot"] == "on" else
+                               "off -- the image will NOT boot where Secure Boot is enabled"))
+    info("release     : <version>%s     jobs: %d     clean: %s"
+         % (opts["localversion"], opts["jobs"], opts["clean"]))
+    m = re.search(r"linux-(\d+\.\d+)", os.path.basename(tree))
+    try:
+        _, _, label = find_base_config(tree if os.path.isdir(tree) else "/nonexistent",
+                                       opts["config_base"],
+                                       target_series=m.group(1) if m else "",
+                                       skip_own=opts.get("_skip_own", False),
+                                       want_full=opts["modules"] == "full")
+    except ToolError as e:
+        label = "NONE -- " + str(e).splitlines()[0]
+    info("base config : %s" % label)
+    serving = in_service(tree)
+    if serving:
+        note("this tree is the DKMS build directory for installed kernel(s): %s"
+             % ", ".join(serving))
+    info("then        : %s" % ("install, %s the default boot entry" % (
+        "and make it" if opts["set_default"] else "WITHOUT changing") if opts["install"]
+        else "stop after building (install later with the `install` command)"))
+
+
+def cmd_plan(args):
+    opts = merge_options(args)
+    machine = detect_machine()
+    toolchain = resolve_toolchain(opts, machine)
+    vendors, why = resolve_gpu(opts["gpu"], machine["gpu_vendors"], machine["arch"])
+    say("Resolving")
+    tree, _ = resolve_tree(opts, fetch=False)
+    show_plan(opts, machine, toolchain, vendors, why, tree)
+    problems = doctor(opts, machine, toolchain)
+    if os.path.isdir(tree):
+        problems += check_tree_requirements(tree, toolchain,
+                                            need_pahole=opts["debug_info"] != "off")
+    out("")
+    info("nothing was downloaded, written or built." + (
+        "" if not problems else "  %d blocking problem(s) above." % problems))
+    return 1 if problems else 0
+
+
+def cmd_doctor(args):
+    opts = merge_options(args)
+    if opts["install_deps"]:
+        install_deps(find_pkg_manager(), opts["dry_run"], opts["secure_boot"] == "on")
+    machine = detect_machine()
+    try:
+        toolchain = resolve_toolchain(opts, machine)
+    except ToolError as e:
+        bad(str(e))
+        toolchain = None
+    problems = doctor(opts, machine, toolchain)
+    if (machine.get("nvidia") or {}).get("gpus"):
+        say("NVIDIA")
+        show_outlook(nvidia_outlook(machine["nvidia"], machine["pkg_manager"]))
+    return 1 if problems else 0
+
+
+def cmd_build(args, interactive=False):
+    opts = merge_options(args)
+    if opts["install_deps"]:
+        # First: on a fresh box there is no compiler to detect until this ran.
+        install_deps(find_pkg_manager(), opts["dry_run"], opts["secure_boot"] == "on")
+    reuse = None
+    if interactive and not getattr(args, "profile", None):
+        reuse = choose_profile(list_profiles())       # FIRST: before anything else is asked
+        if reuse:
+            args.profile = reuse["path"]
+            opts = merge_options(args)
+            opts["_profile_name"] = reuse["name"]
+    machine = detect_machine()
+    if interactive and not (reuse and reuse["as_is"]):
+        show_machine(machine)
+        latest, rels = get_releases()
+        opts = wizard(opts, machine, latest, rels)
+    toolchain = resolve_toolchain(opts, machine)
+    opts["_cpu_level"] = toolchain.get("cpu_level", "")
+    vendors, why = resolve_gpu(opts["gpu"], machine["gpu_vendors"], machine["arch"])
+    if doctor(opts, machine, toolchain, quiet_ok=False):
+        raise ToolError("preflight found blocking problems -- fix them, or re-run "
+                        "with --install-deps to let the package manager try")
+    say("Source")
+    tree, _ = resolve_tree(opts, fetch=True)
+    if re.search(r"[\s:]", tree):
+        raise ToolError("kbuild cannot build in a path with spaces or colons: %s" % tree)
+    lock_tree(tree)                 # before the state is READ: see lock_tree()
+    fit_llvm_to_tree(toolchain, tree)
+    apply_cpu(toolchain, opts, tree, machine["arch"])
+    sdir = state_dir(opts)
+    state = State(os.path.join(sdir, "state.ini"))
+    prev = state.get(tree)
+    # A tree last configured TRIMMED must not seed a FULL build with its .config.
+    opts["_skip_own"] = opts["modules"] == "full" and prev.get("modules") == "trimmed"
+    if opts["_skip_own"]:
+        note("this tree's .config came from a --modules trimmed run; a full build "
+             "starts from a full base instead")
+    show_plan(opts, machine, toolchain, vendors, why, tree)
+    say("What this tree requires of the build tools")
+    if check_tree_requirements(tree, toolchain, need_pahole=opts["debug_info"] != "off"):
+        raise ToolError("the chosen tools do not meet linux-%s's own minimums -- see "
+                        "`toolchains` for what else is installed" % os.path.basename(tree)[6:])
+    if opts["install"]:
+        say("Install preflight (now, not after the build)")
+        install_preflight(machine, opts)
+    if opts["save_profile"]:
+        save_profile(opts["save_profile"], opts)
+    if interactive and not ask("\nProceed? (y/n)", "y").lower().startswith("y"):
+        info("stopped before touching the tree.")
+        return 0
+
+    log_path = os.path.join(sdir, "build-%s.log" % os.path.basename(tree))
+    mk = Make(tree, toolchain, opts["jobs"])
+
+    say("Previous attempt on this tree")
+    info("recorded    : %s" % ("%s%s%s" % (
+        prev.get("status"), " at stage " + prev["stage"] if prev.get("stage") else "",
+        "  (%s)" % prev["finished"] if prev.get("finished") else "")
+        if prev else "nothing"))
+    has_objects = False
+    for dirpath, dirnames, files in os.walk(tree):
+        dirnames[:] = [d for d in dirnames if not (dirpath == tree and d in ("scripts", "tools", ".git"))]
+        if any(f.endswith(".o") for f in files):
+            has_objects = True
+            break
+    do_clean, why_clean = decide_clean(opts["clean"], has_objects, prev.get("status", ""),
+                                       prev.get("stage", ""), in_service(tree))
+    info("%-12s: %s" % ("cleaning" if do_clean else "keeping", why_clean))
+    # Before the record, the pin or the .config is touched: a refusal must leave
+    # the tree exactly as the installed kernels need it.
+    conflict = serving_conflict(tree, in_service(tree), opts["localversion"], toolchain["version"])
+    if conflict and opts["clean"] != "force":
+        raise ToolError(conflict)
+    keeper = None
+    if opts["install"] and not opts["dry_run"]:
+        # Before the long part, not after it.
+        say("sudo, once, now -- so the install at the end does not wait on a prompt")
+        keeper = SudoKeepalive()
+        keeper.start()
+    stage = "configure"
+    state.update(tree, status="configuring", stage=stage, started=now(), finished="",
+                 exit_code="", error="", last_error="", toolchain=toolchain["version"],
+                 jobs=opts["jobs"], log=log_path)
+    try:
+        recover_held_config(tree)       # before a backup could copy a staging file
+        if do_clean:
+            clean_tree(mk, tree, restore=opts["config_base"] == "auto")
+
+        # Image signing exists for x86_64 only.  Elsewhere the config is still made
+        # Secure-Boot-ready, but say so NOW: it used to fail after the whole compile,
+        # and leave a sign hook behind that broke every goal-less make in the tree.
+        sign_here = opts["secure_boot"] == "on" and bool(image_path(tree))
+        if opts["secure_boot"] == "on" and not sign_here:
+            warn("image signing is not implemented for %s: the configuration will be Secure-"
+                 "Boot-ready, the IMAGE will be unsigned." % os.uname().machine)
+        if pin_toolchain(tree, toolchain, sign_here) and pin_text(dict(toolchain, kcflags="")):
+            info("pinned      : %s -- out-of-tree builds against this tree will use %s too"
+                 % (PIN_FILE, toolchain["path"]))
+        say("Configuring")
+        staging, reqs, results, _ = configure(tree, opts, machine, mk, vendors)
+        say("Verifying the configuration")
+        fails = report_verify(results)
+        if fails:
+            rejected = os.path.join(tree, ".config.elkt-rejected")
+            os.replace(staging, rejected)
+            drop_staging_litter(staging)
+            raise ToolError("%d required option(s) did not come out as intended -- NOT "
+                            "building.\n  Each FAIL is a dependency that is off, not a typo: "
+                            "`make menuconfig`, then / to search the symbol.\n  The tree's "
+                            ".config was left untouched; the rejected one is %s"
+                            % (fails, rejected))
+        if check_compressors(DotConfig(staging), mk.env["PATH"]):
+            os.replace(staging, os.path.join(tree, ".config.elkt-rejected"))
+            drop_staging_litter(staging)
+            raise ToolError("the config needs a compressor that is not installed -- NOT "
+                            "building.  Install it, or choose another CONFIG_KERNEL_* / "
+                            "CONFIG_MODULE_COMPRESS_* with menuconfig.")
+        commit_config(tree, staging)
+        # So kernelrelease can see LOCALVERSION.  Before 4.19 the target was
+        # called silentoldconfig.
+        if mk.call(["syncconfig"], check=False).returncode != 0:
+            mk.call(["silentoldconfig"])
+        predicted = mk.value("kernelrelease")
+        cfg = DotConfig(os.path.join(tree, ".config"))
+        info("config      : %d built-in, %d modules" % (cfg.count("y"), cfg.count("m")))
+        info("release     : %s" % predicted)
+        state.update(tree, release=predicted, config_base=opts["config_base"],
+                     debug_info=opts["debug_info"], modules=opts["modules"])
+        if opts["configure_only"]:
+            say("Configured, not built  (--configure-only)")
+            info("review it:  make -C %s menuconfig" % tree)
+            info("then build: the same command without --configure-only")
+            state.update(tree, status="configured", stage="done", finished=now())
+            return 0
+
+        say("Building %s with -j%d" % (predicted, opts["jobs"]))
+        info("full log    : %s" % log_path)
+        stage = "build"
+        state.update(tree, status="building", stage=stage)
+        rc, stats = run_build(mk, log_path, opts["verbose"])
+        if rc != 0:
+            out("")
+            bad("the build failed (%s) after %dm%02ds.  First errors in the log:"
+                % ("make exit %d" % rc if rc > 0 else "make was killed by signal %d" % -rc,
+                   stats["seconds"] // 60, stats["seconds"] % 60))
+            for h in error_summary(log_path):
+                out("  " + h)
+            raise ToolError("build failed -- full log: %s\n  Re-running continues "
+                            "incrementally from where it stopped." % log_path)
+        # The authority, written by the build itself.
+        release = read_text(os.path.join(tree, "include/config/kernel.release")).strip() or predicted
+        ok("built in %dm%02ds: %d steps, %d warnings" % (
+            stats["seconds"] // 60, stats["seconds"] % 60, stats["steps"], stats["warnings"]))
+        # The record of what was BUILT -- written now, not when this run started:
+        # a run that fails or is cut off must not change what `install` trusts.
+        state.update(tree, status="built", stage="done", release=release,
+                     finished=now(), seconds=stats["seconds"], warnings=stats["warnings"],
+                     config_sha=sha256_file(os.path.join(tree, ".config")),
+                     **choice_record(opts, toolchain))
+
+        stage = "checks"
+        if sign_here:
+            k = secure_boot_sign(tree, machine)
+            state.update(tree, signed="yes", certificate=k["der"])
+        problems = post_build_checks(tree, toolchain, machine, vendors, release)
+        if not opts["install"]:
+            say("Built, not installed.")
+            # The exact flags, not "the same ones": install re-resolves the
+            # toolchain, and a clang-built tree re-probed with gcc is a bad day.
+            # `install` takes the compiler, its tools and the CPU flags from this
+            # tree's record by itself; they are spelled out for a reader.
+            same = "".join(" --%s %s" % (k.replace("_", "-"), shlex.quote(str(opts[k])))
+                           for k in ("cc", "cxx", "llvm_prefix", "binutils", "linker", "python",
+                                     "ccache", "cpu")
+                           if opts[k] != DEFAULTS[k])
+            if opts["toolchain"] != DEFAULTS["toolchain"] and not opts["cc"]:
+                same = " --toolchain %s%s" % (opts["toolchain"], same)
+            info("install with:  %s install --source %s%s"
+                 % (os.path.basename(sys.argv[0]), tree, same))
+            return 1 if problems else 0
+        if problems and not opts["yes"]:
+            raise ToolError("%d post-build check(s) failed -- NOT installing.  The build "
+                            "itself is intact; `install --yes` overrides." % problems)
+        stage = "install"
+        install_kernel(tree, mk, machine, vendors, release, opts, state)
+        return 0
+    except KeyboardInterrupt:
+        # As below: a ^C during the checks or the install says nothing about the
+        # BUILD.  Recording 'failed' made `install`/`package`/`sign` without
+        # --source pass over this tree and quietly pick an older one.
+        if stage in ("configure", "build"):
+            state.update(tree, status="failed", stage=stage, exit_code=130, finished=now())
+        else:
+            state.update(tree, last_error="%s: interrupted" % stage)
+        raise
+    except Exception as e:
+        # 'built' must survive a failure that came after it: see decide_clean().
+        first = (str(e).splitlines() or [type(e).__name__])[0][:200]
+        if stage in ("configure", "build"):
+            state.update(tree, status="failed", stage=stage, finished=now(),
+                         exit_code=1, error=first)
+        else:
+            state.update(tree, last_error="%s: %s" % (stage, first))
+        raise
+    finally:
+        if keeper:
+            keeper.stop()
+
+
+TREE_CHOICES = ("toolchain", "cc", "llvm_prefix", "cxx", "binutils", "linker", "python", "ccache", "cpu")
+
+
+def choice_record(opts, tc):
+    """What a FINISHED build writes into the tree's record, for the commands that
+    run make in that tree later.  A compiler given by bare name is recorded by the
+    path it resolved to: PATH may say otherwise tomorrow."""
+    rec = dict(("opt_" + k, opts[k]) for k in TREE_CHOICES)
+    if opts["cc"] and os.sep not in os.path.expanduser(opts["cc"]):
+        rec["opt_cc"] = tc["path"]
+    if opts["cxx"] and os.sep not in os.path.expanduser(opts["cxx"]) and tc.get("cxx"):
+        rec["opt_cxx"] = tc["cxx"]
+    rec.update(kcflags=tc.get("kcflags", ""), cpu_level=tc.get("cpu_level", ""))
+    return rec
+
+
+def has_record(rec):
+    """Was this tree finished by a build that records its choices?"""
+    return any(("opt_" + k) in rec for k in TREE_CHOICES)
+
+
+def tree_kcflags(tree, rec):
+    """The CPU flags TREE was built with: its record's, else what its GNUmakefile
+    hands on (a tree whose record is gone)."""
+    if has_record(rec):
+        return rec.get("kcflags", "")
+    m = re.search(r"^export KCFLAGS := (.*)$", read_text(os.path.join(tree, PIN_FILE)), re.M)
+    return m.group(1).replace("$$", "$").strip() if m else ""
+
+
+def adopt_tree_choices(opts, rec, tree, machine):
+    """install / package / pin / dkms-check on a built tree: every toolchain
+    choice THIS command line does not make is taken from the tree's record, so
+    `install --source TREE` alone runs the make that built it.  A tree with no
+    record (built by hand, or by an older version of this tool) gets the
+    installed compiler whose banner its .config names."""
+    given, taken = opts.get("_given", ()), []
+    if has_record(rec):
+        for k in TREE_CHOICES:
+            v = rec.get("opt_" + k)
+            if v is not None and k not in given and str(opts[k]) != v:
+                opts[k] = v
+                taken.append("%s %s" % (k, v or "(default)"))
+    else:
+        if not ({"cc", "toolchain", "llvm_prefix"} & set(given)):
+            want = DotConfig(os.path.join(tree, ".config")).get("CC_VERSION_TEXT") or ""
+            t = next((t for t in machine.get("toolchains", [])
+                      if want and t["version"] == want and t["usable"] != "no"), None)
+            if t and t["real"] != os.path.realpath("/usr/bin/gcc"):
+                opts["cc"] = t["path"]
+                taken.append("cc %s" % t["path"])
+        m = re.search(r"-march=(\S+)", tree_kcflags(tree, rec))
+        if m and "cpu" not in given and opts["cpu"] != m.group(1):
+            opts["cpu"] = m.group(1)
+            taken.append("cpu %s" % m.group(1))
+    if taken:
+        info("as built    : %s" % ", ".join(taken))
+    return taken
+
+
+def tree_toolchain(opts, machine, tree, rec, strict=True):
+    """The toolchain for a command that runs make in a BUILT tree: the one that
+    built it, taken from the tree's record where this command line says nothing.
+
+    strict (package, pin): another compiler, or other CPU flags, are refused --
+    packaging compiles the whole kernel again, and a pin must name what built
+    the tree.  Not strict (install, dkms-check): `make modules_install` and
+    `make install` compile nothing and never re-run Kconfig (kbuild lists
+    %install among its no-sync-config targets), so a compiler that changed since
+    the build -- a gcc errata update, clang-current pointed elsewhere -- is said,
+    not refused, and one that is gone falls back to the default."""
+    adopt_tree_choices(opts, rec, tree, machine)
+    validate_options(opts)
+    try:
+        tc = resolve_toolchain(opts, machine)
+    except ToolError as e:
+        if strict:
+            raise
+        warn("the toolchain this tree was built with cannot be set up now (%s) -- going on "
+             "with the default: installing compiles nothing" % str(e).splitlines()[0])
+        for k in TREE_CHOICES:
+            if k not in opts.get("_given", ()):
+                opts[k] = DEFAULTS[k]
+        tc = resolve_toolchain(opts, machine)
+    fit_llvm_to_tree(tc, tree)
+    apply_cpu(tc, opts, tree, machine["arch"])
+    built = DotConfig(os.path.join(tree, ".config")).get("CC_VERSION_TEXT")
+    if built and built != tc["version"]:
+        msg = "%s was built with\n      %s\n  not with %s" % (tree, built, tc["version"])
+        if strict:
+            raise ToolError(msg + ".\n  This compiles again: pass the --cc it was built with.")
+        warn(msg + " -- that is fine for installing, which compiles nothing")
+    flags = tree_kcflags(tree, rec)
+    if strict and tc.get("kcflags", "") != flags:
+        raise ToolError("%s was built with %s, and this would compile it all again with %s.  "
+                        "Pass the --cpu it was built with." % (
+                            tree, "KCFLAGS=" + flags if flags else "no CPU flags",
+                            "KCFLAGS=" + tc["kcflags"] if tc.get("kcflags") else "none"))
+    level = rec.get("cpu_level", "") if has_record(rec) else ""
+    m = re.search(r"-march=(\S+)", flags)
+    if not level and m:
+        level = march_level(tc["path"], m.group(1), scrubbed_env(tc.get("extra_path"))) or ""
+    opts["_cpu_level"] = level
+    return tc
+
+
+def tree_is_stale(tree, rec):
+    """'' or why the kernel built in TREE is not the tree as it is configured now.
+    A finished build records a checksum of the .config it built -- file times
+    cannot say it: a change that touches only modules never relinks vmlinux.
+    A run that failed at CONFIGURE left the .config alone (a rejected one is set
+    aside), so the checksum decides there too."""
+    st, stage = rec.get("status", ""), rec.get("stage", "")
+    if st == "building":
+        return "the last build of this tree never finished (it recorded 'building')"
+    if st == "failed" and stage == "build":
+        return ("the last build of this tree FAILED (at build, %s): what is in it is partly that "
+                "build, partly an earlier one" % (rec.get("finished") or "?"))
+    cfg, sha = os.path.join(tree, ".config"), rec.get("config_sha")
+    if sha:
+        if os.path.isfile(cfg) and sha256_file(cfg) != sha:
+            return ".config has changed since this tree was last built"
+        return ""
+    if st == "configured":
+        return "this tree was configured again after its last build"
+    return ""
+
+
+def built_tree(opts, state):
+    if opts["source"]:
+        return opts["source"]
+    done = [(state.get(t).get("finished", ""), t) for t in state.trees()
+            if state.get(t).get("status") in ("built", "installing", "installed")
+            and os.path.isdir(t)]
+    if not done:
+        raise ToolError("no built tree on record -- pass --source <tree>")
+    return sorted(done)[-1][1]
+
+
+def cmd_install(args):
+    opts = merge_options(args)
+    if os.geteuid() == 0:
+        raise ToolError("do not run this as root; it calls sudo itself where needed")
+    machine = detect_machine()
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    tree = built_tree(opts, state)
+    lock_tree(tree)
+    release = read_text(os.path.join(tree, "include/config/kernel.release")).strip()
+    if not release or not os.path.isfile(os.path.join(tree, "vmlinux")):
+        raise ToolError("%s has not been built (no vmlinux / kernel.release)" % tree)
+    recover_held_config(tree)       # a run killed mid-trim leaves its staging copy as .config
+    rec = state.get(tree)
+    stale = tree_is_stale(tree, rec)
+    if stale:
+        raise ToolError("%s -- NOT installing.\n  Build it first:  %s.py build --source %s"
+                        % (stale, TOOL, tree))
+    info("tree        : %s" % tree)
+    info("release     : %s" % release)
+    toolchain = tree_toolchain(opts, machine, tree, rec, strict=False)
+    cfg = DotConfig(os.path.join(tree, ".config"))
+    vendors = set(v for v, s in (("amd", "DRM_AMDGPU"), ("nvidia", "DRM_NOUVEAU"),
+                                 ("intel", "DRM_I915")) if cfg.get(s) in ("m", "y"))
+    mk = Make(tree, toolchain, opts["jobs"])
+    # `build --install` refuses to install a tree that failed these; so must this.
+    problems = post_build_checks(tree, toolchain, machine, vendors, release)
+    if problems and not opts["yes"]:
+        raise ToolError("%d post-build check(s) failed -- NOT installing.  --yes overrides."
+                        % problems)
+    install_kernel(tree, mk, machine, vendors, release, opts, state)
+    return 0
+
+
+def cmd_sign(args):
+    opts = merge_options(args)
+    machine = detect_machine()
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    tree = built_tree(opts, state)
+    lock_tree(tree)
+    info("tree        : %s" % tree)
+    k = secure_boot_sign(tree, machine)
+    cfg = DotConfig(os.path.join(tree, ".config"))
+    for sym in ("EFI_STUB", "MODULE_SIG", "MODULE_SIG_ALL"):
+        if cfg.get(sym) != "y":
+            warn("CONFIG_%s is not set in this tree: signed or not, it is not Secure-Boot-"
+                 "ready.  Rebuild with --secure-boot on." % sym)
+    state.update(tree, signed="yes", certificate=k["der"])
+    return 0
+
+
+PKG_TARGET = {"rpm": "binrpm-pkg", "deb": "bindeb-pkg", "tar": "tarxz-pkg"}
+INSTALL_TXT = """{release} -- built {date} with {compiler}
+Configuration: {summary}
+
+INSTALL
+{steps}
+
+SECURE BOOT
+{sb}
+
+WHAT THIS KERNEL EXPECTS OF YOUR MACHINE
+{expects}
+
+Verify the download first:   sha256sum -c SHA256SUMS
+"""
+
+
+def tree_summary(cfg, kcflags="", level=""):
+    """What the TREE is, read from its config -- not what this command's options
+    happen to say (a trimmed build packaged with default options is still trimmed).
+    kcflags: the CPU flags it was built with, which are not in its config."""
+    preempt = next((name for name, sym in (("lazy", "PREEMPT_LAZY"), ("full", "PREEMPT"),
+                                           ("voluntary", "PREEMPT_VOLUNTARY"), ("none", "PREEMPT_NONE"))
+                    if cfg.get(sym) == "y"), "?")
+    gpus = [n for n, sym in (("amdgpu", "DRM_AMDGPU"), ("nouveau", "DRM_NOUVEAU"),
+                             ("i915", "DRM_I915"), ("xe", "DRM_XE")) if cfg.get(sym) in ("m", "y")]
+    return "%d modules, %d built-in | GPU: %s | CPU: %s | preempt %s%s, HZ %s | BTF %s" % (
+        cfg.count("m"), cfg.count("y"), " ".join(gpus) or "none",
+        "native (-march=native)" if cfg.get("X86_NATIVE_CPU") == "y" or "-march=native" in kcflags
+        else "%s (%s)" % (kcflags, level or "?") if kcflags else "generic",
+        preempt, " (switchable at boot: preempt=)" if cfg.get("PREEMPT_DYNAMIC") == "y" else "",
+        cfg.get("HZ") or "?", "yes" if cfg.get("DEBUG_INFO_BTF") == "y" else "no")
+
+
+def packaged_image_signed(fmt, pkg, k):
+    """Open the package and look at the vmlinuz INSIDE it.  -> True / False, or
+    None when no image could be got out of it."""
+    d = tempfile.mkdtemp(prefix="elkt-pkg-")
+    try:
+        if fmt == "rpm":
+            cmd = "rpm2cpio %s | cpio -id --quiet './lib/modules/*/vmlinuz' './boot/vmlinuz*'" % shlex.quote(pkg)
+        elif fmt == "deb":
+            cmd = "dpkg-deb --fsys-tarfile %s | tar -x --wildcards './boot/vmlinuz*'" % shlex.quote(pkg)
+        else:
+            cmd = "tar -xf %s --wildcards '*/vmlinuz*' 'boot/vmlinuz*'" % shlex.quote(pkg)
+        run(["sh", "-c", cmd], cwd=d, check=False, env=scrubbed_env())
+        for dirpath, _, files in os.walk(d):
+            for fn in files:
+                if fn.startswith("vmlinuz"):
+                    return image_signed_by(os.path.join(dirpath, fn), k)
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_package(args):
+    opts = merge_options(args)
+    machine = detect_machine()
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    tree = built_tree(opts, state)
+    toolchain = tree_toolchain(opts, machine, tree, state.get(tree))     # packaging runs make again
+    cfg = DotConfig(os.path.join(tree, ".config"))
+    fmt = getattr(args, "format", None) or (
+        "rpm" if which("rpmbuild", path=":".join(SYSTEM_PATH)) else
+        "deb" if which("dpkg-deb", path=":".join(SYSTEM_PATH)) else "tar")
+    if fmt not in PKG_TARGET:
+        raise ToolError("--format must be rpm, deb or tar")
+    need = {"rpm": "rpmbuild", "deb": "dpkg-deb", "tar": "tar"}[fmt]
+    if not which(need, path=":".join(SYSTEM_PATH)):
+        raise ToolError("--format %s needs %s, which is not installed" % (fmt, need))
+    sb = opts["secure_boot"] == "on"
+    if not os.path.isfile(os.path.join(tree, "vmlinux")):
+        raise ToolError("%s has not been built (no vmlinux) -- build it first" % tree)
+    if sb and fmt == "deb":
+        # Said BEFORE the long run, not after it.  bindeb-pkg re-links the kernel
+        # under a new build number in `make ... headers all` -- a make WITH goals,
+        # which the tree's wrapper does not (and must not) hook -- so the image in
+        # the .deb would be unsigned, and the check below would throw it away.
+        raise ToolError("--format deb cannot carry a signed image yet: its build step re-links "
+                        "the kernel where this tool cannot re-sign it.\n  Use --format tar (the "
+                        "signed image goes in as it is), or --secure-boot off for an unsigned .deb.")
+    lock_tree(tree)
+    k = signing_key() if sb else None
+    say("Packaging %s as %s" % (tree, fmt))
+    if sb:
+        # A tree built with --secure-boot off, or by hand, is signed here; tarxz-pkg
+        # packs the image as it finds it (its `make -f Makefile` bypasses the wrapper).
+        sign_image(tree, k)
+    pin_toolchain(tree, toolchain, sb)          # the wrapper is what keeps the image signed
+    log_path = os.path.join(state_dir(opts), "package-%s.log" % os.path.basename(tree))
+    info("full log    : %s" % log_path)
+    mk = Make(tree, toolchain, opts["jobs"])
+    started = time.time()
+    # NOT ELKT_NO_SIGN here: the package's own build step relinks the kernel, and
+    # the wrapper re-signing at the end of it is the whole point.
+    # ELKT_TREE_LOCKED: the hook's `sign` runs UNDER this process's lock on the tree.
+    # As install_kernel() does: a --debug-info btf tree carries DWARF only so that
+    # BTF could be made from it.  The rpm spec strips modules only when it builds a
+    # debuginfo package (never here), so without this every module ships ~10x its
+    # size.  A command-line variable reaches the package's own `make
+    # modules_install` through MAKEFLAGS; kbuild strips BEFORE it signs.
+    strip = ["INSTALL_MOD_STRIP=1"] if cfg.get("DEBUG_INFO_BTF") == "y" \
+        and state.get(tree).get("debug_info") == "btf" else []
+    if strip:
+        info("modules     : stripped of DWARF in the package (BTF stays), as `install` does")
+    rc, stats = run_build(mk, log_path, opts["verbose"], strip + [PKG_TARGET[fmt]],
+                          {"ELKT_NO_SIGN": "" if sb else "1", "ELKT_NO_PIN": "",
+                           "ELKT_TREE_LOCKED": "1"})
+    if rc != 0:
+        bad("packaging failed (make exit %d).  First errors in the log:" % rc)
+        for h in error_summary(log_path):
+            out("  " + h)
+        raise ToolError("see %s" % log_path)
+    release = read_text(os.path.join(tree, "include/config/kernel.release")).strip()
+    where = {"rpm": os.path.join(tree, "rpmbuild", "RPMS", "**", "*.rpm"),
+             "deb": os.path.join(os.path.dirname(tree), "*.deb"),
+             "tar": os.path.join(tree, "*.tar.xz")}[fmt]
+    pkgs = sorted(f for f in glob.glob(where, recursive=True) if os.path.getmtime(f) >= started - 5)
+    if not pkgs:
+        raise ToolError("make succeeded but no %s package newer than this run was found (%s)" % (fmt, where))
+    ok("packaged in %dm%02ds" % (stats["seconds"] // 60, stats["seconds"] % 60))
+
+    main_pkg = next((f for f in pkgs if re.search(r"(kernel|linux-image)-?\d", os.path.basename(f))
+                     and "devel" not in f and "headers" not in f and "dbg" not in f), pkgs[0])
+    if sb:
+        # BEFORE anything reaches the publish directory.
+        signed = packaged_image_signed(fmt, main_pkg, k)
+        if signed:
+            ok("the kernel image INSIDE %s is signed with '%s'" % (os.path.basename(main_pkg), key_cn(k)))
+        else:
+            raise ToolError("the kernel image inside %s %s -- not publishing it; nothing was "
+                            "copied.\n  (The tree's %s re-signs after the package's build step; "
+                            "was it removed?  The packages are still in %s)"
+                            % (os.path.basename(main_pkg),
+                               "is NOT signed with your key" if signed is False
+                               else "could not be looked at", PIN_FILE, os.path.dirname(main_pkg)))
+    outdir = os.path.abspath(os.path.expanduser(getattr(args, "output", None) or
+                                                os.path.join("~", "kernel-packages", release)))
+    os.makedirs(outdir, exist_ok=True)
+    # One publish directory per RELEASE, and a release is rebuilt (another
+    # compiler, another CPU setting, a new build number): what an earlier run of
+    # THIS command put there must not sit beside the new set, checksummed as if
+    # it belonged to it.  Only file kinds this command writes are removed.
+    for old in sorted(os.listdir(outdir)):
+        if old in ("INSTALL.txt", "SHA256SUMS", "secureboot.der") \
+                or old.endswith((".rpm", ".deb", ".tar.xz")):
+            os.unlink(os.path.join(outdir, old))
+            info("removed     : %s  (from an earlier run)" % old)
+    for f in pkgs:
+        shutil.copy2(f, outdir)
+    if sb:
+        shutil.copy2(k["der"], os.path.join(outdir, "secureboot.der"))
+    # kernel-headers (rpm) is the USERSPACE headers package and is always built;
+    # what builds a module is kernel-devel (rpm) / linux-headers (deb).
+    has_devel = any(re.match(r"(kernel-devel-|linux-headers-)", os.path.basename(f)) for f in pkgs)
+    names = [os.path.basename(f) for f in pkgs]
+    steps = {"rpm": "  sudo dnf install ./%s\n  reboot, and pick %s from the boot menu" % (
+                 " ./".join(n for n in names if "headers" not in n), release),
+             "deb": "  sudo apt install ./%s\n  reboot, and pick %s from the boot menu" % (" ./".join(names), release),
+             # --keep-directory-symlink is NOT optional: the archive has a lib/
+             # directory, /lib is a symlink on every usr-merged distro, and GNU
+             # tar's default is to replace such a symlink with a real directory --
+             # on Debian that takes ld-linux away and nothing runs any more.
+             "tar": "  sudo tar -C / --keep-directory-symlink --no-overwrite-dir -xf %s\n"
+                    "      (GNU tar.  Do NOT leave --keep-directory-symlink out: /lib is a symlink,\n"
+                    "       and plain `tar -C / -xf` would replace it with a directory.)\n"
+                    "  sudo depmod %s && sudo dracut --kver %s   (or update-initramfs -c -k %s)\n"
+                    "  add a boot entry (grubby --add-kernel / update-grub), reboot" % (names[0], release, release, release)}[fmt]
+    native = cfg.get("X86_NATIVE_CPU") == "y"
+    kcf, lvl = toolchain.get("kcflags", ""), opts.get("_cpu_level", "")
+    expects = ["  CPU: %s" % ("built with -march=native on '%s' -- it needs a CPU with at least that "
+                              "instruction set, and will not boot on an older one" % machine["cpu"]["model"]
+                              if native or "-march=native" in kcf else
+                              "built with KCFLAGS=%s -- it needs %s, and will not boot on an older "
+                              "one" % (kcf, LEVEL_CPUS.get(lvl, "a CPU of that kind")) if kcf
+                              else "any %s CPU" % machine["arch"]),
+               "  Out-of-tree modules (DKMS, NVIDIA, VirtualBox): %s" % (
+                   "install the kernel-devel / linux-headers package too; they are built with YOUR "
+                   "system compiler" if has_devel else
+                   "NOT possible -- a tar archive carries no build tree" if fmt == "tar" else
+                   "NOT possible -- no kernel-devel package was produced (kbuild omits it when CC "
+                   "and HOSTCC differ)")]
+    if not has_devel:
+        warn("no kernel-devel / linux-headers package in this set: whoever installs it cannot "
+             "build a module (DKMS, NVIDIA).  INSTALL.txt says so.")
+    if not toolchain["system"]:
+        expects.append("  ! built with %s, which is not a distro compiler: module builds on another "
+                       "machine need a compiler that accepts the same flags.  For a kernel other "
+                       "people install, build with the system compiler." % toolchain["version"][:60])
+    sbtxt = ("  The image is signed with '%s'.  With Secure Boot ENABLED, trust it once:\n"
+             "      sudo mokutil --import secureboot.der     (pick a one-time password)\n"
+             "      reboot -> blue MOK Manager screen -> Enroll MOK -> that password\n"
+             "  With Secure Boot disabled, skip this." % key_cn(k)) if sb else \
+        "  NOT signed: boots only with Secure Boot disabled."
+    with open(os.path.join(outdir, "INSTALL.txt"), "w") as f:
+        f.write(INSTALL_TXT.format(release=release, date=time.strftime("%Y-%m-%d"),
+                                   compiler=toolchain["version"][:70],
+                                   summary=tree_summary(cfg, kcf, lvl),
+                                   steps=steps, sb=sbtxt, expects="\n".join(expects)))
+    # Exactly this run's files -- not whatever else is in the directory.
+    with open(os.path.join(outdir, "SHA256SUMS"), "w") as f:
+        for n in sorted(names + ["INSTALL.txt"] + (["secureboot.der"] if sb else [])):
+            f.write("%s  %s\n" % (sha256_file(os.path.join(outdir, n)), n))
+    say("Ready to publish: %s" % outdir)
+    for n in sorted(os.listdir(outdir)):
+        info("%10s  %s" % (human(os.path.getsize(os.path.join(outdir, n))), n))
+    if not toolchain["system"]:
+        warn("built with a non-distro compiler -- see INSTALL.txt, 'WHAT THIS KERNEL EXPECTS'")
+    state.update(tree, packaged=outdir)
+    return 0
+
+
+def cmd_pin(args):
+    opts = merge_options(args)
+    machine = detect_machine()
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    tree = built_tree(opts, state)
+    cfg = DotConfig(os.path.join(tree, ".config"))
+    built_by = cfg.get("CC_VERSION_TEXT") or ""
+    info("tree        : %s" % tree)
+    info("built with  : %s" % (built_by or "unknown -- not configured?"))
+    toolchain = tree_toolchain(opts, machine, tree, state.get(tree))     # a pin names what BUILT it
+    if pin_toolchain(tree, toolchain, opts["secure_boot"] == "on") and pin_text(toolchain):
+        ok("pinned: %s" % os.path.join(tree, PIN_FILE))
+    else:
+        info("nothing to pin: this is the system toolchain, which is what everything uses anyway")
+    release = read_text(os.path.join(tree, "include/config/kernel.release")).strip()
+    return 0 if dkms_check(tree, toolchain, machine, release) else 1
+
+
+def cmd_dkms_check(args):
+    opts = merge_options(args)
+    machine = detect_machine()
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    tree = built_tree(opts, state)
+    toolchain = tree_toolchain(opts, machine, tree, state.get(tree), strict=False)
+    release = read_text(os.path.join(tree, "include/config/kernel.release")).strip()
+    info("tree        : %s  (%s)" % (tree, release or "release unknown -- not built?"))
+    return 0 if dkms_check(tree, toolchain, machine, release) else 1
+
+
+def cmd_status(args):
+    opts = merge_options(args)
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    say("Known source trees  (%s)" % state.path)
+    if not state.trees():
+        info("none yet")
+    for tree in state.trees():
+        s = state.get(tree)
+        gone = "" if os.path.isdir(tree) else "   [directory is gone]"
+        out("\n  %s%s" % (tree, gone))
+        info("  %s%s   release %s   %s" % (
+            s.get("status", "?"), " at " + s["stage"] if s.get("stage") not in ("", "done", None) else "",
+            s.get("release", "?"), s.get("finished") or "started " + s.get("started", "?")))
+        serving = in_service(tree)
+        if serving:
+            info("  in service as the DKMS build dir of: %s" % ", ".join(serving))
+        if s.get("error") or s.get("last_error"):
+            info("  last error: %s" % (s.get("error") or s.get("last_error")))
+    return 0
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--state-dir", help="where state.ini and build logs live "
+                        "(default: ~/.local/state/%s)" % TOOL)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+
+    b = argparse.ArgumentParser(add_help=False)
+    b.add_argument("--kernel", help="stable | longterm | mainline | 6.12 | 6.12.9  (default stable)")
+    b.add_argument("--source", help="an existing kernel tree; skips the download")
+    b.add_argument("--workdir", help="where trees are downloaded and built (default ~/src)")
+    b.add_argument("--gpu", help="auto | all | none | amd,nvidia,intel  (default auto)")
+    b.add_argument("--toolchain", help="gcc | llvm  (default gcc = the SYSTEM gcc)")
+    b.add_argument("--cc", help="the compiler: any gcc or clang, by path or name "
+                   "(see the `toolchains` command)")
+    b.add_argument("--llvm-prefix", dest="llvm_prefix", help="directory holding clang, ld.lld ...")
+    b.add_argument("--cxx", help="the C++ compiler (kbuild's HOSTCXX: GCC plugins, xconfig); "
+                   "default: the one installed beside --cc")
+    b.add_argument("--binutils", help="auto | gnu | llvm | <dir holding ld and as>  (default auto: "
+                   "what goes with the compiler)")
+    b.add_argument("--linker", help="default | bfd | lld")
+    b.add_argument("--python", help="the python3 kbuild's scripts run under (default /usr/bin/python3)")
+    b.add_argument("--ccache", help="off | on")
+    b.add_argument("--config-base", dest="config_base",
+                   help="auto | running | defconfig | <file>  (default auto)")
+    b.add_argument("--modules", help="full | trimmed (localmodconfig + GPU + rescue set)")
+    b.add_argument("--keep-symbol", action="append",
+                   help="with --modules trimmed: also keep this CONFIG symbol (repeatable)")
+    b.add_argument("--cpu", help="generic | x86-64-v2 | x86-64-v3 | x86-64-v4 | native | a CPU name "
+                   "the compiler knows (raptorlake, znver4 ...)  (default generic)")
+    b.add_argument("--preempt", help="keep | none | voluntary | full | lazy")
+    b.add_argument("--hz", help="keep | 100 | 250 | 300 | 1000")
+    b.add_argument("--debug-info", dest="debug_info", help="off | btf | on")
+    b.add_argument("--secure-boot", dest="secure_boot",
+                   help="on | off  (default on: Secure-Boot-ready config, and the image signed "
+                        "with your key -- see the `sign` command)")
+    b.add_argument("--localversion", help="release suffix (default -elkt)")
+    b.add_argument("--frame-warn", dest="frame_warn", help="-Wframe-larger-than (default 8192)")
+    b.add_argument("--jobs", help="parallel jobs (default: all CPUs)")
+    b.add_argument("--clean", help="auto | always | never | force")
+    b.add_argument("--profile", help="a saved profile, by name (see `profiles`) or by path")
+    b.add_argument("--save-profile", dest="save_profile", help="write the resolved answers to a profile")
+    b.add_argument("--require-pgp", action="store_true", help="refuse an unverified sha256sums.asc")
+    b.add_argument("--install-deps", action="store_true", help="run the package manager first (sudo)")
+    b.add_argument("--configure-only", action="store_true",
+                   help="stop once the config is verified and written; build nothing")
+    b.add_argument("--install", action="store_true", help="install after a successful build")
+    b.add_argument("--set-default", action="store_true", help="make the new kernel the default boot entry")
+    b.add_argument("--allow-unsigned", action="store_true", help="install even though Secure Boot is on")
+    b.add_argument("--dry-run", action="store_true", help="install: print the sudo commands, run none")
+    b.add_argument("--yes", action="store_true", help="do not stop for confirmations")
+    b.add_argument("--verbose", action="store_true", help="stream the whole build instead of a status line")
+
+    p = argparse.ArgumentParser(
+        prog=TOOL + ".py", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Pick, configure, build and install a Linux kernel for this machine.\n"
+                    "With no command on a terminal it asks; every question is also a flag.")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="command")
+    k = sub.add_parser("kernels", parents=[common], help="what kernel.org offers right now")
+    k.add_argument("--series", help="list every point release of a series, e.g. 6.12")
+    sub.add_parser("detect", parents=[common], help="what this machine is")
+    sub.add_parser("profiles", parents=[common], help="the saved profiles")
+    sub.add_parser("toolchains", parents=[common, b],
+                   help="every compiler, binutils set and python here; what would be used")
+    sub.add_parser("doctor", parents=[common, b], help="can this machine build a kernel?")
+    sub.add_parser("plan", parents=[common, b], help="resolve everything, touch nothing")
+    sub.add_parser("build", parents=[common, b], help="fetch, configure, verify, build, check")
+    sub.add_parser("wizard", parents=[common, b], help="ask, then build")
+    sub.add_parser("install", parents=[common, b], help="install a built tree")
+    sub.add_parser("dkms-check", parents=[common, b], help="will out-of-tree modules compile?")
+    pk = sub.add_parser("package", parents=[common, b],
+                        help="turn a built tree into an RPM / deb / tarball other people can install")
+    pk.add_argument("--format", help="rpm | deb | tar  (default: what this machine can build)")
+    pk.add_argument("--output", help="where the finished set goes (default ~/kernel-packages/<release>)")
+    sub.add_parser("pin", parents=[common, b],
+                   help="make a built tree use ITS compiler for every out-of-tree build (DKMS, installers)")
+    sub.add_parser("sign", parents=[common, b],
+                   help="sign a built tree's kernel image for Secure Boot (makes your key on first use)")
+    sub.add_parser("status", parents=[common, b], help="recorded state of every known tree")
+    return p
+
+
+def _as_interrupt(signum, frame):
+    raise KeyboardInterrupt()
+
+
+COMMANDS = ("kernels", "detect", "toolchains", "profiles", "sign", "pin", "package", "doctor", "plan", "build", "wizard", "install",
+            "dkms-check", "status")
+
+
+def normalize_argv(argv):
+    argv = list(argv)
+    # `tool.py --kernel 6.12` means "ask me the rest".  argparse cannot express a
+    # default subcommand, so put it there before it looks.  Only argv[0] can be
+    # the command: a VALUE may well be spelled 'build' (--workdir build).
+    if not argv or argv[0] not in COMMANDS + ("-h", "--help", "--version"):
+        argv = ["wizard"] + argv
+    # Every LOCALVERSION starts with '-', which argparse reads as an option and
+    # answers with "expected one argument".  Glue the pair into --opt=value.
+    for i in range(len(argv) - 1):
+        if argv[i] == "--localversion":
+            argv[i:i + 2] = ["--localversion=" + argv[i + 1]]
+            break
+    return argv
+
+
+def main(argv=None):
+    parser = build_parser()
+    argv = normalize_argv(sys.argv[1:] if argv is None else argv)
+    # A dropped ssh session is a SIGHUP, systemd stopping a unit a SIGTERM.
+    # Unhandled, neither runs a finally: state stays 'building' and the next run
+    # cleans a good tree.  As KeyboardInterrupt they take the ^C path.
+    # But a SIGHUP somebody chose to IGNORE (`nohup tool build &`) stays ignored:
+    # replacing it aborted the build at logout and took make's immunity with it.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, _as_interrupt)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "wizard":
+            if not sys.stdin.isatty():
+                out("Not a terminal: nothing to ask.  Use `build` with flags or "
+                    "--profile, or see --help.")
+                return 2
+            return cmd_build(args, interactive=True)
+        return {"kernels": cmd_kernels, "detect": cmd_detect, "doctor": cmd_doctor,
+                "plan": cmd_plan, "build": cmd_build, "install": cmd_install,
+                "dkms-check": cmd_dkms_check, "status": cmd_status,
+                "toolchains": cmd_toolchains, "profiles": cmd_profiles,
+                "sign": cmd_sign, "pin": cmd_pin, "package": cmd_package}[args.command](args)
+    except ToolError as e:
+        out("\n" + _c("31", "ERROR:") + " " + str(e))
+        return 1
+    except KeyboardInterrupt:
+        out("\ninterrupted -- the tree is consistent; re-running continues incrementally.")
+        return 130
+
+
+def _ensure_platform_python():
+    """Started as `python3 tool.py` where python3 is PyPy or a private build?
+    Re-exec under the platform interpreter, once."""
+    if sys.implementation.name == "cpython" or os.environ.get("ELKT_NO_REEXEC"):
+        return
+    if os.path.exists(PLATFORM_PYTHON) and \
+            os.path.realpath(sys.executable) != os.path.realpath(PLATFORM_PYTHON):
+        os.environ["ELKT_NO_REEXEC"] = "1"
+        os.execv(PLATFORM_PYTHON, [PLATFORM_PYTHON, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+
+
+if __name__ == "__main__":
+    _ensure_platform_python()
+    sys.exit(main())

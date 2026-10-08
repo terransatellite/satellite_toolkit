@@ -1,0 +1,407 @@
+
+### os
+NAME="AlmaLinux"
+VERSION="10.2 (Lavender Lion)"
+RELEASE_TYPE=stable
+ID="almalinux"
+ID_LIKE="rhel centos fedora"
+VERSION_ID="10.2"
+PLATFORM_ID="platform:el10"
+PRETTY_NAME="AlmaLinux 10.2 (Lavender Lion)"
+ANSI_COLOR="0;34"
+LOGO="fedora-logo-icon"
+CPE_NAME="cpe:/o:almalinux:almalinux:10.2"
+HOME_URL="https://almalinux.org/"
+DOCUMENTATION_URL="https://wiki.almalinux.org/"
+VENDOR_NAME="AlmaLinux"
+VENDOR_URL="https://almalinux.org/"
+BUG_REPORT_URL="https://bugs.almalinux.org/"
+
+ALMALINUX_MANTISBT_PROJECT="AlmaLinux-10"
+ALMALINUX_MANTISBT_PROJECT_VERSION="10.2"
+REDHAT_SUPPORT_PRODUCT="AlmaLinux"
+REDHAT_SUPPORT_PRODUCT_VERSION="10.2"
+SUPPORT_END=2035-06-01
+Linux syn-2603-6010-6706-8aaf-5a11-22ff-feba-9340.res6.spectrum.com 6.12.0-211.61.1.el10_2.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Oct  2 10:06:07 EDT 2026 x86_64 GNU/Linux
+cmdline: BOOT_IMAGE=(hd1,gpt4)/vmlinuz-6.12.0-211.61.1.el10_2.x86_64 root=/dev/mapper/almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-root ro crashkernel=2G-64G:256M,64G-:512M resume=UUID=85c6b5dc-6fd0-4ca7-afb5-448f35ae9b2c rd.lvm.lv=almalinux_syn-2603-6010-6706-8aaf-afc0-3a7f-9339-ac8e/root rd.lvm.lv=almalinux_syn-2603-6010-6706-8aaf-afc0-3a7f-9339-ac8e/swap rd.lvm.lv=almalinux_syn-2603-6010-6706-8aaf-f55f-a647-f570-b5cf/swap rhgb quiet
+
+### dmi
+sys_vendor       ASUS
+product_name     System Product Name
+product_version  System Version
+board_vendor     ASUSTeK COMPUTER INC.
+board_name       PRIME Z790-P WIFI D4
+board_version    Rev 1.xx
+bios_vendor      American Megatrends Inc.
+bios_version     1402
+bios_date        09/11/2023
+chassis_type     3
+
+### virtualisation
+none
+
+### cpu
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           42 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  24
+On-line CPU(s) list:                     0-23
+Vendor ID:                               GenuineIntel
+Model name:                              13th Gen Intel(R) Core(TM) i7-13700K
+CPU family:                              6
+Model:                                   183
+Thread(s) per core:                      2
+Core(s) per socket:                      16
+Socket(s):                               1
+Stepping:                                1
+CPU(s) scaling MHz:                      18%
+CPU max MHz:                             5500.0000
+CPU min MHz:                             800.0000
+BogoMIPS:                                6835.20
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities
+Virtualization:                          VT-x
+L1d cache:                               640 KiB (16 instances)
+L1i cache:                               768 KiB (16 instances)
+L2 cache:                                24 MiB (10 instances)
+L3 cache:                                30 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-23
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Mitigation; Clear Register File
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+
+### x86-64-levels
+  x86-64-v4
+  x86-64-v3 (supported, searched)
+  x86-64-v2 (supported, searched)
+
+### cpu-flags
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities
+
+### memory
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi       1.9Gi        17Gi        28Mi        11Gi        29Gi
+Swap:          3.0Gi          0B       3.0Gi
+MemTotal:       32627108 kB
+SwapTotal:       3117052 kB
+
+### pci
+0000:00:00.0 Host bridge [0600]: Intel Corporation Raptor Lake-S Host Bridge/DRAM Controller [8086:a703] (rev 01)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+0000:00:01.0 PCI bridge [0604]: Intel Corporation Raptor Lake PCI Express 5.0 Graphics Port (PEG010) [8086:a70d] (rev 01)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: pcieport
+0000:00:08.0 System peripheral [0880]: Intel Corporation GNA Scoring Accelerator module [8086:a74f] (rev 01)
+	DeviceName: Intel GNA Device
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+0000:00:0a.0 Signal processing controller [1180]: Intel Corporation Raptor Lake Crashlog and Telemetry [8086:a77d] (rev 01)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: intel_vsec
+	Kernel modules: intel_vsec
+0000:00:0e.0 RAID bus controller [0104]: Intel Corporation RST Volume Management Device Controller [8086:a77f]
+	DeviceName: RAID Controller
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: vmd
+0000:00:14.0 USB controller [0c03]: Intel Corporation Raptor Lake USB 3.2 Gen 2x2 (20 Gb/s) XHCI Host Controller [8086:7a60] (rev 11)
+	DeviceName: USB Controller
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: xhci_hcd
+	Kernel modules: mei_me
+0000:00:14.2 RAM memory [0500]: Intel Corporation Raptor Lake PCH Shared SRAM [8086:7a27] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+0000:00:14.3 Network controller [0280]: Intel Corporation 700 Series Chipset CNVi WiFi [8086:7a70] (rev 11)
+	Subsystem: Intel Corporation Wi-Fi 6 AX201 160MHz [8086:0074]
+	Kernel driver in use: iwlwifi
+	Kernel modules: iwlwifi
+0000:00:15.0 Serial bus controller [0c80]: Intel Corporation Raptor Lake Serial IO I2C Host Controller #0 [8086:7a4c] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: intel-lpss
+0000:00:15.1 Serial bus controller [0c80]: Intel Corporation Raptor Lake Serial IO I2C Host Controller #1 [8086:7a4d] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: intel-lpss
+0000:00:15.2 Serial bus controller [0c80]: Intel Corporation Raptor Lake Serial IO I2C Host Controller #2 [8086:7a4e] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: intel-lpss
+0000:00:16.0 Communication controller [0780]: Intel Corporation Raptor Lake CSME HECI #1 [8086:7a68] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: mei_me
+	Kernel modules: mei_me
+0000:00:17.0 System peripheral [0880]: Intel Corporation RST VMD Managed Controller [8086:09ab]
+	DeviceName: SATA Controller
+0000:00:1a.0 PCI bridge [0604]: Intel Corporation Raptor Lake PCI Express Root Port #25 [8086:7a48] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: pcieport
+0000:00:1b.0 PCI bridge [0604]: Intel Corporation Raptor Lake PCI Express Root Port #17 [8086:7a40] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: pcieport
+0000:00:1c.0 PCI bridge [0604]: Intel Corporation Raptor Lake PCI Express Root Port #1 [8086:7a38] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: pcieport
+0000:00:1c.2 PCI bridge [0604]: Intel Corporation Raptor Lake PCI Express Root Port #3 [8086:7a3a] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: pcieport
+0000:00:1d.0 PCI bridge [0604]: Intel Corporation Raptor Lake PCI Express Root Port #9 [8086:7a30] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: pcieport
+0000:00:1f.0 ISA bridge [0601]: Intel Corporation Z790 Chipset LPC/eSPI Controller [8086:7a04] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+0000:00:1f.3 Audio device [0403]: Intel Corporation Raptor Lake High Definition Audio Controller [8086:7a50] (rev 11)
+	DeviceName: Intel HD Audio
+	Subsystem: ASUSTeK Computer Inc. Device [1043:87fb]
+	Kernel driver in use: snd_hda_intel
+	Kernel modules: snd_soc_avs, snd_sof_pci_intel_tgl, snd_hda_intel
+0000:00:1f.4 SMBus [0c05]: Intel Corporation 700 Series Chipset SMBus Controller [8086:7a23] (rev 11)
+	DeviceName: SMBus Controller
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: i801_smbus
+	Kernel modules: i2c_i801
+0000:00:1f.5 Serial bus controller [0c80]: Intel Corporation Raptor Lake SPI (flash) Controller [8086:7a24] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+0000:01:00.0 VGA compatible controller [0300]: NVIDIA Corporation TU117 [GeForce GTX 1630] [10de:1f83] (rev a1)
+	Subsystem: Micro-Star International Co., Ltd. [MSI] Device [1462:8e9a]
+	Kernel driver in use: nouveau
+	Kernel modules: nouveau
+0000:01:00.1 Audio device [0403]: NVIDIA Corporation Device [10de:10fa] (rev a1)
+	Subsystem: Micro-Star International Co., Ltd. [MSI] Device [1462:8e9a]
+	Kernel driver in use: snd_hda_intel
+	Kernel modules: snd_hda_intel
+0000:05:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8125 2.5GbE Controller [10ec:8125] (rev 05)
+	DeviceName: RTL8125 2.5GbE Controller
+	Subsystem: ASUSTeK Computer Inc. Device [1043:87d7]
+	Kernel driver in use: r8169
+	Kernel modules: r8169
+10000:e0:17.0 SATA controller [0106]: Intel Corporation Raptor Lake SATA AHCI Controller [8086:7a62] (rev 11)
+	Subsystem: ASUSTeK Computer Inc. Device [1043:8882]
+	Kernel driver in use: ahci
+	Kernel modules: ahci
+
+### gpu-drivers
+nouveau              3751936  33
+nvidia-gpu-firmware-20260827-23.3.el10_2.noarch
+
+### disks
+NAME                                                                     SIZE TYPE FSTYPE      MOUNTPOINTS              MODEL              TRAN   ROTA
+sda                                                                    476.9G disk                                      Patriot P210 512GB sata      0
+|-sda1                                                                   600M part vfat        /boot/efi                                             0
+|-sda2                                                                     1G part xfs                                                               0
+|-sda3                                                                 445.6G part LVM2_member                                                       0
+| |-almalinux_syn--2603--6010--6706--8aaf--f55f--a647--f570--b5cf-swap  15.6G lvm  swap                                                              0
+| |-almalinux_syn--2603--6010--6706--8aaf--f55f--a647--f570--b5cf-root   130G lvm  xfs                                                               0
+| `-almalinux_syn--2603--6010--6706--8aaf--f55f--a647--f570--b5cf-home   300G lvm  xfs                                                               0
+|-sda4                                                                     1G part xfs         /boot                                                 0
+`-sda5                                                                  28.7G part LVM2_member                                                       0
+  |-almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-root  25.8G lvm  xfs         /                                                     0
+  `-almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-swap     3G lvm  swap        [SWAP]                                                0
+sdb                                                                    238.5G disk                                      Patriot P210 256GB sata      0
+|-sdb1                                                                  14.9G part swap                                                              0
+|-sdb2                                                                     1K part                                                                   0
+|-sdb5                                                                   3.7G part ext4                                                              0
+|-sdb6                                                                  59.6G part ext4                                                              0
+`-sdb7                                                                 160.2G part ext4                                                              0
+sdc                                                                    465.8G disk                                      USB 3.2.2 FD       usb       0
+`-sdc1                                                                 465.8G part vfat        /run/media/jsadlier/BIOS                              0
+
+### space
+Filesystem                                                                     Type  Size  Used Avail Use% Mounted on
+/dev/mapper/almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-root xfs    26G   26G  569M  98% /
+/dev/sda4                                                                      xfs   893M  770M  123M  87% /boot
+/dev/sda1                                                                      vfat  599M  9.1M  590M   2% /boot/efi
+/dev/mapper/almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-root xfs    26G   26G  569M  98% /
+/dev/mapper/almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-root xfs    26G   26G  569M  98% /
+
+### root-and-boot-mounts
+/dev/mapper/almalinux_syn--2603--6010--6706--8aaf--afc0--3a7f--9339--ac8e-root xfs rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+/dev/sda4 xfs
+/dev/sda1 vfat
+
+### firmware-boot
+UEFI
+SecureBoot disabled
+
+### boot-entries
+System.map-6.12.0-211.56.1.el10_2.x86_64
+System.map-6.12.0-211.61.1.el10_2.x86_64
+System.map-6.12.0-211.7.4.el10_2.x86_64
+config-6.12.0-211.56.1.el10_2.x86_64
+config-6.12.0-211.61.1.el10_2.x86_64
+config-6.12.0-211.7.4.el10_2.x86_64
+efi
+grub2
+initramfs-0-rescue-7c849b4039b242008a901b6d59892a93.img
+initramfs-6.12.0-211.56.1.el10_2.x86_64.img
+initramfs-6.12.0-211.61.1.el10_2.x86_64.img
+initramfs-6.12.0-211.7.4.el10_2.x86_64.img
+loader
+symvers-6.12.0-211.56.1.el10_2.x86_64.xz
+symvers-6.12.0-211.61.1.el10_2.x86_64.xz
+symvers-6.12.0-211.7.4.el10_2.x86_64.xz
+vmlinuz-0-rescue-7c849b4039b242008a901b6d59892a93
+vmlinuz-6.12.0-211.56.1.el10_2.x86_64
+vmlinuz-6.12.0-211.61.1.el10_2.x86_64
+vmlinuz-6.12.0-211.7.4.el10_2.x86_64
+kernel-6.12.0-211.7.4.el10_2.x86_64
+kernel-6.12.0-211.56.1.el10_2.x86_64
+kernel-6.12.0-211.61.1.el10_2.x86_64
+kernel-core-6.12.0-211.7.4.el10_2.x86_64
+kernel-core-6.12.0-211.56.1.el10_2.x86_64
+kernel-core-6.12.0-211.61.1.el10_2.x86_64
+
+### selinux
+Enforcing
+
+### tools
+gcc        /usr/bin/gcc
+g++        /usr/bin/g++
+cc         /usr/bin/cc
+clang      /usr/bin/clang
+clang++    /usr/bin/clang++
+ld.lld     /usr/bin/ld.lld
+make       /usr/bin/make
+bc         /usr/bin/bc
+bison      /usr/bin/bison
+flex       /usr/bin/flex
+perl       /usr/bin/perl
+python3    /usr/bin/python3
+pahole     -
+openssl    /usr/bin/openssl
+rpmbuild   /usr/bin/rpmbuild
+dracut     /usr/bin/dracut
+grubby     /usr/sbin/grubby
+dkms       -
+akmods     -
+git        /usr/bin/git
+curl       /usr/bin/curl
+wget       /usr/bin/wget
+tar        /usr/bin/tar
+xz         /usr/bin/xz
+zstd       /usr/bin/zstd
+bzip2      /usr/bin/bzip2
+patch      /usr/bin/patch
+ninja      /usr/bin/ninja
+cmake      /usr/bin/cmake
+nasm       /usr/bin/nasm
+gcc (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)
+Python 3.12.14
+
+### devel-packages
+elfutils-libelf-devel-0.194-2.el10_2.x86_64
+openssl-devel-3.5.8-1.el10_2.alma.1.x86_64
+package ncurses-devel is not installed
+package dwarves is not installed
+kernel-devel-6.12.0-211.7.4.el10_2.x86_64
+kernel-devel-6.12.0-211.56.1.el10_2.x86_64
+kernel-devel-6.12.0-211.61.1.el10_2.x86_64
+kernel-headers-6.12.0-211.61.1.el10_2.x86_64
+
+### firmware-dir
+1534-2-0x8.bin.xz
+1534-2-0xB.bin.xz
+15E2-0-0x8.bin.xz
+15E2-0-0x9.bin.xz
+15E2-0-0xA.bin.xz
+15E2-0-0xB.bin.xz
+15E2-0-0xC.bin.xz
+15E2-0-0xD.bin.xz
+15E2-0-0xE.bin.xz
+15E2-0-0xF.bin.xz
+15E2-1-0x8.bin.xz
+15E2-1-0x9.bin.xz
+15E2-1-0xA.bin.xz
+15E2-1-0xB.bin.xz
+15E2-1-0xC.bin.xz
+15E2-1-0xD.bin.xz
+15E2-1-0xE.bin.xz
+15E2-1-0xF.bin.xz
+16F4-1-0x9.bin.xz
+16F4-1-0xC.bin.xz
+1714-1-0x8.bin.xz
+1714-1-0xB.bin.xz
+1954-0-0-0x8.bin.xz
+1954-0-0-0xB.bin.xz
+1954-0-1-0x8.bin.xz
+1954-0-1-0xB.bin.xz
+1954-1-0-0x8.bin.xz
+1954-1-0-0xB.bin.xz
+1954-1-1-0x8.bin.xz
+1954-1-1-0xB.bin.xz
+1964-0-0-0x8.bin.xz
+1964-0-0-0xB.bin.xz
+1964-0-1-0x8.bin.xz
+1964-0-1-0xB.bin.xz
+1964-1-0-0x8.bin.xz
+1964-1-0-0xB.bin.xz
+1964-1-1-0x8.bin.xz
+1964-1-1-0xB.bin.xz
+1994-0-2-0xB.bin.xz
+1994-0-2-0xC.bin.xz
+nvidia firmware:
+ad102
+ad103
+ad104
+ad106
+ad107
+ga100
+ga102
+ga103
+ga104
+ga106
+
+### network
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+eno1             UP             58:11:22:ba:93:40 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+wlp0s20f3        DOWN           7e:86:95:7b:93:76 <NO-CARRIER,BROADCAST,MULTICAST,UP> 
+eno1             UP             192.168.0.111/24 2603:6010:6706:8aaf:5a11:22ff:feba:9340/64 fe80::5a11:22ff:feba:9340/64 
+wlp0s20f3        DOWN           
+
+### desktop
+graphical.target
+gdm-47.0-24.el10_2.x86_64
+gnome-shell-49.4-9.el10_2.alma.1.x86_64
+package sddm is not installed
+package lightdm is not installed
+[daemon]
+AutomaticLoginEnable=False
+AutomaticLogin=claude_code
+[security]
+[xdmcp]
+[chooser]
+[debug]
+
+### sshd
+(sshd config not readable as this user)
+
+### login-policy
+PASS_MAX_DAYS	99999
+PASS_MIN_LEN	8
+ENCRYPT_METHOD YESCRYPT
+Profile ID: local
+Enabled features:
+- with-fingerprint
+- with-mdns4
+Last password change					: Oct 08, 2026
+Password expires					: never
+Password inactive					: never
+Account expires						: never
+Minimum number of days between password change		: 0
+Maximum number of days between password change		: 99999
+Number of days of warning before password expires	: 7
+
+### uptime
+ 13:36:42 up 23 min,  2 users,  load average: 0.00, 0.44, 0.48
+         system boot  Oct  8 13:14

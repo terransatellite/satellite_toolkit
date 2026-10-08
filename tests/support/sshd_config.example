@@ -1,0 +1,13 @@
+Port 2222
+ListenAddress 127.0.0.1
+HostKey /tmp/claude-1000/-home-madness-code-cxx-satellite/932f3d36-f2a1-4f4a-b0bf-9851dbd87eac/scratchpad/sshd/host_ed25519
+PidFile /tmp/claude-1000/-home-madness-code-cxx-satellite/932f3d36-f2a1-4f4a-b0bf-9851dbd87eac/scratchpad/sshd/sshd.pid
+AuthorizedKeysFile /tmp/claude-1000/-home-madness-code-cxx-satellite/932f3d36-f2a1-4f4a-b0bf-9851dbd87eac/scratchpad/sshd/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+StrictModes no
+PermitTTY yes
+ForceCommand /tmp/claude-1000/-home-madness-code-cxx-satellite/932f3d36-f2a1-4f4a-b0bf-9851dbd87eac/scratchpad/sshd/force.sh
+LogLevel VERBOSE

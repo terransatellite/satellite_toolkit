@@ -1,0 +1,5 @@
+
+==> Preflight
+  ok   build tools and headers present
+  FAIL /home/claude_code/src has 568.1 MB free; this build wants about 10.0 GB
+  --   /lib/firmware/intel-ucode is empty: no CPU microcode update will be loaded by ANY kernel here (install microcode_ctl / intel-microcode / amd64-microcode, then rebuild the initramfs).

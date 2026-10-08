@@ -1,0 +1,124 @@
+FIRST REAL INSTALL -- 2026-09-20, siege3 (AlmaLinux 10.2, Xeon E5-2670 v3), run by the user from the wizard.
+Observed from outside by a second session; nothing here was run with sudo.
+
+build   : 07:34:34 -> 08:07:16  (1930 s, 0 warnings; a niced 128-thread job of the user's ran alongside)
+install : 08:07:16 -> 08:08:54  modules_install (2562 modules, INSTALL_MOD_STRIP=1), install -> installkernel -> kernel-install -> dracut
+profile : xeon-haswell-all-gpu + localversion -xeon-haswell-all-gpu-server-latency; clang 24, full modules, BTF, preempt full, HZ 100, Secure Boot on
+
+== state.ini afterwards
+[/home/madness/src/linux-7.2.6]
+status = installed
+stage = done
+started = 2026-09-20T07:34:34-0400
+finished = 2026-09-20T08:08:54-0400
+exit_code = 
+error = 
+last_error = 
+toolchain = clang version 24.0.0git (https://github.com/llvm/llvm-project.git 3c2eaf3920a8320930a8334b328a040ec0402091)
+jobs = 24
+log = /home/madness/.local/state/enterprise_linux_kernel_tool/build-linux-7.2.6.log
+release = 7.2.6-xeon-haswell-all-gpu-server-latency
+config_base = auto
+debug_info = btf
+modules = full
+seconds = 1930
+warnings = 0
+signed = yes
+certificate = /home/madness/.config/enterprise_linux_kernel_tool/keys/secureboot.der
+
+[/home/madness/src/elkt-test/linux-7.2.6]
+signed = yes
+certificate = /home/madness/.config/enterprise_linux_kernel_tool/keys/secureboot.der
+
+== /boot for this release
+-rw-r--r--   1 root root    270390 2026-09-20 08:08 config-7.2.6-xeon-haswell-all-gpu-server-latency
+-rw-------   1 root root 107082931 2026-09-20 08:08 initramfs-7.2.6-xeon-haswell-all-gpu-server-latency.img
+-rw-r--r--   1 root root  16750056 2026-09-20 08:07 vmlinuz-7.2.6-xeon-haswell-all-gpu-server-latency
+== image
+The signer's common name is madness@siege3 kernel signing key
+/boot/vmlinuz-7.2.6-xeon-haswell-all-gpu-server-latency is byte-identical to the tree's signed bzImage
+== config
+/boot/config-7.2.6-xeon-haswell-all-gpu-server-latency is identical to the tree's .config
+== /lib/modules/7.2.6-xeon-haswell-all-gpu-server-latency
+total 4240
+drwxr-xr-x   3 root root   4096 2026-09-20 08:07 .
+drwxr-xr-x. 10 root root   4096 2026-09-20 08:07 ..
+lrwxrwxrwx   1 root root     29 2026-09-20 08:07 build -> /home/madness/src/linux-7.2.6
+drwxr-xr-x  13 root root    143 2026-09-20 08:07 kernel
+-rw-r--r--   1 root root 954047 2026-09-20 08:07 modules.alias
+modules: 2562
+== amdgpu.ko as installed
+-rw-r--r-- 1 root root 35807985 Sep 20 08:07 /lib/modules/7.2.6-xeon-haswell-all-gpu-server-latency/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko
+debug sections: 0   .BTF: 1   signature appended: 1
+vermagic: 7.2.6-xeon-haswell-all-gpu-server-latency SMP preempt mod_unload modversions 
+== root-owned files left in the user's tree: 0
+== dkms status
+amdgpu/6.19.14-2364437.el10, 6.12.0-211.50.1.el10_2.x86_64_v2, x86_64_v2: installed (Original modules exist)
+amdgpu/6.19.14-2364437.el10, 6.12.0-211.51.1.el10_2.x86_64_v2, x86_64_v2: installed (Original modules exist)
+amdgpu/6.19.14-2364437.el10, 6.12.0-211.53.1.el10_2.x86_64_v2, x86_64_v2: installed (Original modules exist)
+
+NOT verified here (needs root): the default boot entry (grubenv is 0600), the initramfs contents.
+NOT done: a reboot into it; Secure Boot is still off on this machine.
+
+== /boot at 08:07:45 -- NOT a clean 'before': modules_install took seconds, and installkernel had
+== already copied vmlinuz by then.  The initramfs and config-<rel> were not there yet.
+# snapshot 08:07:45
+--- /boot
+total 1420308
+dr-xr-xr-x.  5 root root      4096 2026-09-20 08:07 .
+dr-xr-xr-x. 18 root root       255 2026-09-14 10:26 ..
+-rw-r--r--   1 root root    259835 2026-09-03 20:00 config-6.12.0-211.50.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root    259835 2026-09-06 20:00 config-6.12.0-211.51.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root    259835 2026-09-10 20:00 config-6.12.0-211.53.1.el10_2.x86_64_v2
+drwx------   3 root root      8192 1969-12-31 19:00 efi
+drwx------.  3 root root        50 2026-09-16 23:34 grub2
+-rw-------.  1 root root 243062967 2026-08-18 21:31 initramfs-0-rescue-dd601eac871d4e13b3af985d4a86053d.img
+-rw-------   1 root root  41110016 2026-08-19 22:26 initramfs-6.12.0-211.47.1.el10_2.x86_64_v2kdump.img
+-rw-------   1 root root  93752320 2026-08-28 16:54 initramfs-6.12.0-211.49.1.el10_2.x86_64_v2kdump.img
+-rw-------   1 root root 102549899 2026-09-06 07:39 initramfs-6.12.0-211.50.1.el10_2.x86_64_v2.img
+-rw-------   1 root root  93772800 2026-09-06 09:40 initramfs-6.12.0-211.50.1.el10_2.x86_64_v2kdump.img
+-rw-------   1 root root 102542678 2026-09-10 18:10 initramfs-6.12.0-211.51.1.el10_2.x86_64_v2.img
+-rw-------   1 root root  93772800 2026-09-11 11:48 initramfs-6.12.0-211.51.1.el10_2.x86_64_v2kdump.img
+-rw-------   1 root root 102542426 2026-09-14 10:31 initramfs-6.12.0-211.53.1.el10_2.x86_64_v2.img
+-rw-------   1 root root  93768704 2026-09-14 10:33 initramfs-6.12.0-211.53.1.el10_2.x86_64_v2kdump.img
+-rw-------   1 root root 137256207 2026-08-26 17:28 initramfs-7.2.0.img
+-rw-------   1 root root 105004545 2026-09-08 16:00 initramfs-7.2.4-gpu.img
+-rw-------   1 root root  95582720 2026-09-08 18:46 initramfs-7.2.4-gpukdump.img
+drwxr-xr-x.  3 root root        21 2026-08-18 21:29 loader
+-rw-r--r--   1 root root    291224 2026-09-06 07:39 symvers-6.12.0-211.50.1.el10_2.x86_64_v2.xz
+-rw-r--r--   1 root root    291224 2026-09-10 18:10 symvers-6.12.0-211.51.1.el10_2.x86_64_v2.xz
+-rw-r--r--   1 root root    291216 2026-09-14 10:31 symvers-6.12.0-211.53.1.el10_2.x86_64_v2.xz
+-rw-r--r--   1 root root   9246940 2026-09-03 20:00 System.map-6.12.0-211.50.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root   9246940 2026-09-06 20:00 System.map-6.12.0-211.51.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root   9246980 2026-09-10 20:00 System.map-6.12.0-211.53.1.el10_2.x86_64_v2
+-rwxr-xr-x.  1 root root  16267440 2026-08-18 21:31 vmlinuz-0-rescue-dd601eac871d4e13b3af985d4a86053d
+-rw-r--r--.  1 root root       180 2026-08-18 21:31 .vmlinuz-0-rescue-dd601eac871d4e13b3af985d4a86053d.hmac
+-rwxr-xr-x   1 root root  16275632 2026-09-03 20:00 vmlinuz-6.12.0-211.50.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root       171 2026-09-03 20:00 .vmlinuz-6.12.0-211.50.1.el10_2.x86_64_v2.hmac
+-rwxr-xr-x   1 root root  16279728 2026-09-06 20:00 vmlinuz-6.12.0-211.51.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root       171 2026-09-06 20:00 .vmlinuz-6.12.0-211.51.1.el10_2.x86_64_v2.hmac
+-rwxr-xr-x   1 root root  16279728 2026-09-10 20:00 vmlinuz-6.12.0-211.53.1.el10_2.x86_64_v2
+-rw-r--r--   1 root root       171 2026-09-10 20:00 .vmlinuz-6.12.0-211.53.1.el10_2.x86_64_v2.hmac
+-rw-r--r--   1 root root  23679488 2026-08-26 17:02 vmlinuz-7.2.0
+-rw-r--r--   1 root root  14671872 2026-09-08 15:37 vmlinuz-7.2.4-gpu
+-rw-r--r--   1 root root  16750056 2026-09-20 08:07 vmlinuz-7.2.6-xeon-haswell-all-gpu-server-latency
+--- BLS entries
+ls: cannot open directory '/boot/loader/entries': Permission denied
+--- grubenv
+cat: /boot/grub2/grubenv: Permission denied
+--- df
+Filesystem                                                                      Size  Used Avail Use% Mounted on
+/dev/sde2                                                                        12G  1.6G  9.5G  15% /boot
+/dev/mapper/almalinux_syn--2603--6010--6706--8aaf--4aa5--a8bb--bf2a--7136-root  120G   68G   52G  57% /
+--- /lib/modules
+total 32
+drwxr-xr-x. 10 root root 4096 2026-09-20 08:07 .
+dr-xr-xr-x. 51 root root 4096 2026-08-29 04:39 ..
+drwxr-xr-x.  3 root root   20 2026-09-10 18:06 6.12.0-211.47.1.el10_2.x86_64_v2
+drwxr-xr-x   4 root root   40 2026-09-14 10:27 6.12.0-211.49.1.el10_2.x86_64_v2
+drwxr-xr-x   8 root root 4096 2026-09-06 07:39 6.12.0-211.50.1.el10_2.x86_64_v2
+drwxr-xr-x   8 root root 4096 2026-09-10 18:10 6.12.0-211.51.1.el10_2.x86_64_v2
+drwxr-xr-x   8 root root 4096 2026-09-14 10:31 6.12.0-211.53.1.el10_2.x86_64_v2
+drwxr-xr-x   3 root root 4096 2026-08-26 17:28 7.2.0
+drwxr-xr-x   3 root root 4096 2026-09-08 16:00 7.2.4-gpu
+drwxr-xr-x   3 root root 4096 2026-09-20 08:07 7.2.6-xeon-haswell-all-gpu-server-latency

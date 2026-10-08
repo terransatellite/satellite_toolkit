@@ -1,0 +1,44 @@
+
+==> Compilers
+      /usr/bin/gcc                                         gcc 14.3.1
+        system
+      /usr/bin/clang                                       clang 21.1.8
+        system; full LLVM tool set beside it
+      /opt/rh/gcc-toolset-15/root/usr/bin/gcc              gcc 15.2.1
+        Red Hat gcc-toolset (vendor-supported); brings its own binutils 2.44
+
+==> C++ compilers  (kbuild's HOSTCXX: it builds the GCC plugins and xconfig)
+      /usr/bin/g++                                         g++ 14.3.1
+        system
+      /usr/bin/clang++                                     clang++ 21.1.8
+        system; full LLVM tool set beside it
+      /opt/rh/gcc-toolset-15/root/usr/bin/g++              g++ 15.2.1
+        Red Hat gcc-toolset (vendor-supported); brings its own binutils 2.44
+
+==> GNU binutils sets  (a directory with both ld and as)
+  /usr/bin                                       GNU ld version 2.41-63.el10.alma.1   [system]
+  /opt/rh/gcc-toolset-15/root/usr/bin            GNU ld version 2.44-8.el10
+
+==> Python 3 interpreters
+  /usr/bin/python3                               CPython  3.12.14   [platform -- the default for kbuild's scripts]
+
+==> Other build tools
+  make       /usr/bin/make            GNU Make 4.4.1
+  ld.bfd     /usr/bin/ld.bfd          GNU ld version 2.41-63.el10.alma.1
+  ld.lld     /usr/bin/ld.lld          LLD 21.1.8 (compatible with GNU linkers)
+  ld.gold    /usr/bin/ld.gold         GNU gold (version 2.41-63.el10.alma.1) 1.16   [the kernel refuses gold outright]
+  mold       -
+  ccache     -
+  pahole     -
+  rustc      -
+  bindgen    -
+
+==> What the current options resolve to
+  compiler    : gcc (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)
+                /usr/bin/gcc  [system]
+  assembler   : /usr/bin/as  (GNU assembler version 2.41-63.el10.alma.1)
+  linker      : /usr/bin/ld  (GNU ld version 2.41-63.el10.alma.1)
+  python3     : /usr/bin/python3  (Python 3.12.14)
+  make        : /usr/bin/make  (GNU Make 4.4.1)
+  c++ (host)  : /usr/bin/g++  (g++ (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4))
+  make args   : (none needed)
