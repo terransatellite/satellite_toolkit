@@ -484,6 +484,7 @@ class ReviewFindings(TempRoot):
         self.assertEqual(elkt.normalize_argv(["status"]), ["status"])
         self.assertEqual(elkt.normalize_argv([]), ["wizard"])
         self.assertEqual(elkt.normalize_argv(["--version"]), ["--version"])
+        self.assertEqual(elkt.normalize_argv(["--tool-version"]), ["--tool-version"])
 
     def test_a_second_clean_restores_the_config_it_just_saved(self):
         tree = os.path.join(self.root, "tree")
@@ -1256,7 +1257,7 @@ class ToolchainPin(TempRoot):
     def test_with_secure_boot_even_the_system_toolchain_gets_a_wrapper_that_signs(self):
         text = elkt.pin_text(self.tc([]), sign=True)
         self.assertIn("elkt-all: __all", text)
-        self.assertIn(" sign --source $(CURDIR)", text)
+        self.assertIn(" --local sign --source $(CURDIR)", text)   # a `make` never asks "run where?"
         self.assertNotIn("override", text)                  # nothing to pin
         self.assertLess(text.index("include Makefile"), text.index(".DEFAULT_GOAL"))
 

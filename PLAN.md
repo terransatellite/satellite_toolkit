@@ -12,6 +12,44 @@ His request is in `PROMPT_2026-10-08.md` (word for word). The second message, af
 So: everything moves in, nothing is lost, and every piece ends up with the features the others
 have (section 5 is the list, piece by piece).
 
+Newer words (2026-10-08 evening, the cloud session -- development moved to GitHub,
+terransatellite/satellite_toolkit), verbatim. These win over anything older below:
+
+> push to main
+
+> ultimately the tool needs to pull satellite from satellite.foundation click on source and pull
+> from the main branch, a zip file, and build that... That is the ultimate goal of this project,
+> to build satellite with all of these tools built before that...
+
+So step 9 gets its source by downloading the main-branch zip behind satellite.foundation's
+"source" link, on whichever machine builds (local or remote) -- not by syncing a local tree.
+The exact zip URL is still to be confirmed (the cloud session's network cannot reach
+satellite.foundation); it is one option (`--satellite-url`) with that as the default.
+
+> I will make a github page for satellite, it will be github.com/satellitemadness1/satellite and
+> the script will need to pull from github or satellite.foundation, with an option to choose:
+> satellite (github.com ), satellite (satellite.foundation) or satellite repo-1
+> (satellite.foundation) or any of the available repos that are on satellite.foundation, they go
+> up in a format, and you need to click create zip on each of the source repos for
+> satellite.foundation, if the zip hasn't been created.... but all these choices need to be made
+> available at some point, just keep it documented... Go ahead whenever your ready...
+
+So step 9's SOURCE is a choice (`--satellite-source`, and a question in the menu):
+
+| choice | where | how |
+|---|---|---|
+| `github` | github.com/satellitemadness1/satellite, branch main | `https://github.com/satellitemadness1/satellite/archive/refs/heads/main.zip` |
+| `foundation` | satellite.foundation, the "satellite" source repo, main | its zip; if the zip has not been created yet, the "create zip" step first |
+| `foundation:repo-1`, `foundation:repo-N` | any other source repo listed on satellite.foundation ("they go up in a format") | the same |
+| `url:URL` / `dir:PATH` | any zip URL, or a tree already on disk | for testing and offline machines |
+
+Still to learn (needs network access to satellite.foundation, or the user's description): the
+page that lists the source repos and their naming format, the zip URL for each, and what
+"create zip" does (an HTTP request the tool can make itself, or a page action only a person can
+take -- if the latter, the tool says exactly which button to press and waits/retries). Until
+then `github` is the default once that repository exists, and `foundation*` choices are listed
+but report what they need.
+
 ## 1. What it is
 
 One package, `satellite_toolkit/`, whose main file builds -- on THIS machine or on ANOTHER one
@@ -69,7 +107,8 @@ tools/gcc/                    enterprise_gcc_tool.py     (NEW: binutils + gcc) +
 tools/python/                 enterprise_python_tool.py  + tests/ + README.md
 tools/pypy/                   enterprise_pypy_tool.py    (NEW: pypy2 + pypy3 + the 2.7 host) + tests/ + README.md
 tools/kernel/                 enterprise_linux_kernel_tool.py + tests/ + README.md + PLAN.md + legacy/ + machines/
-tools/satellite/              install_build_requirements.py (a copy of the satellite tree's; the tree's wins)
+(no tools/satellite/)         the satellite source -- its own install_build_requirements.py with it -- is
+                              downloaded from satellite.foundation; the toolkit carries no copy of it
 legacy/                       every .sh, byte for byte, with history/ (.bak files), HANDOFF.md, SHA256SUMS
 tests/                        the main file's and satellite_remote.py's tests
 ```
@@ -95,7 +134,7 @@ over), verification after install, stdlib unit tests with fake tools (no network
 
 and the first line of each tool's `main()` is
 
-    argv = where_to_run(argv, __file__, TOOL)
+    argv = where_to_run(list(sys.argv[1:] if argv is None else argv), __file__, TOOL)
 
 It strips its own options before argparse sees them: `--local`, `--remote[=USER@HOST]`,
 `--attach[=SESSION]`, `--sessions`. On a terminal with neither `--local` nor `--remote` it asks
@@ -122,8 +161,34 @@ for the `<name>-current` symlink.
 steps lack ONCE, up front (build_everything.sh's rule, below).
 
 **`status --json`** on every tool: what is installed where, with versions -- the menu shows it.
+Shape (installing tools): `{"tool": ..., "opt_root": DIR, "current": {"<name>-current": TARGET|null},
+"installed": [{"name", "version", "prefix", "runs": bool, "built_by_tool": bool, "compiler": STR|null,
+"for": STR|null}], "builds": [{"id", "status", "stage", "error"}]}`; the kernel tool:
+`{"tool": ..., "installed": [{"release", "modules": bool, "build_link": bool, "boot_image": bool,
+"built_by_tool": bool, "default": bool}], "trees": [{"tree", "status", "stage", "release", "error"}]}`.
+With `--json`, stdout is the JSON and nothing else (messages go to stderr).
 
-**Exit codes**: 0 done, 1 failed, 2 usage, 130 interrupted.  **`--yes`**: ask nothing.
+**Child contract** (written 2026-10-09 so the new tools and the main file agree):
+- Long options only between the main file and a tool (`--jobs N`, never `-jN`).
+- `--yes` = ask nothing, accepted by EVERY subcommand of every tool. Exception that stays: the
+  kernel tool's `--yes` also OVERRIDES its safety refusals, so the main file never passes `--yes`
+  (or `--set-default`) to the kernel tool.
+- Toolchain inputs are REAL paths (`os.path.realpath` of the `-current` link at the moment the
+  step starts), never the `-current` symlink: state files, BUILD-INFO and the kernel's
+  GNUmakefile pin record them, and a later rebuild must not silently change what was used.
+  Names: `--cc PATH` (the C compiler; the C++ partner beside it, or `--cxx PATH`) and
+  `--binutils DIR` (a prefix whose `bin/` holds `as`/`ld`) -- the kernel tool's existing names.
+  The gcc tool keeps `--host-cc/--host-cxx` for the compiler that bootstraps GCC (the system
+  gcc) and uses `--binutils DIR` for `--with-as/--with-ld`.
+- "Done" is asked of the machine (the binary RUNS), and the menu shows a third state, "present
+  but not built by the toolkit" (from `status --json` `built_by_tool`), which is NOT counted done
+  for `all` unless `--accept-existing`.
+- Only `-h`, `--help` and `--tool-version` skip the "run where?" question -- `--version` is a real
+  option in several tools (LLVM / CPython / GCC version) and must still ask.
+
+**Exit codes**: 0 done, 1 failed, 2 usage, 130 interrupted.  A remote run exits with the program's
+own code once it ended there; while it still runs there: 75 detached (Ctrl-]), 255 the connection
+dropped (ssh's own code; `--attach` goes back).  **`--yes`**: ask nothing.
 
 ## 4. The main file
 
@@ -178,7 +243,7 @@ Legend: **have** = already there; **ADD** = added in this work; **n/a** = with t
 | staging + one rename install | have | ADD | have | ADD | n/a (make install as root) | n/a |
 | verify command | have | ADD | have (`check`) | ADD | have (`dkms-check`, post-install) | n/a |
 | `-current` symlink + `--opt-root` | have (`--activate`); ADD `--opt-root` | ADD | ADD (`--link-current`, `--opt-root`) | ADD | n/a | uses them |
-| status (+ `--json`) | have; ADD json | ADD | have; ADD json | ADD | have (`--json`) | ADD |
+| status (+ `--json`) | have; ADD json | ADD | have; ADD json | ADD | have; ADD json (it printed text) | ADD |
 | versions (what upstream has) | have | ADD | have | ADD | have (`kernels`) | n/a |
 | detect | have | ADD | ADD | ADD | have | ADD (in status) |
 | toolchains (compilers/binutils/pythons found) | have | ADD | ADD | ADD | have | n/a |

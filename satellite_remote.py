@@ -16,11 +16,12 @@ so each tool stays ONE file that can be copied anywhere and still go remote.  Ed
 
 What a tool gets from it: one call, the first line of main():
 
-    argv = where_to_run(argv, __file__, TOOL)
+    argv = where_to_run(list(sys.argv[1:] if argv is None else argv), __file__, TOOL)
 
   --local                     run here (and never ask)
   --remote[=USER@HOST]        run there; the target is asked when it is not given
-  --attach[=SESSION]          back to a session running there (the newest of this tool's)
+  --attach[=SESSION]          back to a session running there (the newest of this tool's);
+                              `--attach SESSION` too, when the word is shaped like a session name
   --sessions                  what runs, and what ran, there
   (none, on a terminal)       "run where?" -- Enter is this machine
 
@@ -29,6 +30,18 @@ THERE: the tool file is uploaded to ~/.satellite_toolkit/code/<tool>-<sha12>/ an
 program on a pseudo-terminal and keeps everything it prints in a log, so a dropped ssh connection
 does not stop a five-hour build.  This side attaches to it: what it prints streams here, what is
 typed goes there, Ctrl-] detaches (it keeps running), --attach comes back.
+
+The exit code of a remote run is the program's own once it ENDED there.  Otherwise it says that
+the program is still running there, never that it is done:
+
+  75   detached with Ctrl-] (EX_TEMPFAIL): it keeps running there; --attach goes back
+  255  the connection dropped (ssh's own code for that): it keeps running there, or may be
+  130  interrupted here with no terminal (Ctrl-C to a piped run): it keeps running there
+  1    it could not go there at all (the login, the upload, the start; said in a sentence)
+
+`before=` lets the caller act on the machine once a NEW session is about to start -- after the
+login, the python there and the upload, before the start: before(machine, folder, rest) -> None
+(rest as it is) or a new rest.  A RemoteError from it is said and nothing starts.
 
 THE LOGIN: when ~/code/py/satellite_ssh keeps a password for USER@HOST (its 600 file), it logs in
 with that, and types it again when the program there asks "[sudo] password for USER:" -- never
@@ -70,6 +83,12 @@ _SR_DETACH = b"\x1d"                                 # Ctrl-]  -- telnet's escap
 _SR_EXIT = b"\x1b]777;satellite-remote-exit;"
 _SR_SUDO = re.compile(br"\[sudo\] password for ([^:\r\n]+): *$")
 _SR_TAIL = 65536                                     # what a re-attach shows of the past
+# A session name as _sr_session_name makes it (and the keeper's -2, -3 for a second one started
+# in the same second): what `--attach NAME`, with a space, takes for a name.
+_SR_NAME_SHAPE = re.compile(r"^[A-Za-z0-9_]{1,20}-[0-9]{8}-[0-9]{6}(-[0-9]{1,3})?$")
+# Exit codes of a remote run that did not see the program end (the module's docstring).
+_SR_DETACHED = 75                                    # EX_TEMPFAIL: Ctrl-], still running there
+_SR_DROPPED = 255                                    # ssh's own code for a lost connection
 
 
 class RemoteError(Exception):
@@ -113,6 +132,11 @@ def _sr_take(argv):
             o["where"], o["target"] = "remote", a.split("=", 1)[1] or None
         elif a == "--attach":
             o["attach"] = ""
+            # `--attach NAME` as well as --attach=NAME -- but only a word shaped like a session
+            # name, so `--attach status` still leaves `status` to the tool.
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-") and _SR_NAME_SHAPE.match(argv[i + 1]):
+                o["attach"] = argv[i + 1]
+                i += 1
         elif a.startswith("--attach="):
             o["attach"] = a.split("=", 1)[1]
         elif a == "--sessions":
@@ -134,7 +158,9 @@ def _sr_take(argv):
 def _sr_wants_question(rest):
     if os.environ.get("SATELLITE_TOOLKIT_WHERE") == "local" or not _sr_tty():
         return False
-    return not any(a in ("-h", "--help", "--version", "--tool-version") for a in rest)
+    # --version is a real option in several tools (an LLVM / CPython / GCC release),
+    # so it still asks; only help and the tool's own version are quiet
+    return not any(a in ("-h", "--help", "--tool-version") for a in rest)
 
 
 def _sr_ask(prompt, default=""):
@@ -274,11 +300,12 @@ class RemoteLink(object):
             self.kept = mod
             return self
         # Plain ssh: a key or an agent, or the password typed here.  ControlPersist keeps the
-        # master after -f puts it in the background; close() ends it.
+        # master after -f puts it in the background; close() ends it -- and 10 minutes with no
+        # ssh using it end it too, so a tool killed before close() leaves no master for good.
         self.dir = tempfile.mkdtemp(prefix="satellite-remote-", dir="/tmp" if os.path.isdir("/tmp") else None)
         self.sock = os.path.join(self.dir, "ssh")     # short: a socket path stops at 107 bytes
         argv = (["ssh", "-M", "-S", self.sock] + self.options
-                + ["-o", "ControlPersist=yes", "-o", "StrictHostKeyChecking=accept-new",
+                + ["-o", "ControlPersist=10m", "-o", "StrictHostKeyChecking=accept-new",
                    "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=30", "-fN", self.target])
         if not _sr_tty():
             argv[1:1] = ["-o", "BatchMode=yes"]       # nobody to type a password: a key, or nothing
@@ -397,8 +424,13 @@ def _sr_upload(link, files, name):
         raise RemoteError("ssh to %s failed: %s" % (link.target, err.strip() or out.strip()))
     if out.strip() != "have":
         _sr_say("  sending %s (%d KB) to %s" % (name, max(1, len(blob) // 1024), link.target))
-        script = ('set -e; umask 077; d=%s; rm -rf "$d.part"; mkdir -p "$d.part"; '
-                  'tar -xzf - -C "$d.part"; touch "$d.part/.complete"; rm -rf "$d"; mv "$d.part" "$d"') % q
+        # Two runs sending the same tool at once each unpack into a .part of their own; the
+        # first rename wins (mv -T: never INTO a folder that is there), and the other one --
+        # the same files, by the digest -- is dropped.  Only a folder left half-made before is
+        # replaced.
+        script = ('set -e; umask 077; d=%s; p="$d.part.$$"; rm -rf "$p"; mkdir -p "$p"; '
+                  'tar -xzf - -C "$p"; touch "$p/.complete"; mv -T "$p" "$d" 2>/dev/null && exit 0; '
+                  'if [ -f "$d/.complete" ]; then rm -rf "$p"; exit 0; fi; rm -rf "$d"; mv -T "$p" "$d"') % q
         rc, out, err = link.run("sh -c %s" % shlex.quote(script), data=blob, timeout=600)
         if rc != 0:
             raise RemoteError("could not unpack %s on %s: %s" % (name, link.target, (err or out).strip()))
@@ -464,12 +496,19 @@ def _sr_keeper_main(name, argv, size=None):
     if not cmd or not re.match(r"^[A-Za-z0-9._-]{1,48}$", name):
         _sr_say("satellite_remote: a session needs a plain name and a command")
         return 2
-    sdir = os.path.join(_sr_sessions(), name)
-    try:
-        os.mkdir(sdir, 0o700)
-    except OSError as e:
-        _sr_say("satellite_remote: session %s: %s" % (name, e))
-        return 2
+    # Two runs started in the same second ask for the same name: the second is NAME-2, then
+    # NAME-3 ...  mkdir is the claim, so two starters can never share a folder.  The name that
+    # was taken is the one in the "ok NAME PID" answer.
+    root = _sr_sessions()
+    for n in range(1, 100):
+        sdir = os.path.join(root, name if n == 1 else "%s-%d" % (name, n))
+        try:
+            os.mkdir(sdir, 0o700)
+            break
+        except OSError as e:
+            if e.errno != errno.EEXIST or n == 99:
+                _sr_say("satellite_remote: session %s: %s" % (os.path.basename(sdir), e))
+                return 2
     _sr_write_file(os.path.join(sdir, "cmd.json"), json.dumps(
         {"argv": cmd, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "cwd": os.getcwd(),
          "version": _SR_VERSION}, indent=1))
@@ -544,7 +583,7 @@ def _sr_keeper_loop(sdir, cmd, ready_w, size):
     _sr_write_file(os.path.join(sdir, "pids"), "%d %d\n" % (os.getpid(), pid))
     os.write(ready_w, ("ok %s %d\n" % (os.path.basename(sdir), pid)).encode())
     os.close(ready_w)
-    clients = {}                                 # socket -> [bytes waiting to go, hello seen, input]
+    clients = {}                                 # socket -> [bytes waiting to go, hello seen, input, since]
     ended = None
     status = None                                # the program's wait status, once it has one
     drain_until = 0.0
@@ -566,7 +605,10 @@ def _sr_keeper_loop(sdir, cmd, ready_w, size):
             rd.append(c)
             if st[0]:
                 wr.append(c)
-        if ended is not None and not wr:
+        # Ended, and every client has had all of it.  One that connected but has not said its
+        # hello yet is waited for (10 s at most): quitting under it would show it neither the
+        # output nor the exit code -- only a reset connection.
+        if ended is not None and not wr and all(st[1] or time.time() - st[3] > 10 for st in clients.values()):
             break
         r, w, _ = select.select(rd, wr, [], 1.0)
         if master in r:
@@ -598,7 +640,7 @@ def _sr_keeper_loop(sdir, cmd, ready_w, size):
             try:
                 c, _ = listener.accept()
                 c.setblocking(False)
-                clients[c] = [b"", False, b""]
+                clients[c] = [b"", False, b"", time.time()]
             except OSError:
                 pass
         for c in list(clients):
@@ -746,9 +788,9 @@ def _sr_attach_socket(sdir, name, path, st, rows, cols):
             return st["exit"]
         _sr_say("\r\n[%s stopped without an exit code -- the machine restarted, or it was killed]" % name)
         return 1
-    c.sendall(("ATTACH %d %d %d\n" % (_SR_TAIL, rows, cols)).encode())
     code, held, inputs = 1, b"", [0]
     try:
+        c.sendall(("ATTACH %d %d %d\n" % (_SR_TAIL, rows, cols)).encode())
         while True:
             r, _, _ = select.select([c] + inputs, [], [])
             if c in r:
@@ -791,6 +833,8 @@ def _sr_attach_socket(sdir, name, path, st, rows, cols):
                     inputs = []
                     continue
                 c.sendall(data)
+    except OSError:                          # the keeper went away under us (killed, the machine
+        pass                                 # stopping): the session's own record says the rest
     finally:
         c.close()
     st = _sr_session_state(sdir)
@@ -810,6 +854,8 @@ def _sr_window_size():
 def _sr_drive(argv, link, detach_hint=""):
     """Run argv (an `ssh -tt ... attach`) on a pseudo-terminal of our own: what it prints goes to
     this terminal, what is typed goes to it, Ctrl-] leaves.  -> exit code, or None when detached.
+    A ^C that reaches THIS process (no terminal: a piped run) leaves too, and is raised again as
+    KeyboardInterrupt once the ssh is gone -- the session there keeps running either way.
     A sudo question there is answered with the kept password -- once per question."""
     import pty
     interactive = _sr_tty()
@@ -830,6 +876,7 @@ def _sr_drive(argv, link, detach_hint=""):
         _sr_set_size(fd, *_sr_window_size())
     old_winch = signal.signal(signal.SIGWINCH, resized) if interactive else None
     window, last_out, answered, refused, detached = b"", time.time(), 0, False, False
+    interrupted = False
     try:
         while True:
             try:
@@ -866,13 +913,13 @@ def _sr_drive(argv, link, detach_hint=""):
                     os.write(fd, pw.encode() + b"\n")
                     answered += 1
     except KeyboardInterrupt:                   # not a terminal: ^C leaves, the session stays
-        detached = True
+        interrupted = True
     finally:
         if saved is not None:
             termios.tcsetattr(0, termios.TCSADRAIN, saved)
         if old_winch is not None:
             signal.signal(signal.SIGWINCH, old_winch)
-    if detached:
+    if detached or interrupted:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -882,7 +929,10 @@ def _sr_drive(argv, link, detach_hint=""):
             os.close(fd)
         except OSError:
             pass
-        _sr_say("\r\ndetached -- it keeps running there.%s" % detach_hint)
+        _sr_say("\r\n%s -- it keeps running there.%s" % ("interrupted here" if interrupted else "detached",
+                                                         detach_hint))
+        if interrupted:
+            raise KeyboardInterrupt()
         return None
     _, status = os.waitpid(pid, 0)
     try:
@@ -936,14 +986,16 @@ class RemoteMachine(object):
             return []
 
     def start(self, folder, entry, args, name):
+        """-> the session's name: name, or name-2, name-3 ... when one of that name is there."""
         rows, cols = _sr_window_size()
         words = ([self.link.python, "-I", "%s/%s" % (folder, entry), "--satellite-keeper=" + name,
                   "--satellite-size=%dx%d" % (rows, cols), "--", self.link.python, "-I", "%s/%s" % (folder, entry),
                   "--local"] + list(args))
         rc, out, err = self.link.run("cd && " + " ".join(_sr_home_quote(w) for w in words), timeout=60)
-        if rc != 0 or not out.strip().startswith("ok"):
+        word = (out.strip().splitlines() or [""])[-1].split()     # "ok NAME PID"
+        if rc != 0 or len(word) < 2 or word[0] != "ok":
             raise RemoteError("could not start the session on %s: %s" % (self.target, (err or out).strip()))
-        return name
+        return word[1]
 
     def attach(self, folder, entry, name, hint=""):
         rows, cols = _sr_window_size()
@@ -960,18 +1012,52 @@ def _sr_home_quote(word):
     return shlex.quote(word)
 
 
-def _sr_session_name(tool_name):
+def _sr_short(tool_name):
+    """The first word of a tool's session names -- clang, python, linux_kernel ...  --attach
+    alone looks for it."""
     short = re.sub(r"[^A-Za-z0-9]+", "_", re.sub(r"_tool$", "", tool_name.replace("enterprise_", "")))[:20]
-    return "%s-%s" % (short.strip("_") or "tool", time.strftime("%Y%m%d-%H%M%S"))
+    return short.strip("_") or "tool"
 
 
-def _sr_remote(tool_file, tool_name, rest, o, upload, entry):
+def _sr_session_name(tool_name):
+    # Second resolution only: a second run started in the same second is made NAME-2 by the
+    # keeper (_sr_keeper_main), which is where the name is claimed.
+    return "%s-%s" % (_sr_short(tool_name), time.strftime("%Y%m%d-%H%M%S"))
+
+
+def _sr_after_attach(machine, folder, entry, name, code, hint):
+    """The attach ended with code.  That is the program's exit code only when the session ENDED
+    there: a dropped connection ends ssh too (255, or 128+N when ssh was killed) while the build
+    goes on.  So the machine is asked which it was."""
+    try:
+        found = [s for s in machine.sessions(folder, entry) if s.get("name") == name]
+    except RemoteError:
+        _sr_say("\n  the connection to %s dropped and it cannot be reached again -- session %s may "
+                "still be running there.%s" % (machine.target, name, hint))
+        return _SR_DROPPED
+    if not found:                                # no such session there: the attach said so
+        return code
+    s = found[0]
+    if s["state"] == "running":
+        _sr_say("\n  the connection dropped -- it keeps running there.%s" % hint)
+        return _SR_DROPPED
+    if s["state"] == "ended" and s.get("exit") is not None:
+        _sr_say("  session %s on %s ended: exit %d" % (name, machine.target, s["exit"]))
+        return s["exit"]
+    _sr_say("  session %s on %s stopped without an exit code" % (name, machine.target))
+    return code or 1
+
+
+def _sr_remote(tool_file, tool_name, rest, o, upload, entry, before=None):
     target = _sr_target(o, tool_name)
     _sr_split_target(target)
-    _sr_remember(target, tool_name)
     machine = RemoteMachine(target)
     try:
-        machine.open()
+        # RemoteMachine.open() in two halves, so the target is remembered once it let us in:
+        # a typo is never offered again; a machine that let us in but lacks python3 still is.
+        machine.link.open()
+        _sr_remember(target, tool_name)
+        _sr_python(machine.link)
         files = upload() if upload else [(os.path.abspath(tool_file), os.path.basename(tool_file))]
         entry = entry or os.path.basename(tool_file)
         folder = machine.code(files, tool_name)
@@ -992,21 +1078,27 @@ def _sr_remote(tool_file, tool_name, rest, o, upload, entry):
         name = o["attach"]
         if name == "":                           # --attach alone: this tool's newest one there
             mine = [s for s in machine.sessions(folder, entry)
-                    if s["name"].startswith(_sr_session_name(tool_name).rsplit("-", 2)[0] + "-")]
+                    if s["name"].startswith(_sr_short(tool_name) + "-")]
             running = [s for s in mine if s["state"] == "running"]
             pick = (running or mine or [None])[-1]
             if pick is None:
                 raise RemoteError("no session of %s on %s to attach to" % (tool_name, target))
             name = pick["name"]
         if name is None:
+            if before is not None:
+                # The caller's last word before a NEW session starts (never for --attach or
+                # --sessions): the login, the python there and the upload are done.  It may send
+                # more, and may change the arguments; a RemoteError from it starts nothing.
+                changed = before(machine, folder, list(rest))
+                if changed is not None:
+                    rest = list(changed)
             name = machine.start(folder, entry, rest, _sr_session_name(tool_name))
             _sr_say("  %s runs there as session %s -- Ctrl-] leaves it running" % (entry, name))
         hint = "\n  back to it:  %s --remote=%s --attach=%s" % (me, target, name)
         code = machine.attach(folder, entry, name, hint)
-        if code is None:
-            return 0
-        _sr_say("  session %s on %s ended: exit %d" % (name, target, code))
-        return code
+        if code is None:                         # Ctrl-]: still running there -- not "done"
+            return _SR_DETACHED
+        return _sr_after_attach(machine, folder, entry, name, code, hint)
     except RemoteError as e:
         _sr_say("ERROR: %s" % e)
         return 1
@@ -1014,10 +1106,12 @@ def _sr_remote(tool_file, tool_name, rest, o, upload, entry):
         machine.close()
 
 
-def where_to_run(argv, tool_file, tool_name, upload=None, entry=None):
+def where_to_run(argv, tool_file, tool_name, upload=None, entry=None, before=None):
     """The first line of every tool's main(): -> the argv to run HERE, or it runs the tool on
-    another machine and exits with what it exited with there."""
-    rest, o = _sr_take(list(argv))
+    another machine and exits with what it exited with there (or 75 / 255 / 130 / 1: the
+    module's docstring).  argv None is sys.argv[1:].  upload() -> [(path here, path there)]
+    when more than the tool file goes; entry = which of them runs there; before: the docstring."""
+    rest, o = _sr_take(list(sys.argv[1:] if argv is None else argv))
     if o["keeper"] is not None:
         sys.exit(_sr_keeper_main(o["keeper"], rest, o["size"]))
     if o["keeper_attach"] is not None:
@@ -1032,7 +1126,7 @@ def where_to_run(argv, tool_file, tool_name, upload=None, entry=None):
     if where != "remote":
         return rest
     try:
-        code = _sr_remote(tool_file, tool_name, rest, o, upload, entry)
+        code = _sr_remote(tool_file, tool_name, rest, o, upload, entry, before)
     except RemoteError as e:
         _sr_say("ERROR: %s" % e)
         code = 1

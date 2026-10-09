@@ -1,3 +1,12 @@
+# A private sshd for trying satellite_remote by hand: run as yourself, not root --
+#   /usr/sbin/sshd -D -e -f <this file>
+# with SATELLITE_SSH_OPTIONS="-p 2222 -i KEY -o UserKnownHostsFile=FILE" for the tools.
+# force.sh: export HOME=<a scratch home>; cd; exec sh -c "$SSH_ORIGINAL_COMMAND" (a shell when empty).
+# tests/test_remote.py (RealSshdTests) writes its own copy of all of this on a free port.
+#
+# A user-mode sshd hands a pty to the login with chown(/dev/pts/N, uid, tty): where /dev/pts is
+# mounted without gid=5 (some containers) that fails unless the user is in the tty group, and
+# the login drops at once ("chown(/dev/pts/N, ...) failed" in sshd's log).
 Port 2222
 ListenAddress 127.0.0.1
 HostKey /tmp/claude-1000/-home-madness-code-cxx-satellite/932f3d36-f2a1-4f4a-b0bf-9851dbd87eac/scratchpad/sshd/host_ed25519

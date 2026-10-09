@@ -3,6 +3,9 @@
 
     ./sync_remote.py           write it wherever it differs
     ./sync_remote.py --check   change nothing; exit 1 and name the files whose copy differs
+    --strict                   a tool listed below that is not there yet is an error too
+                               (without it, it is named and skipped: the toolkit can be synced
+                               while some of its tools are still being written)
 
 Each tool holds the block between these two lines (the tool's own code is never touched):
 
@@ -10,6 +13,9 @@ Each tool holds the block between these two lines (the tool's own code is never 
     # <<< satellite_remote <<<
 
 so every tool is still ONE file that can be copied anywhere and go remote by itself.
+
+The satellite tree's own scripts are not in the list: its source is downloaded from
+satellite.foundation and built as it is, so the toolkit carries no copy of them to edit.
 """
 import os
 import sys
@@ -24,12 +30,12 @@ TOOLS = ("satellite_toolkit.py",
          "tools/gcc/enterprise_gcc_tool.py",
          "tools/python/enterprise_python_tool.py",
          "tools/pypy/enterprise_pypy_tool.py",
-         "tools/kernel/enterprise_linux_kernel_tool.py",
-         "tools/satellite/install_build_requirements.py")
+         "tools/kernel/enterprise_linux_kernel_tool.py")
 
 
 def block():
-    with open(SOURCE) as f:
+    # utf-8 said, not left to the locale: Python 3.6 in the C locale reads ASCII only.
+    with open(SOURCE, encoding="utf-8") as f:
         lines = f.read().split("\n")
     a, b = lines.index(FROM), lines.index(TO)
     return "\n".join(lines[a + 1:b])
@@ -47,33 +53,40 @@ def synced(text, body):
 
 def main(argv):
     check = "--check" in argv
+    strict = "--strict" in argv
     body = block()
-    bad, changed = [], []
+    bad, changed, skipped, held = [], [], [], 0
     for rel in TOOLS:
         path = os.path.join(HERE, rel)
         if not os.path.exists(path):
-            bad.append("%s: missing" % rel)
+            if strict:
+                bad.append("%s: missing" % rel)
+            else:
+                skipped.append(rel)
             continue
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read()
         new = synced(text, body)
         if new is None:
             bad.append("%s: no (or more than one) marker pair" % rel)
             continue
+        held += 1
         if new != text:
             changed.append(rel)
             if not check:
                 tmp = path + ".syncing"
-                with open(tmp, "w") as f:
+                with open(tmp, "w", encoding="utf-8") as f:
                     f.write(new)
                 os.chmod(tmp, os.stat(path).st_mode)
                 os.replace(tmp, path)
+    for rel in skipped:
+        print("  - %s: not there yet, skipped (--strict makes that an error)" % rel)
     for line in bad:
         print("  ! " + line)
     for rel in changed:
         print(("  differs: " if check else "  written: ") + rel)
     if not bad and not changed:
-        print("  every tool holds the same satellite_remote block")
+        print("  every tool here (%d of %d) holds the same satellite_remote block" % (held, len(TOOLS)))
     return 1 if bad or (check and changed) else 0
 
 
