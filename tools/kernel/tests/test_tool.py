@@ -6,11 +6,16 @@ a `root=` argument and is pointed at a fake filesystem built in a temp dir.
 
     /usr/bin/python3 tests/test_tool.py
 """
+import ast
+import contextlib
+import glob
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,9 +27,11 @@ elkt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(elkt)
 
 # The tool talks a lot; the tests only care what it DOES.  Keep what it said in
-# case a failing test wants to look.
+# case a failing test wants to look.  (REAL_OUT: for the tests of WHERE it says it.)
 SAID = []
+REAL_OUT = elkt.out
 elkt.out = lambda text="": SAID.append(text)
+TOOL_FILE = os.path.join(HERE, "..", "enterprise_linux_kernel_tool.py")
 
 
 def put(root, path, text="", mode="w"):
@@ -620,7 +627,7 @@ class Install(TempRoot):
             def __init__(self, out_="", rc=0):
                 self.stdout, self.returncode = out_, rc
 
-        def fake_sudo(cmd, check=True, capture=False, dry=False):
+        def fake_sudo(cmd, check=True, capture=False, dry=False, stdin_data=None):
             test.calls.append(list(cmd))
             if cmd[:2] == ["grubby", "--default-kernel"]:
                 # stderr is merged in, and grubby is noisy: junk before AND after
@@ -683,7 +690,7 @@ class Install(TempRoot):
 
     def test_dry_run_runs_nothing_and_records_nothing(self):
         real_sudo = self.saved[0]
-        elkt.sudo = lambda cmd, check=True, capture=False, dry=False: (
+        elkt.sudo = lambda cmd, check=True, capture=False, dry=False, stdin_data=None: (
             self.assertTrue(dry, "sudo called for real in a dry run: %r" % (cmd,)) or
             real_sudo(cmd, check, capture, dry))
         self.go(dry_run=True)
@@ -1835,6 +1842,805 @@ class ReviewOfTheSecondPass(TempRoot):
         finally:
             elkt.CHECK_CAVEATS = real
 
+
+# ------------------------------------------------- the satellite toolkit's contracts (2026-10-09)
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+def run_main(argv, local_first=True):
+    """main() the way the satellite toolkit runs the tool: --local, stdout and stderr kept
+    apart, and the real out() -- these tests are about WHERE things are said."""
+    o, e = io.StringIO(), io.StringIO()
+    saved = elkt.out
+    elkt.out = REAL_OUT
+    try:
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            rc = elkt.main((["--local"] + list(argv)) if local_first else list(argv))
+    finally:
+        elkt.out = saved
+    return rc, o.getvalue(), e.getvalue()
+
+
+class patched(object):
+    """Replace module attributes for the length of a `with`."""
+
+    def __init__(self, obj, **attrs):
+        self.obj, self.attrs, self.saved = obj, attrs, {}
+
+    def __enter__(self):
+        for k, v in self.attrs.items():
+            self.saved[k] = getattr(self.obj, k)
+            setattr(self.obj, k, v)
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            setattr(self.obj, k, v)
+
+
+DOCTOR_KEYS = {"tool", "ok", "package_manager", "missing", "enable_repos", "install_command"}
+FAKE_MACHINE = {"pkg_manager": "dnf", "os_id": "almalinux", "os_like": "rhel centos fedora",
+                "os_version": "10.0", "arch": "x86_64", "running": "6.12.0-211.el10.x86_64",
+                "gpu_vendors": [], "cpu": {"vendor": "GenuineIntel", "level": "x86-64-v3"},
+                "memory": 32 << 30, "boot": {"grubby": True, "bls": True, "initramfs": "dracut"},
+                "dkms": [], "toolchains": [], "nvidia": {}, "secure_boot": "off"}
+
+
+class Grammar(unittest.TestCase):
+    def test_the_tool_and_its_tests_are_python_3_6_and_ascii(self):
+        if sys.version_info < (3, 8):
+            self.skipTest("ast.parse(feature_version=) needs 3.8 to check")
+        for path in (TOOL_FILE, os.path.abspath(__file__)):
+            with open(path, "rb") as f:
+                text = f.read().decode("ascii")          # a stray U+00A0 fails here, by name
+            ast.parse(text, filename=path, feature_version=(3, 6))
+
+
+class RemoteBlock(unittest.TestCase):
+    """The local-or-remote block: generated, one pair of markers, the first thing main() does."""
+
+    def setUp(self):
+        self.text = read(TOOL_FILE)
+
+    def test_one_marker_pair_after_the_constants(self):
+        lines = self.text.split("\n")
+        begins = [i for i, l in enumerate(lines) if l.startswith("# >>> satellite_remote >>>")]
+        ends = [i for i, l in enumerate(lines) if l == "# <<< satellite_remote <<<"]
+        self.assertEqual((len(begins), len(ends)), (1, 1))
+        self.assertLess(next(i for i, l in enumerate(lines) if l.startswith("TOOL = ")), begins[0])
+        self.assertTrue(elkt._sr_session_name(elkt.TOOL).startswith("linux_kernel-"))
+
+    def test_block_is_what_sync_remote_writes(self):
+        toolkit = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+        if not os.path.exists(os.path.join(toolkit, "sync_remote.py")):
+            self.skipTest("not inside the satellite toolkit")
+        sys.path.insert(0, toolkit)
+        quiet, sys.dont_write_bytecode = sys.dont_write_bytecode, True     # no .pyc beside it
+        try:
+            import sync_remote
+        finally:
+            sys.path.remove(toolkit)
+            sys.dont_write_bytecode = quiet
+        self.assertEqual(sync_remote.synced(self.text, sync_remote.block()), self.text,
+                         "the block differs from satellite_remote.py: run ./sync_remote.py")
+
+    def test_where_to_run_is_the_first_statement_of_main(self):
+        main = next(n for n in ast.parse(self.text).body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        first = main.body[0]
+        self.assertIsInstance(first, ast.Assign)
+        self.assertEqual((first.targets[0].id, first.value.func.id), ("argv", "where_to_run"))
+
+
+class ToolkitContract(TempRoot):
+    def test_dkms_cap_is_a_command_not_a_wizard_answer(self):
+        self.assertEqual(elkt.normalize_argv(["dkms-cap", "--dry-run"]), ["dkms-cap", "--dry-run"])
+        self.assertIn("dkms-cap", elkt.COMMANDS)
+
+    def test_every_subcommand_takes_yes_json_and_opt_root(self):
+        p = elkt.build_parser()
+        for cmd in elkt.COMMANDS:
+            a = p.parse_args([cmd, "--yes", "--json", "--opt-root", "/x"])
+            self.assertEqual((a.yes, a.json, a.opt_root), (True, True, "/x"), cmd)
+
+    def test_local_never_reaches_argparse_and_json_is_alone_on_stdout(self):
+        sdir = os.path.join(self.root, "state")
+        for argv, first in ((["status", "--json", "--state-dir", sdir], True),
+                            (["status", "--local", "--json", "--state-dir", sdir], False)):
+            rc, so, se = run_main(argv, local_first=first)
+            self.assertEqual(rc, 0, se)
+            data = json.loads(so)                      # stdout is the JSON and nothing else
+            self.assertTrue({"tool", "installed", "trees"} <= set(data))
+            self.assertEqual(data["tool"], elkt.TOOL)
+        self.assertIsNone(elkt.UI.stream)              # main() puts the streams back
+
+    def test_doctor_json_as_root_answers_instead_of_refusing(self):
+        def no_toolchain(opts, machine=None):
+            raise elkt.ToolError("no working compiler at /usr/bin/gcc")
+        with patched(elkt, detect_machine=lambda: dict(FAKE_MACHINE), resolve_toolchain=no_toolchain), \
+                patched(elkt.os, geteuid=lambda: 0):
+            rc, so, se = run_main(["doctor", "--json", "--workdir", self.root,
+                                   "--state-dir", os.path.join(self.root, "s")])
+        self.assertEqual(rc, 1)
+        d = json.loads(so)
+        self.assertEqual(set(d), DOCTOR_KEYS)
+        self.assertFalse(d["ok"])
+        self.assertTrue(any("root" in m["what"] and m["level"] == "required" and m["package"] == ""
+                            for m in d["missing"]))
+        for m in d["missing"]:
+            self.assertEqual(set(m), {"what", "package", "level"})
+            self.assertIn(m["level"], ("required", "wanted", "optional"))
+        self.assertNotIn("ERROR", so)
+
+    def doctor_with(self, machine, toolchain=True):
+        gaps = [("flex", "flex"), ("libelf.h", "libelf.h (elfutils-libelf-devel / libelf-dev)"),
+                ("sign", "a signing tool")]
+        with patched(elkt, build_dep_gaps=lambda opts, tc=None: gaps, which=lambda n, path=None: None,
+                     cc_has_header=lambda cc, h: True, microcode_missing=lambda m: "",
+                     free_bytes=lambda p: 1 << 50):
+            return elkt.doctor_report(dict(elkt.DEFAULTS, workdir=self.root), machine,
+                                      {"path": "/usr/bin/gcc"} if toolchain else None, "", euid=1000)
+
+    def test_doctor_report_names_packages_for_the_package_manager_in_front_of_it(self):
+        d = self.doctor_with(dict(FAKE_MACHINE))
+        self.assertEqual(set(d), DOCTOR_KEYS)
+        self.assertEqual(d["package_manager"], "dnf")
+        self.assertEqual(d["install_command"], "sudo dnf install -y flex elfutils-libelf-devel pesign nss-tools dwarves")
+        self.assertEqual([m["level"] for m in d["missing"]], ["required"] * 3 + ["wanted"])
+        self.assertEqual(d["enable_repos"], [])           # nothing the kernel needs is in CRB
+        d = self.doctor_with(dict(FAKE_MACHINE, pkg_manager="apt-get", os_id="ubuntu", os_like="debian"))
+        self.assertEqual(d["install_command"], "sudo apt-get install -y flex libelf-dev sbsigntool dwarves")
+        d = self.doctor_with(dict(FAKE_MACHINE, pkg_manager="apt-get"), toolchain=False)
+        self.assertIn({"what": "gcc, the system C compiler", "package": "gcc", "level": "required"}, d["missing"])
+        d = self.doctor_with(dict(FAKE_MACHINE, pkg_manager=""))
+        self.assertEqual((d["package_manager"], d["install_command"]), (None, ""))
+
+    def test_crb_is_named_the_way_each_enterprise_linux_names_it(self):
+        m = lambda i, v, like="rhel centos fedora": {"os_id": i, "os_version": v, "os_like": like, "arch": "x86_64"}
+        self.assertEqual(elkt.crb_repo(m("almalinux", "10.0")), "crb")
+        self.assertEqual(elkt.crb_repo(m("rocky", "8.10")), "powertools")
+        self.assertEqual(elkt.crb_repo(m("rhel", "9.6", "fedora")), "codeready-builder-for-rhel-9-x86_64-rpms")
+        self.assertEqual(elkt.crb_repo(m("fedora", "42", "")), "")
+        self.assertEqual(elkt.enable_repo_command("crb"), ["sudo", "dnf", "config-manager", "--set-enabled", "crb"])
+        self.assertEqual(elkt.enable_repo_command("codeready-builder-for-rhel-9-x86_64-rpms")[:3],
+                         ["sudo", "subscription-manager", "repos"])
+
+    def test_gpu_firmware_is_the_package_this_distribution_ships_it_in(self):
+        f = lambda pm, i, v="": elkt.gpu_firmware_package("amd", {"pkg_manager": pm, "os_id": i, "os_version": v})
+        self.assertEqual(f("dnf", "almalinux", "10.0"), "amd-gpu-firmware")
+        self.assertEqual(f("dnf", "fedora", "42"), "amd-gpu-firmware")
+        self.assertEqual(f("dnf", "almalinux", "9.6"), "linux-firmware")
+        self.assertEqual(f("apt-get", "debian", "13"), "firmware-amd-graphics")
+        self.assertEqual(f("apt-get", "ubuntu", "24.04"), "linux-firmware")
+        self.assertEqual(f("zypper", "opensuse-tumbleweed"), "kernel-firmware-amdgpu")
+
+    def test_opt_root_is_searched_ahead_of_home_opt_and_put_back(self):
+        home, opt = os.path.join(self.root, "home"), os.path.join(self.root, "toolkit opt")
+        os.makedirs(os.path.join(home, "opt", "gcc-15", "bin"))
+        os.makedirs(os.path.join(opt, "clang-21.1.0", "bin"))
+        os.symlink("clang-21.1.0", os.path.join(opt, "clang-current"))
+        dirs = elkt.tool_search_dirs(root=self.root, home=home, path_env="", opt_root=opt)
+        mine, theirs = os.path.join(opt, "clang-21.1.0", "bin"), os.path.join(home, "opt", "gcc-15", "bin")
+        self.assertIn(mine, dirs)
+        self.assertLess(dirs.index(mine), dirs.index(theirs))
+        self.assertEqual(len([d for d in dirs if "clang" in d]), 1)     # -current is the same directory
+        self.assertNotIn(mine, elkt.tool_search_dirs(root=self.root, home=home, path_env="", opt_root="~/opt"))
+        seen = []
+        with patched(elkt, run_command=lambda args: seen.append(elkt.OPT_ROOT[0]) or 0):
+            run_main(["status", "--opt-root", opt])
+        self.assertEqual(seen, [opt])
+        self.assertEqual(elkt.OPT_ROOT[0], "~/opt")
+
+    def llvm_install(self):
+        """An upstream LLVM install as the clang tool leaves it: bin/clang-21 the file,
+        bin/clang a link to it, ld.lld / llvm-ar ... without a suffix."""
+        d = os.path.join(self.root, "opt", "clang-21.1.0", "bin")
+        fake_tool(d + "/clang-21", CLANG18)
+        os.symlink("clang-21", d + "/clang")
+        os.symlink("clang", d + "/clang++")
+        for tool in elkt.LLVM_TOOLS:
+            fake_tool(os.path.join(d, tool), "LLD 21")
+        os.symlink("clang-21.1.0", os.path.join(self.root, "opt", "clang-current"))
+        return d
+
+    def test_the_realpath_of_an_llvm_installs_clang_still_gets_its_own_tools(self):
+        d = self.llvm_install()
+        real = os.path.realpath(os.path.join(self.root, "opt", "clang-current", "bin", "clang"))
+        self.assertTrue(real.endswith("/clang-21"))
+        self.assertEqual(elkt.llvm_companions(real), ("LLVM=" + d + "/", None))
+        self.assertEqual(elkt.cxx_partner(real), d + "/clang++")
+
+    def test_binutils_may_be_named_by_its_prefix(self):
+        gcc = fake_tool(self.root + "/opt/gcc-15.2.0/bin/gcc", "gcc (GCC) 15.2.0")
+        prefix = self.root + "/opt/binutils-2.45"
+        fake_tool(prefix + "/bin/ld", "GNU ld (GNU Binutils) 2.45")
+        fake_tool(prefix + "/bin/as", "GNU assembler (GNU Binutils) 2.45")
+        tc = elkt.resolve_toolchain(dict(elkt.DEFAULTS, cc=gcc, binutils=prefix), {})
+        self.assertEqual(tc["extra_path"], prefix + "/bin")
+        self.assertIn("CC=" + gcc, tc["args"])
+
+    def test_the_main_files_kernel_command_line(self):
+        """What satellite_toolkit.py passes for step 8: --gpu all, the REAL path of
+        clang-current's clang, cpython-current's python, --install -- never --yes or
+        --set-default."""
+        d = self.llvm_install()
+        py = put(self.root, "opt/cpython-3.14.0/bin/python3.14", "#!/bin/sh\necho 3\n")
+        os.chmod(py, 0o755)
+        cc = os.path.realpath(os.path.join(self.root, "opt", "clang-current", "bin", "clang"))
+        args = elkt.build_parser().parse_args(elkt.normalize_argv(
+            ["build", "--kernel", "stable", "--gpu", "all", "--cc", cc, "--python", py, "--install",
+             "--workdir", self.root + "/work", "--opt-root", self.root + "/opt"]))
+        opts = elkt.merge_options(args)
+        self.assertFalse(opts["yes"] or opts["set_default"] or opts["keep_boot_default"])
+        tc = elkt.resolve_toolchain(opts, {})
+        self.assertEqual(tc["args"], ["LLVM=" + d + "/", "HOSTLDFLAGS=-no-pie", "PYTHON3=" + py])
+        self.assertEqual(elkt.resolve_gpu("all", [], "x86_64")[0], {"amd", "nvidia", "intel"})
+
+    def test_keep_boot_default_and_set_default_are_opposites(self):
+        args = elkt.build_parser().parse_args(["install", "--keep-boot-default", "--set-default"])
+        with self.assertRaises(elkt.ToolError):
+            elkt.merge_options(args)
+
+
+class StatusJson(TempRoot):
+    def setUp(self):
+        TempRoot.setUp(self)
+        r = self.root
+        self.tree = os.path.join(r, "src", "linux-7.2.6")
+        put(self.tree, "GNUmakefile", elkt.PIN_MARK + "\n")
+        put(r, "lib/modules/7.2.6-elkt/modules.dep")
+        os.symlink(self.tree, os.path.join(r, "lib/modules/7.2.6-elkt/build"))
+        put(r, "boot/vmlinuz-7.2.6-elkt", "k")
+        self.el = "6.12.0-211.el10.x86_64"
+        os.makedirs(os.path.join(r, "lib/modules", self.el, "kernel"))
+        os.symlink("/nonexistent/kernels/" + self.el, os.path.join(r, "lib/modules", self.el, "build"))
+        put(r, "boot/vmlinuz-" + self.el, "k")
+        put(r, "lib/modules/7.1.0-half/modules.order")             # modules_install, nothing else
+        bls = "0123456789abcdef0123456789abcdef-" + self.el
+        put(r, "boot/grub2/grubenv", "# GRUB Environment Block\nsaved_entry=%s\n%s" % (bls, "#" * 900))
+        put(r, "boot/loader/entries/%s.conf" % bls, "title AlmaLinux\nversion %s\nlinux /vmlinuz-%s\n"
+            % (self.el, self.el))
+        self.sdir = os.path.join(r, "state")
+        st = elkt.State(os.path.join(elkt.state_dir({"state_dir": self.sdir}), "state.ini"))
+        st.update(self.tree, status="installed", stage="done", release="7.2.6-elkt", error="")
+        st.update(os.path.join(r, "src", "linux-7.3"), status="failed", stage="build",
+                  error="make exit 2", release="")
+
+    def test_the_contract_shape_and_what_counts_as_installed(self):
+        data = elkt.status_data({"state_dir": self.sdir}, root=self.root)
+        self.assertTrue({"tool", "installed", "trees"} <= set(data))
+        by = dict((k["release"], k) for k in data["installed"])
+        self.assertEqual(sorted(by), sorted(["7.2.6-elkt", self.el, "7.1.0-half"]))
+        for k in data["installed"]:
+            self.assertTrue({"release", "modules", "build_link", "boot_image", "built_by_tool",
+                             "default"} <= set(k))
+        ours = by["7.2.6-elkt"]
+        self.assertEqual((ours["modules"], ours["build_link"], ours["boot_image"], ours["built_by_tool"],
+                          ours["default"], ours["complete"]), (True, True, True, True, False, True))
+        el = by[self.el]
+        self.assertEqual((el["modules"], el["build_link"], el["built_by_tool"], el["default"]),
+                         (True, False, False, True))
+        half = by["7.1.0-half"]
+        self.assertEqual((half["modules"], half["boot_image"], half["complete"]), (True, False, False))
+        trees = dict((t["tree"], t) for t in data["trees"])
+        for t in data["trees"]:
+            self.assertTrue({"tree", "status", "stage", "release", "error"} <= set(t))
+        self.assertEqual(trees[self.tree]["error"], None)
+        self.assertEqual(trees[os.path.join(self.root, "src", "linux-7.3")]["error"], "make exit 2")
+        json.dumps(data)                                           # JSON as it is
+
+    def test_built_by_the_tool_from_its_pin_alone(self):
+        os.remove(os.path.join(self.sdir, "state.ini"))           # the record is gone; the pin is not
+        put(self.root, "lib/modules/7.2.7-custom/modules.dep")
+        os.symlink(self.tree, os.path.join(self.root, "lib/modules/7.2.7-custom/build"))
+        by = dict((k["release"], k) for k in elkt.status_data({"state_dir": self.sdir}, root=self.root)["installed"])
+        self.assertTrue(by["7.2.7-custom"]["built_by_tool"])
+        self.assertTrue(by["7.2.6-elkt"]["built_by_tool"])         # -elkt, the default LOCALVERSION
+        self.assertFalse(by[self.el]["built_by_tool"])
+
+
+AMD_VER = "6.19.14-2364437.el10"
+AMD_CONF = 'PACKAGE_NAME="amdgpu"\nPACKAGE_VERSION="%s"\nAUTOINSTALL="yes"\n' % AMD_VER
+EL = "6.12.0-211.53.1.el10_2.x86_64"
+
+
+class DkmsCap(TempRoot):
+    """cap_amdgpu_dkms() against a sudo that runs the command as it is, inside a fake root."""
+
+    def setUp(self):
+        TempRoot.setUp(self)
+        self.calls = []
+        test = self
+
+        def fake_sudo(cmd, check=True, capture=False, dry=False, stdin_data=None):
+            test.calls.append(list(cmd))
+            if dry:
+                return None
+            p = subprocess.run(cmd, input=stdin_data, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True)
+            if check and p.returncode:
+                raise elkt.ToolError("command failed: %s" % " ".join(cmd))
+            return p
+        self.saved = elkt.sudo
+        elkt.sudo = fake_sudo
+
+    def tearDown(self):
+        elkt.sudo = self.saved
+        TempRoot.tearDown(self)
+
+    def package(self, ver=AMD_VER, text=AMD_CONF, kernels=((EL, "installed"),)):
+        """AMD's layout: /usr/src/amdgpu-<ver>/dkms.conf a symlink into amd/dkms/."""
+        real = put(self.root, "usr/src/amdgpu-%s/amd/dkms/dkms.conf" % ver, text)
+        os.symlink("amd/dkms/dkms.conf", os.path.join(self.root, "usr/src/amdgpu-%s/dkms.conf" % ver))
+        for k, st in kernels:
+            os.makedirs(os.path.join(self.root, "var/lib/dkms/amdgpu", ver, k, "x86_64"))
+            if st == "installed":
+                os.symlink("%s/%s/x86_64" % (ver, k),
+                           os.path.join(self.root, "var/lib/dkms/amdgpu", "kernel-%s-x86_64" % k))
+        return real
+
+    def cap(self, **kw):
+        return elkt.cap_amdgpu_dkms(elkt.amdgpu_dkms_packages(self.root), EL, root=self.root, **kw)
+
+    def test_the_rule(self):
+        self.assertEqual(elkt.amdgpu_cap_for([], EL), "6.12.999")
+        self.assertEqual(elkt.amdgpu_cap_for(["6.12.0-1", "6.18.3-2"], EL), "6.18.999")
+        self.assertEqual(elkt.amdgpu_cap_for([EL], EL, "6.18"), "6.18.999")
+        self.assertEqual(elkt.amdgpu_cap_for([EL], EL, "6.18.5"), "6.18.5")
+
+    def test_a_symlinked_conf_is_capped_in_the_file_and_backed_up_dereferenced(self):
+        real = self.package()
+        res = self.cap()
+        self.assertEqual(res[0]["action"], "capped")
+        self.assertTrue(os.path.islink(os.path.join(self.root, "usr/src/amdgpu-%s/dkms.conf" % AMD_VER)))
+        backup = real + elkt.CAP_BACKUP
+        self.assertFalse(os.path.islink(backup))                   # was: cp -a copied the LINK
+        self.assertEqual(read(backup), AMD_CONF)
+        lim = elkt.parse_dkms_conf(read(real))
+        self.assertEqual(lim, {"BUILD_EXCLUSIVE_KERNEL_MAX": "6.12.999"})
+        self.assertFalse(elkt.dkms_will_build(lim, "7.2.6-elkt")[0])
+        self.assertTrue(elkt.dkms_will_build(lim, "6.12.110-elkt")[0])   # its own series still builds
+        self.assertTrue(read(real).startswith(AMD_CONF))
+        self.assertNotIn("DRM_AMDGPU=y", read(real))       # the legacy reason is gone
+
+    def test_an_existing_cap_is_left_alone_unless_forced(self):
+        text = AMD_CONF + 'BUILD_EXCLUSIVE_KERNEL_MAX="6.18"\n'
+        real = self.package(text=text)
+        self.assertEqual(self.cap()[0]["action"], "kept")
+        self.assertEqual((read(real), self.calls), (text, []))
+        self.assertFalse(os.path.exists(real + elkt.CAP_BACKUP))
+        self.assertEqual(self.cap(force=True)[0]["action"], "replaced")
+        self.assertEqual(elkt.parse_dkms_conf(read(real))["BUILD_EXCLUSIVE_KERNEL_MAX"], "6.12.999")
+        self.assertEqual(read(real + elkt.CAP_BACKUP), text)
+
+    def test_every_package_is_capped_and_a_stale_build_removed(self):
+        a = self.package()
+        b = self.package(ver="6.16.6-2255209.el10", text=AMD_CONF.replace(AMD_VER, "6.16.6-2255209.el10"),
+                         kernels=())
+        stale = put(self.root, "var/lib/dkms/amdgpu/%s/build/make.log" % AMD_VER, "error")
+        res = self.cap()
+        self.assertEqual([r["action"] for r in res], ["capped", "capped"])
+        for real in (a, b):
+            self.assertIn("BUILD_EXCLUSIVE_KERNEL_MAX", elkt.parse_dkms_conf(read(real)))
+        self.assertFalse(os.path.exists(os.path.dirname(stale)))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "var/lib/dkms/amdgpu", AMD_VER, EL)))
+        self.assertEqual(dict((r["version"], r["build_removed"]) for r in res),
+                         {AMD_VER: True, "6.16.6-2255209.el10": False})
+
+    def test_the_first_backup_is_never_overwritten(self):
+        real = self.package()
+        self.cap()
+        self.cap(force=True, series="6.18")
+        self.assertEqual(read(real + elkt.CAP_BACKUP), AMD_CONF)
+        self.assertEqual(elkt.parse_dkms_conf(read(real))["BUILD_EXCLUSIVE_KERNEL_MAX"], "6.18.999")
+
+    def test_a_cap_below_a_kernel_it_is_installed_for_is_refused(self):
+        real = self.package()
+        res = self.cap(series="6.6")
+        self.assertEqual(res[0]["action"], "refused")
+        self.assertEqual((read(real), self.calls), (AMD_CONF, []))
+
+    def test_a_dry_run_writes_nothing(self):
+        real = self.package()
+        put(self.root, "var/lib/dkms/amdgpu/%s/build/make.log" % AMD_VER, "error")
+        del SAID[:]
+        self.cap(dry=True)
+        self.assertEqual(read(real), AMD_CONF)
+        self.assertFalse(os.path.exists(real + elkt.CAP_BACKUP))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "var/lib/dkms/amdgpu", AMD_VER, "build")))
+        self.assertTrue(self.calls)                                # ...and says what it would run
+        said = "\n".join(SAID)
+        self.assertIn("backup would go to " + real + elkt.CAP_BACKUP, said)
+        self.assertNotIn("backup ->", said)                        # was: a green 'ok', and no backup
+
+    def test_a_failed_write_is_said_and_the_next_package_still_capped(self):
+        a = self.package()
+        b = self.package(ver="6.16.6-2255209.el10", kernels=())
+        os.chmod(os.path.dirname(a), 0o555)                        # no backup can be written there
+        try:
+            if os.access(os.path.dirname(a), os.W_OK):
+                self.skipTest("running as root: a read-only directory does not stop root")
+            res = self.cap()
+        finally:
+            os.chmod(os.path.dirname(a), 0o755)
+        self.assertEqual(dict((r["version"], r["action"]) for r in res),
+                         {AMD_VER: "failed", "6.16.6-2255209.el10": "capped"})
+        self.assertIn("BUILD_EXCLUSIVE_KERNEL_MAX", elkt.parse_dkms_conf(read(b)))
+
+    def test_the_command_with_nothing_to_cap_succeeds(self):
+        real_which = elkt.which
+        with patched(elkt, which=lambda n, path=None: None if n == "dkms" else real_which(n, path)):
+            rc, so, se = run_main(["dkms-cap", "--json", "--state-dir", self.root + "/s"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(so)["packages"], [])
+        self.assertIn("nothing to cap", se)
+        with patched(elkt, which=lambda n, path=None: "/usr/sbin/dkms" if n == "dkms" else real_which(n, path),
+                     amdgpu_dkms_packages=lambda root="/", dkms=None: []):
+            rc, so, se = run_main(["dkms-cap", "--dry-run", "--state-dir", self.root + "/s"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no amdgpu-dkms here", so)
+
+    def test_as_root_the_json_says_so_and_nothing_is_written(self):
+        real = self.package()
+        real_which, real_pkgs = elkt.which, elkt.amdgpu_dkms_packages
+        with patched(elkt, which=lambda n, path=None: "/usr/sbin/dkms" if n == "dkms" else real_which(n, path),
+                     amdgpu_dkms_packages=lambda root="/", dkms=None: real_pkgs(self.root)), \
+                patched(elkt.os, geteuid=lambda: 0):
+            rc, so, se = run_main(["dkms-cap", "--json", "--state-dir", self.root + "/s"])
+        self.assertEqual(rc, 1)
+        d = json.loads(so)
+        self.assertFalse(d["ok"])
+        self.assertIn("root", d["error"])
+        self.assertEqual((read(real), self.calls), (AMD_CONF, []))
+
+    def test_the_command_caps_and_reports(self):
+        real = self.package()
+        real_which = elkt.which
+        real_pkgs = elkt.amdgpu_dkms_packages
+
+        class NoKeepalive(object):
+            def start(self): pass
+            def stop(self): pass
+        with patched(elkt, which=lambda n, path=None: "/usr/sbin/dkms" if n == "dkms" else real_which(n, path),
+                     amdgpu_dkms_packages=lambda root="/", dkms=None: real_pkgs(self.root),
+                     dkms_status_lines=lambda: ["amdgpu/%s, %s, x86_64: installed" % (AMD_VER, EL)],
+                     SudoKeepalive=NoKeepalive), patched(elkt.os, geteuid=lambda: 1000):
+            rc, so, se = run_main(["dkms-cap", "--json", "--state-dir", self.root + "/s"])
+        self.assertEqual(rc, 0, se)
+        d = json.loads(so)
+        self.assertEqual([p["action"] for p in d["packages"]], ["capped"])
+        self.assertEqual(d["dkms_status_before"], d["dkms_status_after"])
+        self.assertIn("dkms status, before:", se)
+        self.assertIn("6.12.999", read(real))
+
+
+UBUNTU_CFG = """#
+# DO NOT EDIT THIS FILE
+#
+if [ -s $prefix/grubenv ]; then
+  set have_grubenv=true
+  load_env
+fi
+function savedefault {
+  if [ -z "${boot_once}" ]; then
+    saved_entry="${chosen}"
+    save_env saved_entry
+  fi
+}
+function load_video {
+  if [ x$feature_all_video_module = xy ]; then
+    insmod all_video
+  fi
+}
+menuentry 'Ubuntu' --class ubuntu --class gnu-linux --class os $menuentry_id_option 'gnulinux-simple-UUID' {
+\trecordfail
+\tload_video
+\tlinux\t/boot/vmlinuz-6.8.0-45-generic root=UUID=UUID ro  quiet splash $vt_handoff
+\tinitrd\t/boot/initrd.img-6.8.0-45-generic
+}
+submenu 'Advanced options for Ubuntu' $menuentry_id_option 'gnulinux-advanced-UUID' {
+\tmenuentry 'Ubuntu, with Linux 6.8.0-45-generic' --class ubuntu $menuentry_id_option 'gnulinux-6.8.0-45-generic-advanced-UUID' {
+\t\tlinux\t/boot/vmlinuz-6.8.0-45-generic root=UUID=UUID ro  quiet splash $vt_handoff
+\t}
+\tmenuentry 'Ubuntu, with Linux 6.8.0-45-generic (recovery mode)' --class ubuntu $menuentry_id_option 'gnulinux-6.8.0-45-generic-recovery-UUID' {
+\t\tlinux\t/boot/vmlinuz-6.8.0-45-generic root=UUID=UUID ro recovery nomodeset
+\t}
+\tmenuentry 'Ubuntu, with Linux 6.8.0-40-generic' --class ubuntu $menuentry_id_option 'gnulinux-6.8.0-40-generic-advanced-UUID' {
+\t\tlinux\t/vmlinuz-6.8.0-40-generic root=UUID=UUID ro  quiet splash $vt_handoff
+\t}
+}
+menuentry 'UEFI Firmware Settings' $menuentry_id_option 'uefi-firmware' {
+\tfwsetup
+}
+"""
+KEEP_45 = "gnulinux-advanced-UUID>gnulinux-6.8.0-45-generic-advanced-UUID"
+KEEP_40 = "gnulinux-advanced-UUID>gnulinux-6.8.0-40-generic-advanced-UUID"
+
+
+class Grub(TempRoot):
+    """Debian / Ubuntu: no grubby, GRUB_DEFAULT decides."""
+
+    def setUp(self):
+        TempRoot.setUp(self)
+        self.defaults = put(self.root, "etc/default/grub",
+                            'GRUB_DEFAULT=0\nGRUB_TIMEOUT_STYLE=hidden\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash"\n')
+        put(self.root, "boot/grub/grub.cfg", UBUNTU_CFG)
+        put(self.root, "boot/vmlinuz-6.8.0-45-generic", "k")
+        put(self.root, "boot/vmlinuz-6.8.0-40-generic", "k")
+
+    def look(self, release="7.2.6-elkt", **kw):
+        return elkt.grub_outlook(release, root=self.root, **kw)
+
+    def test_the_menu_as_grub_reads_it(self):
+        items = elkt.grub_menu(UBUNTU_CFG)
+        self.assertEqual([i["kind"] for i in items], ["menuentry", "submenu", "menuentry"])
+        refs = [r for _, r in elkt.grub_entries(items)]
+        self.assertEqual(refs[1], KEEP_45)
+        self.assertEqual([e["release"] for e, _ in elkt.grub_entries(items)],
+                         ["6.8.0-45-generic", "6.8.0-45-generic", "6.8.0-45-generic", "6.8.0-40-generic", ""])
+        self.assertIs(elkt.grub_find(items, "1"), items[1]["children"][0])          # a submenu: its first
+        self.assertIs(elkt.grub_find(items, "Advanced options for Ubuntu>Ubuntu, with Linux 6.8.0-40-generic"),
+                      items[1]["children"][2])
+        self.assertIsNone(elkt.grub_find(items, "gnulinux-gone"))
+
+    def test_the_setting_the_last_file_gives(self):
+        self.assertEqual(elkt.grub_default_setting(self.root), ("0", self.defaults))
+        put(self.root, "etc/default/grub.d/50-local.cfg", 'GRUB_DEFAULT="saved"  # keep it\n')
+        self.assertEqual(elkt.grub_default_setting(self.root)[0], "saved")
+        put(self.root, "etc/default/grub.d/50-local.cfg", "GRUB_DEFAULT=\n")
+        self.assertEqual(elkt.grub_default_setting(self.root)[0], "0")              # empty is 0
+
+    def test_grub_default_0_and_a_newer_kernel_becomes_the_default(self):
+        o = self.look()
+        self.assertEqual((o["follows_newest"], o["becomes_default"], o["current"], o["keep_ref"]),
+                         (True, True, "6.8.0-45-generic", KEEP_45))
+        self.assertFalse(self.look("6.1.150-elkt")["becomes_default"])               # sorts below
+        self.assertIsNone(self.look("6.8.0-elkt")["becomes_default"])                # sort -V's call
+        self.assertIsNone(self.look("")["becomes_default"])
+
+    def test_a_saved_default_stays_unless_nothing_or_the_first_entry_is_saved(self):
+        put(self.root, "etc/default/grub", "GRUB_DEFAULT=saved\n")
+        put(self.root, "boot/grub/grubenv", "# GRUB Environment Block\nsaved_entry=%s\n####\n" % KEEP_40)
+        o = self.look()
+        self.assertEqual((o["follows_newest"], o["becomes_default"], o["current"]), (False, False, "6.8.0-40-generic"))
+        put(self.root, "boot/grub/grubenv", "# GRUB Environment Block\nsaved_entry=\n")
+        self.assertTrue(self.look()["becomes_default"])
+        put(self.root, "boot/grub/grubenv", "saved_entry=gnulinux-simple-UUID\n")
+        self.assertTrue(self.look()["becomes_default"])
+        put(self.root, "boot/grub/grubenv", "saved_entry=gnulinux-gone-UUID\n")     # GRUB falls back to 0
+        self.assertTrue(self.look()["becomes_default"])
+
+    def test_a_default_by_title_stays_and_one_by_number_moves(self):
+        put(self.root, "etc/default/grub", "GRUB_DEFAULT='Advanced options for Ubuntu>Ubuntu, with Linux "
+                                           "6.8.0-40-generic'\n")
+        self.assertFalse(self.look()["becomes_default"])
+        put(self.root, "etc/default/grub", "GRUB_DEFAULT=1\n")                       # the submenu's first
+        self.assertTrue(self.look()["becomes_default"])
+        put(self.root, "etc/default/grub", 'GRUB_DEFAULT="1>2"\n')                   # counts: it moves
+        o = self.look()
+        self.assertEqual((o["moves"], o["becomes_default"], o["keep_ref"]), (True, None, KEEP_40))
+        self.assertFalse(self.look("6.1.150-elkt")["becomes_default"])
+
+    def test_the_advanced_submenu_by_id_or_title_boots_the_newest_too(self):
+        # GRUB boots a submenu's FIRST entry however it is named; only '1' used to count.
+        for val in ("1", "gnulinux-advanced-UUID", "'Advanced options for Ubuntu'", '"1>0"',
+                    "gnulinux-advanced-UUID>0"):
+            put(self.root, "etc/default/grub", "GRUB_DEFAULT=%s\n" % val)
+            o = self.look()
+            self.assertEqual((o["follows_newest"], o["moves"], o["becomes_default"], o["current"],
+                              o["keep_ref"]), (True, False, True, "6.8.0-45-generic", KEEP_45), val)
+        put(self.root, "etc/default/grub", "GRUB_DEFAULT=saved\n")
+        put(self.root, "boot/grub/grubenv", "saved_entry=gnulinux-advanced-UUID\n")
+        self.assertTrue(self.look()["becomes_default"])
+        self.assertTrue(elkt.grub_find(elkt.grub_menu(UBUNTU_CFG), "gnulinux-advanced-UUID",
+                                       descend=False)["kind"] == "submenu")
+
+    def test_a_kernel_named_by_its_id_stays_even_through_a_submenu_counted_by_number(self):
+        # The LAST part picks: '1>id' is that kernel's own entry, not a count in the list.
+        put(self.root, "etc/default/grub", 'GRUB_DEFAULT="1>gnulinux-6.8.0-45-generic-advanced-UUID"\n')
+        o = self.look()
+        self.assertEqual((o["follows_newest"], o["moves"], o["becomes_default"], o["current"]),
+                         (False, False, False, "6.8.0-45-generic"))
+        put(self.root, "etc/default/grub", 'GRUB_DEFAULT="gnulinux-advanced-UUID>2"\n')
+        self.assertEqual(self.look()["moves"], True)
+
+    def test_without_a_readable_grub_cfg_grub_default_0_still_means_the_newest(self):
+        os.remove(os.path.join(self.root, "boot/grub/grub.cfg"))
+        o = self.look()
+        self.assertEqual((o["readable"], o["becomes_default"], o["current"], o["keep_ref"]),
+                         (False, True, "6.8.0-45-generic", ""))
+        self.assertIn("grep -E", "\n".join(elkt.grub_keep_commands(o)))
+
+    def test_the_commands_a_person_runs(self):
+        cmds = elkt.grub_keep_commands(self.look())
+        self.assertEqual(cmds[1], "sudo sed -i -E 's/^([[:space:]]*(export[[:space:]]+)?)GRUB_DEFAULT=.*/"
+                                  "\\1GRUB_DEFAULT=saved/' /etc/default/grub")
+        self.assertEqual(cmds[2], "sudo grub-set-default '%s'" % KEEP_45)
+        self.assertEqual(cmds[3], "sudo update-grub")
+
+    def test_the_printed_sed_does_what_keep_boot_default_does(self):
+        # Was 's/^GRUB_DEFAULT=...': an `export` or indented line kept GRUB_DEFAULT=0.
+        if not shutil.which("sed"):
+            self.skipTest("no sed here")
+        for text in ("export GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\n", "  GRUB_DEFAULT=0\n",
+                     'GRUB_DEFAULT="0"\n#GRUB_DEFAULT=2\n'):
+            put(self.root, "etc/default/grub", text)
+            o = self.look()
+            cmd = elkt.grub_keep_commands(o)[1]
+            self.assertTrue(cmd.startswith("sudo sed "), cmd)
+            subprocess.check_call(["sh", "-c", cmd[len("sudo "):].replace(" /etc/default/grub",
+                                                                          " " + self.defaults)])
+            want = re.sub(r"^(\s*(?:export\s+)?)GRUB_DEFAULT=.*$", r"\1GRUB_DEFAULT=saved", text, flags=re.M)
+            self.assertEqual(read(self.defaults), want, text)
+            self.assertEqual(elkt.grub_default_setting(self.root)[0], "saved", text)
+
+    def test_the_default_release_status_reports(self):
+        self.assertEqual(elkt.default_boot_release(self.root, grubby=False), "6.8.0-45-generic")
+        put(self.root, "etc/default/grub", "GRUB_DEFAULT=saved\n")
+        put(self.root, "boot/grub/grubenv", "saved_entry=%s\n" % KEEP_40)
+        self.assertEqual(elkt.default_boot_release(self.root, grubby=False), "6.8.0-40-generic")
+
+
+class InstallOnDebian(TempRoot):
+    """install_kernel() where there is no grubby, against the Install tests' fake sudo -- with
+    cp / tee / rm run for real inside the fake root, grub-set-default writing its grubenv."""
+
+    def setUp(self):
+        Install.setUp(self)
+        self.defaults = put(self.root, "etc/default/grub", "GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\n")
+        self.original = read(self.defaults)
+        put(self.root, "boot/grub/grub.cfg", UBUNTU_CFG)
+        put(self.root, "boot/vmlinuz-6.8.0-45-generic", "k")
+        put(self.root, "boot/vmlinuz-6.8.0-40-generic", "k")
+        self.machine = {"boot": {"grubby": False}, "running": "6.8.0-45-generic", "secure_boot": "off",
+                        "dkms": []}
+        inner, test = elkt.sudo, self
+
+        def sudo(cmd, check=True, capture=False, dry=False, stdin_data=None):
+            if not dry and cmd[0] in ("cp", "tee", "rm") and all(
+                    a.startswith(test.root) for a in cmd[1:] if a.startswith("/")):
+                test.calls.append(list(cmd))
+                p = subprocess.run(cmd, input=stdin_data, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, universal_newlines=True)
+                if check and p.returncode:
+                    raise elkt.ToolError("failed: %s" % " ".join(cmd))
+                return p
+            if not dry and cmd[0] == "grub-set-default":
+                put(test.root, "boot/grub/grubenv", "# GRUB Environment Block\nsaved_entry=%s\n" % cmd[1])
+            return inner(cmd, check=check, capture=capture, dry=dry)
+        elkt.sudo = sudo
+        self.saved_debian = (elkt.debian_grub_outlook, elkt.cap_before_install)
+        elkt.debian_grub_outlook = lambda machine, release="": elkt.grub_outlook(release, root=test.root)
+        real_cap = elkt.cap_before_install
+        elkt.cap_before_install = lambda m, r, dry=False: real_cap(m, r, dry, root=test.root)
+        del SAID[:]
+
+    def tearDown(self):
+        elkt.debian_grub_outlook, elkt.cap_before_install = self.saved_debian
+        Install.tearDown(self)
+
+    def go(self, **over):
+        Install.go(self, **dict(dict(keep_boot_default=False, no_dkms_cap=False), **over))
+
+    def index(self, pred):
+        return next(i for i, c in enumerate(self.calls) if pred(c))
+
+    def test_without_the_flag_grub_is_untouched_and_the_warning_says_how(self):
+        self.go()
+        self.assertEqual(read(self.defaults), self.original)
+        self.assertFalse([c for c in self.calls if c[0] in ("grub-set-default", "update-grub", "tee")])
+        said = "\n".join(SAID)
+        self.assertIn("the DEFAULT boot entry", said)
+        self.assertIn("--keep-boot-default", said)
+        self.assertIn("sudo grub-set-default '%s'" % KEEP_45, said)
+
+    def test_keep_boot_default_pins_the_old_entry_before_make_install(self):
+        self.go(keep_boot_default=True)
+        self.assertIn("GRUB_DEFAULT=saved\n", read(self.defaults))
+        self.assertIn("GRUB_TIMEOUT=5\n", read(self.defaults))
+        backups = glob.glob(self.defaults + ".elkt-*")
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(read(backups[0]), self.original)
+        pin = self.index(lambda c: c[0] == "grub-set-default")
+        self.assertEqual(self.calls[pin], ["grub-set-default", KEEP_45])
+        self.assertLess(pin, self.index(lambda c: c[-1] == "modules_install"))
+        self.assertIn(["update-grub"], self.calls)
+        self.assertIn("the default boot entry is still 6.8.0-45-generic", "\n".join(SAID))
+
+    def test_a_grub_d_override_stops_the_install_before_anything_is_written(self):
+        put(self.root, "etc/default/grub.d/50-cloudimg.cfg", "GRUB_DEFAULT=0\n")
+        with self.assertRaises(elkt.ToolError):
+            self.go(keep_boot_default=True)
+        self.assertEqual(read(self.defaults), self.original)
+        self.assertFalse([c for c in self.calls if c[-1] in ("modules_install", "install")])
+
+    def build(self, *argv):
+        """cmd_build() as far as Make(), where the build starts: -> 'built' when it got there."""
+        tree = os.path.join(self.root, "src", "linux-7.2.6")
+        put(tree, "Makefile", "VERSION = 7\nPATCHLEVEL = 2\nSUBLEVEL = 6\n")
+
+        class Started(Exception):
+            pass
+
+        def make(*a, **k):
+            raise Started()
+        machine = dict(FAKE_MACHINE, boot={"grubby": False, "bls": False, "initramfs": "update-initramfs"},
+                       running="6.8.0-45-generic", pkg_manager="apt")
+        args = elkt.build_parser().parse_args(elkt.normalize_argv(
+            ["build", "--install", "--source", tree, "--state-dir", self.root + "/s"] + list(argv)))
+        with patched(elkt, detect_machine=lambda: machine, doctor=lambda *a, **k: False,
+                     resolve_toolchain=lambda opts, m: {"cpu_level": "", "version": "gcc 13"},
+                     resolve_tree=lambda opts, fetch=False: (tree, None), lock_tree=lambda t: None,
+                     fit_llvm_to_tree=lambda *a: None, apply_cpu=lambda *a: None,
+                     show_plan=lambda *a, **k: None, check_tree_requirements=lambda *a, **k: False,
+                     Make=make):
+            try:
+                elkt.cmd_build(args)
+            except Started:
+                return "built"
+        return "returned"
+
+    def test_build_install_keep_boot_default_refuses_before_the_build(self):
+        # Was: refused only by install_kernel(), after the hours-long build.
+        put(self.root, "etc/default/grub.d/50-cloudimg.cfg", "GRUB_DEFAULT=0\n")
+        with self.assertRaises(elkt.ToolError) as cm:
+            self.build("--keep-boot-default")
+        self.assertIn("50-cloudimg.cfg", str(cm.exception))
+        self.assertIn("nothing has been built", str(cm.exception))
+        os.remove(os.path.join(self.root, "etc/default/grub.d/50-cloudimg.cfg"))
+        put(self.root, "boot/grub/grub.cfg", UBUNTU_CFG.split("submenu ")[0])  # entry 0 only: no own entry
+        with self.assertRaises(elkt.ToolError) as cm:
+            self.build("--keep-boot-default")
+        self.assertIn("nothing to pin -- NOT building", str(cm.exception))
+        self.assertEqual(read(self.defaults), self.original)
+        self.assertEqual(self.calls, [])
+
+    def test_build_install_keep_boot_default_goes_on_when_it_can_keep_it(self):
+        self.assertEqual(self.build("--keep-boot-default"), "built")
+        put(self.root, "etc/default/grub.d/50-cloudimg.cfg", "GRUB_DEFAULT=0\n")
+        self.assertEqual(self.build(), "built")                       # without the flag: a warning
+        self.assertIn("the DEFAULT boot entry", "\n".join(SAID))
+        put(self.root, "etc/default/grub.d/50-cloudimg.cfg",          # stays anyway: nothing to pin
+            "GRUB_DEFAULT=%s\n" % KEEP_40)
+        self.assertEqual(self.build("--keep-boot-default"), "built")
+        self.assertEqual(read(self.defaults), self.original)
+
+    def test_a_dry_run_says_what_it_would_pin_and_writes_nothing(self):
+        self.go(keep_boot_default=True, dry_run=True)
+        self.assertEqual(read(self.defaults), self.original)
+        self.assertEqual(glob.glob(self.defaults + ".elkt-*"), [])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "boot/grub/grubenv")))
+        self.assertIn("default boot entry pinned to 6.8.0-45-generic: " + KEEP_45, "\n".join(SAID))
+
+    def test_a_saved_default_needs_nothing(self):
+        put(self.root, "etc/default/grub", "GRUB_DEFAULT=saved\n")
+        put(self.root, "boot/grub/grubenv", "saved_entry=%s\n" % KEEP_40)
+        self.go(keep_boot_default=True)
+        self.assertFalse([c for c in self.calls if c[0] in ("grub-set-default", "tee")])
+        self.assertIn("stays the default boot entry", "\n".join(SAID))
+
+    def amdgpu(self, kernels=(("6.8.0-45-generic", "installed"),)):
+        DkmsCap.package(self, kernels=kernels)
+        self.machine["dkms"] = [{"name": "amdgpu", "version": AMD_VER, "kernels": list(kernels), "limits": {}}]
+
+    def test_amdgpu_dkms_is_capped_before_make_install(self):
+        self.amdgpu()
+        self.go()
+        tee = self.index(lambda c: c[:2] == ["tee", "-a"])
+        self.assertLess(tee, self.index(lambda c: c[-1] == "modules_install"))
+        self.assertEqual(self.machine["dkms"][0]["limits"], {"BUILD_EXCLUSIVE_KERNEL_MAX": "6.8.999"})
+        self.assertIn("SKIPS amdgpu", "\n".join(SAID))
+
+    def test_no_dkms_cap_and_the_same_series_leave_it_alone(self):
+        self.amdgpu()
+        self.go(no_dkms_cap=True)
+        self.assertFalse([c for c in self.calls if c[0] == "tee"])
+        del self.calls[:]
+        self.machine["dkms"][0]["kernels"] = [("7.2.1-elkt", "installed")]   # 7.2.999: 7.2.6 is in it
+        self.go()
+        self.assertFalse([c for c in self.calls if c[0] == "tee"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

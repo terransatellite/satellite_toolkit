@@ -25,15 +25,18 @@ pacman systems. It installs a kernel: read it before you trust it.
 ./enterprise_linux_kernel_tool.py install --dry-run            # print the sudo commands
 ./enterprise_linux_kernel_tool.py install
 ./enterprise_linux_kernel_tool.py dkms-check --source ~/src/linux-7.2.6
-./enterprise_linux_kernel_tool.py status
+./enterprise_linux_kernel_tool.py dkms-cap --dry-run   # cap every amdgpu-dkms so DKMS skips newer kernels
+./enterprise_linux_kernel_tool.py status           # trees on record, and the kernels installed here
+./enterprise_linux_kernel_tool.py status --json    # the same as data (doctor --json too)
+./enterprise_linux_kernel_tool.py --remote=me@host build ...   # the same, on another machine
 ```
 
 **Status:** everything up to and including the build and its checks has been run
 for real. `install` has only been run as `--dry-run` and against a fake `sudo` --
 start with `install --dry-run`.
 
-Never run it as root. The build runs as you; only `install` calls `sudo`, once,
-up front.
+Never run it as root. The build runs as you; only `install` and `dkms-cap` call
+`sudo`, once, up front (`doctor --json` run as root says so in its answer).
 
 ## What you choose
 
@@ -57,6 +60,9 @@ up front.
 | `--config-base` | `auto` `running` `defconfig` or a file | `auto` |
 | `--localversion` | suffix for the release | `-elkt` |
 | `--clean` | `auto` `always` `never` `force` | `auto` |
+| `--keep-boot-default` | Debian/Ubuntu (no grubby): keep the current default boot entry -- see below | off |
+| `--no-dkms-cap` | `install`: leave amdgpu-dkms uncapped -- see *AMDGPU and DKMS* | off |
+| `--opt-root` | where the satellite toolkit's compilers live (`<dir>/<name>-<version>/bin`): searched by `toolchains`, `detect` and the wizard; nothing is installed there | `~/opt` |
 
 **Profiles.** The wizard's first screen is the list of saved profiles, newest
 first: Enter takes the newest *as it is* -- no questions, straight to the plan
@@ -90,8 +96,8 @@ kept regardless; add more with `--keep-symbol USB_SERIAL`.
 ## Compilers and build tools
 
 `toolchains` looks well beyond PATH: `/usr/bin`, every PATH entry, `/usr/local`,
-`/opt/*`, `~/opt/*`, Red Hat `gcc-toolset-*`, Debian's `/usr/lib/llvm-*`,
-ROCm, AOCC, Intel oneAPI, the NVIDIA HPC SDK. Each compiler is asked what it
+`/opt/*`, `~/opt/*` (and `--opt-root DIR`'s `DIR/*/bin`, ahead of it), Red Hat
+`gcc-toolset-*`, Debian's `/usr/lib/llvm-*`, ROCm, AOCC, Intel oneAPI, the NVIDIA HPC SDK. Each compiler is asked what it
 is (`--version`, `-dumpmachine`) and then made to compile a program *in the
 scrubbed environment the build uses* -- one that needs `LD_LIBRARY_PATH` to
 start is reported as broken there, not an hour into a build.
@@ -109,6 +115,13 @@ start is reported as broken there, not an hour into a build.
   refuses gold; kbuild has no mold support).
 - **Python**: every python3 found, CPython or PyPy. The default is the platform
   interpreter regardless of what `python3` means on your PATH.
+- **The satellite toolkit's prefixes** are taken by their REAL paths, which is what it
+  passes: `--cc <opt>/clang-21.1.0/bin/clang` -- or the realpath of `clang-current/bin/clang`,
+  which ends in `clang-21`, the file that `clang` links to in an LLVM install -- gets
+  `LLVM=<opt>/clang-21.1.0/bin/` and that prefix's `clang++`; `--binutils` takes a binutils
+  `bin/` directory or its prefix (`<opt>/binutils-2.45`). The path recorded in the tree's
+  `GNUmakefile` and in the state is then that version's, not a `-current` link a later build
+  moves.
 
 The plan then names the assembler, linker, python and make the build will
 *really* run -- by asking the chosen compiler (`-print-prog-name=as`) in the
@@ -204,6 +217,41 @@ for a tree that is already built; `build` refreshes it every time.
 A source tree that an installed kernel's `/lib/modules/<rel>/build` points at
 is never cleaned automatically. DKMS compiles against that directory.
 
+**`dkms-cap`: amdgpu-dkms kept off kernels it cannot build for** (`fix-amdgpu-dkms.sh`,
+generalised). AMD's amdgpu-dkms targets the enterprise kernel it was packaged for; against a
+newer kernel -- which has the newer in-tree amdgpu, built here as a module -- its build fails.
+`dkms-cap` adds `BUILD_EXCLUSIVE_KERNEL_MAX="<series>.999"` to **every**
+`/usr/src/amdgpu-*/dkms.conf` (the shell script handled one pinned version), where `<series>`
+is that of the newest kernel the package is built or installed for -- the rule `dkms-check`
+prints. dkms skips a kernel that sorts *above* the cap, and 6.18.52 sorts above `6.18`: the
+script's `6.18` excluded every point release of the very series it served, hence `.999`.
+
+- The cap goes into the **real file**: on AMD's packaging `dkms.conf` is a symlink into
+  `amd/dkms/`. Before the first change it takes a **dereferenced** backup,
+  `<real file>.pre-elkt-dkms-cap` (`cp -aL`; `cp -a` copies the symlink, a "backup" that then
+  shows the changed text -- build_everything.sh's lesson). An existing backup is never
+  overwritten: it is the vendor's file.
+- A `BUILD_EXCLUSIVE_KERNEL_MAX` already there is left alone; `--force` replaces it.
+  `--max 6.18` caps at `6.18.999` instead of the computed series. A cap below a kernel the
+  package is INSTALLED for is refused (`--force` overrides).
+- The stale `/var/lib/dkms/amdgpu/<version>/build` a failed build leaves is removed (never
+  `dkms remove`).
+- `dkms status` is shown before and after; then what the cap means for the newest tree this
+  tool built. `--dry-run` prints the sudo commands and the lines it would add, and runs
+  none. sudo is used for these writes only, asked once.
+- No dkms, or no amdgpu-dkms: nothing to do, exit 0. A failed write or a refused cap: exit 1
+  (the other packages still get their turn). `--json` prints `{tool, ok, packages: [{version,
+  conf, real, backup, max_before, max_after, action, build_removed, error}],
+  dkms_status_before, dkms_status_after, release, skips_release, dry_run, error}`.
+
+**`install` caps it first.** When a registered amdgpu-dkms would try (and fail) to build for
+the release being installed, `install` applies the same cap, in the same sudo session, BEFORE
+`make modules_install` / `make install` -- whose hooks run `dkms autoinstall` for the new
+kernel -- and says so (build_everything.sh's stage order: dkms before kernel). A release in
+the series the package serves is not capped; a package with its own cap is left alone; a cap
+that fails is said and the install goes on (a mitigation, not a dependency). `--no-dkms-cap`
+leaves it uncapped.
+
 ## Packaging
 
 `package --source TREE` runs the kernel's own `binrpm-pkg` (or `bindeb-pkg`,
@@ -233,6 +281,118 @@ distro, and plain `tar -C / -xf` replaces that symlink with a directory.
 Build a kernel meant for other people with the **system compiler**: their DKMS
 builds with theirs.
 
+## The default boot entry on Debian and Ubuntu
+
+With grubby (Fedora, EL, openSUSE) `install` reads the default entry before the install and
+puts it back afterwards -- even when `make install` fails half way. Debian and Ubuntu have no
+grubby: `make install` runs installkernel, whose `zz-update-grub` hook rewrites `grub.cfg`,
+and with `GRUB_DEFAULT=0` -- the stock setting -- entry 0 boots the **newest** kernel by
+version. A newer kernel built here becomes the default just by sorting first.
+
+The tool reads `GRUB_DEFAULT` the way `update-grub` does (`/etc/default/grub`, then
+`/etc/default/grub.d/*.cfg`, the last one wins), `grubenv`'s `saved_entry` and `grub.cfg`'s
+menu, and works out whether the new release becomes the default: entry 0, `saved` with
+nothing saved, the *Advanced options* submenu itself -- by number, id or title alike, since
+GRUB boots a submenu's first entry -- or a number that counts into the kernel list (that
+moves) -- not a kernel's entry named by its id or title, which stays.
+
+- **By default it changes nothing and warns, loudly**, before the build (`build --install`),
+  before the install and after it, with the exact commands that keep the current kernel the
+  default:
+
+  ```
+  sudo cp -a /etc/default/grub /etc/default/grub.bak-$(date +%Y%m%d)
+  sudo sed -i -E 's/^([[:space:]]*(export[[:space:]]+)?)GRUB_DEFAULT=.*/\1GRUB_DEFAULT=saved/' /etc/default/grub
+  sudo grub-set-default 'gnulinux-advanced-<uuid>>gnulinux-6.8.0-45-generic-advanced-<uuid>'
+  sudo update-grub
+  ```
+
+- **`--keep-boot-default`** does exactly that, before `make install`: a dated backup
+  (`/etc/default/grub.elkt-YYYYmmdd-HHMMSS`), `GRUB_DEFAULT=saved`, `grub-set-default` to
+  the entry of the kernel that boots now (by its own id, inside *Advanced options*), and
+  `update-grub`; afterwards it checks `saved_entry`. When it cannot -- `GRUB_DEFAULT` set in a
+  `grub.d` file, which it does not edit, or no entry of that kernel in `grub.cfg` -- it stops
+  BEFORE anything is installed; `build --install --keep-boot-default` checks the same before
+  the build starts, not after it. `GRUB_DEFAULT=saved` with an entry saved needs nothing.
+  `--keep-boot-default` and `--set-default` are refused together.
+- `/etc/default/grub` is never changed without `--keep-boot-default`.
+
+## The satellite toolkit
+
+This tool is step 8 of the satellite toolkit (`../../PLAN.md`): "lastly the linux kernel, with
+AMDGPU, with everything". What it keeps of the toolkit's contracts:
+
+**Local or remote.** The first thing `main()` does is `where_to_run()` (satellite_remote,
+embedded between the `# >>> satellite_remote >>>` markers by `sync_remote.py`; never edited
+here). `--local` runs here; `--remote[=USER@HOST]` uploads the tool to
+`~/.satellite_toolkit/code/` there and runs it in a session that survives a dropped ssh
+connection (Ctrl-] detaches, the build goes on); `--attach[=SESSION]` comes back to it,
+`--sessions` lists them. On a terminal with neither, it asks "run where?";
+`SATELLITE_TOOLKIT_WHERE=local` means `--local`. These four are taken out before argparse
+sees anything, so `--local` is never read as `--localversion`. The session short name is
+`linux_kernel`. Exit codes: `0` done, `1` failed, `2` usage, `130` interrupted; a remote run
+exits with the program's own code once it ended there, or `75` (detached with Ctrl-], it
+keeps running there) or `255` (the connection dropped; `--attach` goes back).
+
+**Every subcommand** takes `--yes`, `--json`, `--opt-root DIR` and `--state-dir DIR`. In this
+tool `--yes` also OVERRIDES the safety refusals (installing over the running release, an
+unenrolled MOK key, a CPU level this machine lacks, failed post-build checks), so the main
+file never passes `--yes` -- nor `--set-default` -- here. A plain `build` asks nothing anyway.
+
+**`--json`**: stdout is the JSON and nothing else; every message, an `ERROR:` included, goes
+to stderr. `doctor --json` prints exactly
+
+```
+{"tool": "enterprise_linux_kernel_tool", "ok": false, "package_manager": "dnf",
+ "missing": [{"what": "flex", "package": "flex", "level": "required"},
+             {"what": "pahole (`--debug-info btf` needs it)", "package": "dwarves", "level": "wanted"},
+             {"what": "room: /home/me/src has 3.1 GB free; ...", "package": "", "level": "required"}],
+ "enable_repos": [], "install_command": "sudo dnf install -y flex dwarves"}
+```
+
+-- `doctor`'s checks as data: build tools, headers, the signing tool (Secure Boot on), pahole
+(required with `--debug-info btf|on`, wanted otherwise), GPU firmware and CPU microcode
+(wanted), ncurses (optional), and what no package fixes (`package: ""`): room in the work
+directory and `/boot`, a path with spaces, a FAT/NTFS work directory, the toolchain chosen
+-- and running as root, which `doctor --json` REPORTS (`ok: false`, exit 1) instead of
+refusing before the answer. `install_command` installs what is required and wanted, nothing
+else; `enable_repos` names CRB / PowerTools / codeready-builder when a package needs it (none
+of the kernel's does on EL 8-10). Exit 0 when `ok`, else 1. No package manager is run.
+
+`status --json` prints the kernel tool's status shape (PLAN.md section 3) at the top level,
+plus what `status` shows beyond it:
+
+```
+{"tool": "enterprise_linux_kernel_tool",
+ "installed": [{"release", "modules": bool, "build_link": bool, "boot_image": bool,
+                "built_by_tool": bool, "default": bool,
+                "complete": bool, "image", "tree", "running": bool}],
+ "trees": [{"tree", "status", "stage", "release", "error",
+            "exists", "started", "finished", "toolchain", "cc", "running", "in_service"}],
+ "state_file", "running", "default", "default_known",
+ "amdgpu_dkms": [{"version", "conf", "max"}]}
+```
+
+`installed` is every release in `/lib/modules` or `/boot`. `complete` = modules, the build
+link and the image all there (modules_install alone is not "installed"). `built_by_tool`: a
+tree on record has that release, or its build link is a tree with this tool's `GNUmakefile`
+pin, or the release ends in the default LOCALVERSION `-elkt`. `default` is read without root
+(grubby, a BLS `saved_entry`, or GRUB_DEFAULT on Debian); `default_known: false` when it
+cannot be (EL keeps `grubenv` root's). No sudo, no network.
+
+**What the main file runs for step 8**, toolchain inputs as REAL paths (the `-current` link's
+target when the step starts):
+
+```
+/usr/bin/python3 -I enterprise_linux_kernel_tool.py --local build --kernel stable --gpu all \
+    --cc <opt>/clang-21.1.0/bin/clang --python <opt>/cpython-3.14.0/bin/python3 \
+    --workdir <work>/kernel-clang --install --opt-root <opt>
+```
+
+(`--kernel-cc gcc`: `--cc <opt>/gcc-16.2.0/bin/gcc --binutils <opt>/binutils-2.46` in its own
+`--workdir`.) The step is done when `status --json` lists a `complete` release that is
+`built_by_tool`.
+
 ## It will refuse to
 
 build from `make defconfig` unless you ask for it by name · build a config in
@@ -241,7 +401,8 @@ alone; the rejected one is kept beside it) · install over the running kernel's
 release without `--yes` · install an unsigned kernel with Secure Boot on
 without `--allow-unsigned` · change your default boot entry without
 `--set-default` (and with it, a `make install` that FAILS still gets the old
-default back) · install a tree whose last build failed, or whose `.config`
+default back) · change `/etc/default/grub` without `--keep-boot-default` · install
+with `--keep-boot-default` when it cannot keep the default · install a tree whose last build failed, or whose `.config`
 changed since it was built · package or pin a tree with another compiler or
 other CPU flags than it was built with (`install`, `package`, `pin` and
 `dkms-check` take them from the tree's record by themselves; `install`, which
@@ -265,18 +426,39 @@ configure, `.config.elkt-rejected`.
 ## Tests
 
 ```
-/usr/bin/python3 tests/test_tool.py
+/usr/bin/python3 -I tests/test_tool.py
 ```
 
-166 tests, no network, no root, no kernel tree. Disk paths are tested on fake
+215 tests, no network, no root, no kernel tree; they pass as root (one test that needs a
+read-only directory to stop a write is skipped there) and as an unprivileged user. Disk paths are tested on fake
 sysfs trees laid out like real ones (SATA behind VMD, NVMe multipath, an md
 partition, USB through a built-in xHCI). Compiler discovery is tested with
 fake compilers -- shell scripts that print a chosen banner. `install` is tested against a
 fake `sudo`, including the case where `make install` fails half way.
 
+For the satellite toolkit: the Python 3.6 grammar and ASCII of the tool and its tests; the
+remote block is what `sync_remote.py` writes and `where_to_run` is the first statement of
+`main()`; `--local` never reaches argparse; every subcommand takes `--yes`, `--json`,
+`--opt-root`; `doctor --json` and `status --json` in the contract's exact shape, stdout
+JSON alone (doctor as root included) against a fake `/lib/modules`, `/boot`, BLS entry and
+state; the package names per package manager, CRB, GPU firmware; `--opt-root` searched
+ahead of `~/opt`; the realpath of an LLVM install's clang and a binutils prefix; the main
+file's step-8 command line. `dkms-cap` runs its `cp` / `tee` / `rm` for real in a fake root
+(a symlinked `dkms.conf` capped in the file and backed up dereferenced, an existing cap kept
+unless `--force`, two packages, the stale build directory, the first backup never
+overwritten, a cap below an installed kernel refused, a dry run, a failed write, the command
+with nothing to do and as root); `install` caps amdgpu-dkms BEFORE `make modules_install`
+(and not with `--no-dkms-cap` or within the series). GRUB: an Ubuntu `grub.cfg` parsed,
+`GRUB_DEFAULT` from `grub.d`, entry 0 / saved / by title / by number, no readable `grub.cfg`;
+`install` on Debian without the flag (nothing changed, the warning with the commands), with
+it (backup, `GRUB_DEFAULT=saved`, `grub-set-default` before `make install`), a `grub.d`
+override (nothing installed), a dry run, a saved default.
+
 ## Not done yet
 
 A signed `.deb`; image signing on anything but x86_64 (said before the build,
-not after it); restoring the default boot entry on systems without `grubby`; a
-boot with Secure Boot actually enabled. The open findings of the 2026-09-20
+not after it); keeping the default boot entry on systems with neither `grubby` nor
+Debian's `update-grub` (Arch, systemd-boot: the tool says to check); a boot with Secure
+Boot actually enabled; `--keep-boot-default` and `dkms-cap` run on a real Debian/Ubuntu
+GRUB and a real amdgpu-dkms (tested against fakes only). The open findings of the 2026-09-20
 review are listed in `../PLAN.md`, section 9e.

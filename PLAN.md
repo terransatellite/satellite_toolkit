@@ -50,6 +50,33 @@ take -- if the latter, the tool says exactly which button to press and waits/ret
 then `github` is the default once that repository exists, and `foundation*` choices are listed
 but report what they need.
 
+**Satellite build facts, measured 2026-10-09** on a copy of github.com/satellitemadness1/satellite
+at 8923ad3 ("build 0103"; full notes and file:line evidence were gathered in the cloud session):
+- Needs clang **19 or newer** AND libstdc++ **14 or newer** headers (clang 18 fails on cpu feature
+  strings; libstdc++ 13 lacks `__resize_and_overwrite`). clang 20 + libstdc++ 14: `make -j4` in
+  154 s, ~2.3 GB RAM, installs into `~/.satl`, hello proof passes. So step 9 uses step 2's clang;
+  on Ubuntu 24.04 it also needs `libstdc++-14-dev`; Debian 12 has no libstdc++ 14 package.
+- Plain `make` builds AND installs into `$HOME/.satl` (desktop launcher too) without asking; as
+  root it skips the install and still exits 0. There is no `install` target at this HEAD. The
+  default is `-j24` unless `-j` is given (pass `-jN` always; under GNU make 4.3 the PGO training
+  sub-make still uses 24). `LLVM_BIN = $(HOME)/opt/clang-current/bin` -- pass `LLVM_BIN=` (and
+  `CXX=`) for any other `--opt-root`. PGO needs llvm-profdata AND its profile runtime together
+  (or `OPTIMISE=no`). Plain make runs bare `python3`: keep `/usr/bin` first on PATH.
+- `make window` (the GTK/VTE stack) cannot build on Debian/Ubuntu today: `vendor/build_stack.py`
+  reads only `/usr/lib64/pkgconfig`, and GTK 4.24 needs wayland >= 1.24 (Ubuntu 24.04 has 1.22).
+  It is "wanted", not required: warn and build satl without it.
+- Done = the installed `satl --run examples/hello_world.satl` prints exactly `Hello, World!`,
+  `a // inside a string is not a comment`, `42`, `true` on stdout (title lines go to stderr), and
+  `satl --version` matches `satellite_config.hpp`'s VERSION/REVISION/BUILD rows. The zip's comment
+  is the commit SHA: record it (the binary does not carry it).
+- The zip: one top dir `satellite-main/`; 30 files are mode 0755 (restore modes from
+  `external_attr >> 16`; `check.sh` needs it); 3 relative symlinks under `haswell_test/`.
+  `install.sh --root DIR` installs elsewhere but still writes `$HOME/.satl/config.ini` (tests use
+  a scratch HOME). There is no `install/install_build_requirements.py` in the tree yet: the
+  toolkit carries `tools/satellite/install_build_requirements.py` (the user's first deliverable),
+  runs the tree's own copy instead when a downloaded tree has one, and the user can add ours to
+  the satellite repo.
+
 ## 1. What it is
 
 One package, `satellite_toolkit/`, whose main file builds -- on THIS machine or on ANOTHER one
@@ -94,7 +121,9 @@ session that survives a dropped ssh connection (section 3).
   uses step 4's gcc + step 3's binutils instead.
 - **Satellite is built with step 2's clang** (the Makefile reads `~/opt/clang-current`): `make
   window` (the carried GTK/VTE stack) and then a plain `make`. The plain-make-builds-GTK patch is
-  not needed for this and still waits for his yes.
+  not needed for this and still waits for his yes. (2026-10-09: `make window` is "wanted" --
+  on Debian/Ubuntu it cannot build today, see the build facts at the top; satl is built without
+  it there, with a warning.)
 
 ## 2. Layout
 
@@ -107,8 +136,10 @@ tools/gcc/                    enterprise_gcc_tool.py     (NEW: binutils + gcc) +
 tools/python/                 enterprise_python_tool.py  + tests/ + README.md
 tools/pypy/                   enterprise_pypy_tool.py    (NEW: pypy2 + pypy3 + the 2.7 host) + tests/ + README.md
 tools/kernel/                 enterprise_linux_kernel_tool.py + tests/ + README.md + PLAN.md + legacy/ + machines/
-(no tools/satellite/)         the satellite source -- its own install_build_requirements.py with it -- is
-                              downloaded from satellite.foundation; the toolkit carries no copy of it
+tools/satellite/              install_build_requirements.py (+ tests/): the user's first deliverable,
+                              for ./install/ in the satellite repo; the satellite SOURCE itself is
+                              downloaded (github / satellite.foundation), never carried; a tree's own
+                              install/install_build_requirements.py wins when it has one
 legacy/                       every .sh, byte for byte, with history/ (.bak files), HANDOFF.md, SHA256SUMS
 tests/                        the main file's and satellite_remote.py's tests
 ```

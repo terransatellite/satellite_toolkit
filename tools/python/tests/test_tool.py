@@ -1,11 +1,14 @@
 #!/usr/bin/python3 -I
-"""Tests for enterprise_python_tool.py.  stdlib unittest; no network, no root, no
-compiler, no CPython tree: every input is a small fake made in a temp dir.
+"""Tests for enterprise_python_tool.py.  stdlib unittest; no network, no root needed
+(they pass as root too: what refuses root is told it is uid 1000), no CPython tree:
+every input is a small fake made in a temp dir -- fake gcc / binutils / python3 are
+shell scripts.  Scratch HOME-like directories only: never ~/opt, never ~/.config.
 
     /usr/bin/python3 -I tests/test_tool.py
 """
 
 import ast
+import io
 import json
 import os
 import shutil
@@ -14,12 +17,14 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 import enterprise_python_tool as ept          # noqa: E402
 
-TOOL_FILE = os.path.join(HERE, "..", "enterprise_python_tool.py")
+TOOL_FILE = os.path.abspath(os.path.join(HERE, "..", "enterprise_python_tool.py"))
+TOOLKIT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 
 
 def put(root, rel, text=""):
@@ -38,6 +43,11 @@ def release(name, pre=False, published=True, rid="1", date="2026-01-01"):
 class TempRoot(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="ept-test-")
+        # Never asked "run where?", never reading or writing the real ~/.config.
+        p = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(self.root, "config"),
+                                         "SATELLITE_TOOLKIT_WHERE": "local"})
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         while ept._LOCKS:                      # the tool holds its lock until it exits; a test does not
@@ -235,9 +245,12 @@ class Packages(unittest.TestCase):
 
     def test_every_dep_row_is_well_formed(self):
         for row in ept.DEPS:
-            self.assertEqual(len(row), 6, row)
-            self.assertIn(row[4], ("required", "wanted", "optional", "fallback"))
+            self.assertEqual(len(row), 8, row)            # key, probes, dnf, apt, zypper, pacman, level, what
+            self.assertIn(row[6], ("required", "wanted", "optional", "fallback"))
             self.assertTrue(row[1])
+            self.assertTrue(all(row[2:6]), row)
+        for t in ept.BUILD_TOOLS:
+            self.assertEqual(len(t), 5, t)
         for mod, key in ept.MODULE_DEP.items():
             self.assertIn(key, [r[0] for r in ept.DEPS], mod)
 
@@ -616,10 +629,10 @@ class BuildTransaction(TempRoot):
             "fetch_and_unpack": lambda ctx, state: None,
             "do_configure": lambda ctx, state, a, f: None,
             "do_make": lambda ctx, state: {"missing": [], "failed": [], "removed": [], "disabled": [], "summary": ""},
-            "judge_modules": lambda rep, found, fam, mgr: None,
+            "judge_modules": lambda rep, found, fam, mgr, **k: None,
             "compiler_banner": lambda cc: "cc",
-            "verify_interpreter": lambda p, offline=False: (verify_good, {"good": verify_good, "when": "t",
-                                                                          "version": "3.14.8"}),
+            "verify_interpreter": lambda p, offline=False, **k: (verify_good, {"good": verify_good, "when": "t",
+                                                                               "version": "3.14.8"}),
             "create_venv": lambda py, target: os.path.join(target, "bin", "python"),
             "pip_sync": lambda *a, **k: {},
             "run_check": lambda *a, **k: {"status": smoke or "ok", "results": []},
@@ -750,6 +763,893 @@ class Records(TempRoot):
             self.assertIn("has no finished release for 3.99", str(cm.exception))
         finally:
             ept.http_get, ept.url_exists = saved
+
+
+# ======================================================================== the toolkit
+
+def script(root, rel, body):
+    path = put(root, rel, "#!/bin/sh\n" + body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def fake_gcc(root, rel, banner="gcc (GCC) 16.2.0", version="16.2.0", pinned=""):
+    """Answers --version, -dumpfullversion and -print-prog-name like gcc; pinned = the
+    directory a gcc configured --with-as/--with-ld names for as and ld."""
+    prog = ('  -print-prog-name=*) n="${1#-print-prog-name=}"; echo "%s$n";;\n' % (pinned + "/" if pinned else ""))
+    return script(root, rel, 'case "$1" in\n  --version) echo "%s"; echo "Copyright (C) 2026 Free Software '
+                  'Foundation, Inc.";;\n  -dumpfullversion|-dumpversion) echo %s;;\n%s  *) exit 0;;\nesac\n'
+                  % (banner, version, prog))
+
+
+def fake_binutils(root, rel, version="2.46"):
+    for name in ("as", "ld", "ar", "readelf"):
+        script(root, "%s/bin/%s" % (rel, name), 'echo "GNU %s (GNU Binutils) %s"\n'
+               % ("assembler" if name == "as" else name, version))
+    return os.path.join(root, rel)
+
+
+def fake_python(root, rel, version="3.14.8", runs=True):
+    """bin/python3 of a prefix: answers the version question (and detect's)."""
+    body = ('case "$*" in\n  *platform*) echo "CPython %s %s";;\n  *) echo %s;;\nesac\n'
+            % (version, os.path.join(root, rel), version)) if runs else "exit 1\n"
+    return script(root, rel + "/bin/python3", body)
+
+
+def marker(prefix, **kv):
+    rec = {"tool": "%s %s" % (ept.TOOL, ept.VERSION), "version": "3.14.8", "configure": ["--prefix=" + prefix],
+           "state": "verified", "verify": {"good": True}, "built": "2026-10-09T10:00:00+0000",
+           "compiler": "/usr/bin/gcc (gcc (GCC) 14.2.1)", "for": "general", "optimized": True}
+    rec.update(kv)
+    put(prefix, ept.MARKER, json.dumps(rec))
+    return rec
+
+
+class Captured(TempRoot):
+    """main() as the main file runs it: what reaches the real stdout and stderr."""
+
+    def run_main(self, *argv, **kw):
+        o, e = io.StringIO(), io.StringIO()
+        with mock.patch.object(ept.sys, "stdout", o), mock.patch.object(ept.sys, "stderr", e), \
+                mock.patch.object(ept.os, "geteuid", return_value=kw.get("euid", 1000)):
+            code = ept.main(list(argv))
+        return code, o.getvalue(), e.getvalue()
+
+
+class TheFile(unittest.TestCase):
+    def setUp(self):
+        with open(TOOL_FILE) as f:
+            self.text = f.read()
+
+    def test_pure_ascii_and_python_36(self):
+        bad = [n for n, line in enumerate(self.text.split("\n"), 1) if any(ord(c) > 127 for c in line)]
+        self.assertEqual(bad, [])
+        ast.parse(self.text, feature_version=(3, 6))
+        ast.parse(ept.GENERAL_SMOKE_SCRIPT, feature_version=(3, 6))
+        with open(os.path.abspath(__file__)) as f:
+            self.assertTrue(all(ord(c) < 128 for c in f.read()))
+
+    def test_isolated_platform_python_shebang_and_pypy_reexec(self):
+        self.assertEqual(self.text.split("\n")[0], "#!/usr/bin/python3 -I")
+        self.assertIn('os.execv(PLATFORM_PYTHON, [PLATFORM_PYTHON, "-I"', self.text)
+
+    def test_the_remote_block_is_what_sync_remote_writes(self):
+        lines = self.text.split("\n")
+        begins = [i for i, l in enumerate(lines) if l.startswith("# >>> satellite_remote >>>")]
+        ends = [i for i, l in enumerate(lines) if l == "# <<< satellite_remote <<<"]
+        self.assertEqual((len(begins), len(ends)), (1, 1))
+        sys.path.insert(0, TOOLKIT)
+        try:
+            import sync_remote
+        finally:
+            sys.path.remove(TOOLKIT)
+        if not os.path.exists(sync_remote.SOURCE):
+            self.skipTest("no satellite_remote.py beside sync_remote.py")
+        self.assertEqual(sync_remote.synced(self.text, sync_remote.block()), self.text,
+                         "the block differs from satellite_remote.py: run ./sync_remote.py")
+
+    def test_where_to_run_is_the_first_statement_of_main(self):
+        tree = ast.parse(self.text)
+        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        first = main.body[0]
+        self.assertEqual(first.targets[0].id, "argv")
+        self.assertEqual(first.value.func.id, "where_to_run")
+
+
+class GeneralMode(TempRoot):
+    def args(self, **kw):
+        a = Ns(purpose="general", opt_root=os.path.join(self.root, "opt"), workdir=os.path.join(self.root, "w"),
+               scraper=os.path.join(self.root, "scraper"), version=None, prefix=None, cc="", binutils="", jobs=1,
+               no_optimize=False, link_current=None, constraints="")
+        a.__dict__.update(kw)
+        return a
+
+    def test_prefix_paths_and_record_key_per_mode(self):
+        opt = os.path.join(self.root, "opt")
+        self.assertEqual(ept.default_prefix("3.15.0", "/x/claude_scraper", opt, "general"),
+                         os.path.join(opt, "cpython-3.15.0"))
+        self.assertEqual(ept.default_prefix("3.15.0", "/x/claude_scraper", opt),
+                         os.path.join(opt, "cpython-3.15.0-claude_scraper"))
+        rel = {"version": "3.15.0"}
+        g = ept.Ctx(self.args(), rel)
+        s = ept.Ctx(self.args(purpose="scraper"), rel)
+        self.assertEqual((g.prefix, g.key, os.path.basename(g.build), os.path.basename(g.stage),
+                          os.path.basename(g.check_venv), os.path.basename(g.logs)),
+                         (os.path.join(opt, "cpython-3.15.0"), "3.15.0-general", "build-3.15.0-general",
+                          "stage-3.15.0-general", "check-venv-3.15.0-general", "3.15.0-general"))
+        self.assertEqual((s.key, os.path.basename(s.build), os.path.basename(s.stage), os.path.basename(s.logs)),
+                         ("3.15.0", "build-3.15.0", "stage-3.15.0", "3.15.0"))          # as it always was
+        self.assertEqual(g.src, s.src)                                                  # one source tree
+        self.assertTrue(g.link_current)
+        self.assertFalse(s.link_current)
+        self.assertFalse(ept.Ctx(self.args(link_current=False), rel).link_current)
+        self.assertTrue(ept.Ctx(self.args(purpose="scraper", link_current=True), rel).link_current)
+
+    def test_the_two_modes_keep_separate_records(self):
+        state = ept.State(os.path.join(self.root, "w", "state.json"))
+        rel = {"version": "3.14.8"}
+        for purpose, secs in (("scraper", 500), ("general", 900)):
+            ctx = ept.Ctx(self.args(purpose=purpose), rel)
+            state.set_build(ctx.key, make_done="t", make_seconds=secs)
+        again = ept.State(state.path)
+        self.assertEqual(again.build("3.14.8")["make_seconds"], 500)
+        self.assertEqual(again.build("3.14.8-general")["make_seconds"], 900)
+
+    def test_auto_in_general_mode_is_the_latest(self):
+        rels = [{"version": v, "id": "", "date": ""} for v in ("3.15.0", "3.14.8", "3.14.0")]
+        with mock.patch.object(ept, "get_releases", return_value=(rels, "python.org API")):
+            rel, why, _ = ept.resolve_release(self.args())
+            self.assertEqual(rel["version"], "3.15.0")
+            self.assertIn("auto is latest", why)
+            self.assertEqual(ept.resolve_release(self.args(version="auto"))[0]["version"], "3.15.0")
+            self.assertEqual(ept.resolve_release(self.args(version="3.14"))[0]["version"], "3.14.8")
+            self.assertEqual(ept.resolve_release(self.args(purpose="scraper"))[0]["version"], "3.14.8")
+
+    def toolchain(self):
+        opt = os.path.join(self.root, "opt")
+        bdir = fake_binutils(opt, "binutils-2.46")
+        fake_gcc(opt, "gcc-16.2.0/bin/gcc")
+        fake_gcc(opt, "gcc-16.2.0/bin/g++")
+        os.symlink(bdir, os.path.join(opt, "binutils-current"))
+        os.symlink(os.path.join(opt, "gcc-16.2.0"), os.path.join(opt, "gcc-current"))
+        return opt, bdir
+
+    def test_cc_and_binutils_by_real_path_ar_named_and_first_on_path(self):
+        opt, bdir = self.toolchain()
+        ctx = ept.Ctx(self.args(cc=os.path.join(opt, "gcc-current", "bin", "gcc"),
+                                binutils=os.path.join(opt, "binutils-current")), {"version": "3.15.0"})
+        gcc = os.path.join(opt, "gcc-16.2.0", "bin", "gcc")
+        self.assertEqual((ctx.cc, ctx.cxx, ctx.binutils), (gcc, gcc[:-3] + "g++", bdir))
+        a = ctx.configure(True)
+        self.assertIn("CC=" + gcc, a)
+        self.assertIn("CXX=" + gcc[:-3] + "g++", a)
+        self.assertIn("AR=" + os.path.join(bdir, "bin", "ar"), a)
+        self.assertEqual(ept.ctx_env(ctx)["PATH"].split(":")[:2], [os.path.join(bdir, "bin"), "/usr/bin"])
+        # what this gcc will really run: bare names, found on the build's PATH -- the binutils first
+        self.assertEqual(ept.prog_paths(ctx.cc, ctx.path_extra),
+                         {"as": os.path.join(bdir, "bin", "as"), "ld": os.path.join(bdir, "bin", "ld")})
+        pinned = os.path.join(self.root, "elsewhere", "bin")
+        fake_gcc(opt, "gcc-17/bin/gcc", pinned=pinned)               # configured --with-as/--with-ld
+        self.assertEqual(ept.prog_paths(os.path.join(opt, "gcc-17", "bin", "gcc"), ctx.path_extra)["ld"],
+                         os.path.join(pinned, "ld"))
+        self.assertEqual(ept.Ctx(self.args(binutils=os.path.join(bdir, "bin")), {"version": "3.15.0"}).binutils, bdir)
+        self.assertEqual(ept.Ctx(self.args(), {"version": "3.15.0"}).configure(True)[-1][:3], "CXX")  # no AR
+
+    def test_a_binutils_without_as_and_ld_or_a_missing_cc_is_refused(self):
+        os.makedirs(os.path.join(self.root, "empty", "bin"))
+        with self.assertRaises(ept.ToolError) as cm:
+            ept.binutils_dir(os.path.join(self.root, "empty"))
+        self.assertIn("no as", str(cm.exception))
+        with self.assertRaises(ept.ToolError):
+            ept.pick_cc(os.path.join(self.root, "nope", "gcc"))
+        self.assertEqual(ept.real_tool_path("/usr/bin/gcc"), "/usr/bin/gcc")      # the name stays
+
+    def test_the_cxx_partner_by_name_beside_the_c_compiler(self):
+        self.assertEqual(ept.cxx_name("/o/bin/gcc"), ("g++", "g++"))
+        self.assertEqual(ept.cxx_name("/usr/bin/gcc-14"), ("g++-14", "g++"))
+        self.assertEqual(ept.cxx_name("/usr/bin/x86_64-linux-gnu-gcc-13"), ("x86_64-linux-gnu-g++-13", "g++"))
+        self.assertEqual(ept.cxx_name("/usr/bin/clang-18"), ("clang++-18", "clang++"))
+        self.assertEqual(ept.cxx_name("/usr/bin/cc"), ("c++", "c++"))
+        self.assertEqual(ept.cxx_name("/usr/bin/tcc"), ("", ""))
+        opt, _ = self.toolchain()
+        gcc = os.path.join(opt, "gcc-16.2.0", "bin", "gcc")
+        self.assertEqual(ept.cxx_partner(gcc), gcc[:-3] + "g++")
+        fake_gcc(opt, "gcc-onlyc/bin/gcc")
+        self.assertEqual(ept.cxx_partner(os.path.join(opt, "gcc-onlyc", "bin", "gcc")), "")
+
+    def test_a_cc_without_a_cxx_beside_it_is_never_paired_quietly_with_the_systems(self):
+        opt, _ = self.toolchain()
+        onlyc = fake_gcc(opt, "gcc-onlyc/bin/gcc")
+        sys_gxx = os.path.join(self.root, "sys", "g++")
+        script(self.root, "sys/g++", "exit 0\n")
+        with mock.patch.object(ept, "which", lambda name, path=None: sys_gxx if name == "g++" else ""):
+            g = ept.Ctx(self.args(cc=onlyc), {"version": "3.15.0"})
+            self.assertIn("no C++ compiler beside --cc " + onlyc, g.cxx_problem)
+            self.assertIn("--cxx PATH", g.cxx_problem)
+            self.assertIn("the system's is " + sys_gxx, g.cxx_problem)
+            # scraper mode: said, and the system's taken as before
+            s = ept.Ctx(self.args(purpose="scraper", cc=onlyc), {"version": "3.15.0"})
+            self.assertEqual(s.cxx, sys_gxx)
+            self.assertIn("CXX is " + sys_gxx, s.cxx_problem)
+            # --cxx names it knowingly: no problem, CXX= is that one
+            k = ept.Ctx(self.args(cc=onlyc, cxx=sys_gxx), {"version": "3.15.0"})
+            self.assertEqual((k.cxx, k.cxx_problem), (sys_gxx, ""))
+            self.assertIn("CXX=" + sys_gxx, k.configure(True))
+        # the default compiler (no --cc) keeps the system's pair, no problem
+        d = ept.Ctx(self.args(), {"version": "3.15.0"})
+        self.assertEqual(d.cxx_problem, "")
+        # --cxx by its real directory, like --cc
+        c = ept.Ctx(self.args(cc=os.path.join(opt, "gcc-current", "bin", "gcc"),
+                              cxx=os.path.join(opt, "gcc-current", "bin", "g++")), {"version": "3.15.0"})
+        self.assertEqual(c.cxx, os.path.join(opt, "gcc-16.2.0", "bin", "g++"))
+        with self.assertRaises(ept.ToolError) as cm:
+            ept.Ctx(self.args(cxx=os.path.join(self.root, "nope", "g++")), {"version": "3.15.0"})
+        self.assertIn("--cxx", str(cm.exception))
+
+    def test_general_mode_doctor_reports_the_missing_cxx_as_required(self):
+        ctx = Ns(cc="/o/gcc-onlyc/bin/gcc", general=True, cxx_problem="no C++ compiler beside --cc /o/gcc-onlyc/bin/gcc")
+        r = ept.doctor_report(ctx, dict((row[0], True) for row in ept.DEPS), True, euid=1000, osr=ALMA,
+                              pm=("dnf", "dnf"), have=lambda name: "/usr/bin/" + name)
+        self.assertFalse(r["ok"])
+        self.assertIn({"what": ctx.cxx_problem, "package": "", "level": "required"}, r["missing"])
+        ctx.general = False                                        # scraper mode: a warning in preflight only
+        r = ept.doctor_report(ctx, dict((row[0], True) for row in ept.DEPS), True, euid=1000, osr=ALMA,
+                              pm=("dnf", "dnf"), have=lambda name: "/usr/bin/" + name)
+        self.assertTrue(r["ok"])
+
+    def test_the_comment_a_compiler_leaves(self):
+        self.assertEqual(ept.expected_comment("gcc (GCC) 16.2.0"), "GCC: (GNU) 16.2.0")
+        self.assertEqual(ept.expected_comment("gcc (GCC) 14.2.1 20250110 (Red Hat 14.2.1-7)"),
+                         "GCC: (GNU) 14.2.1 20250110 (Red Hat 14.2.1-7)")
+        self.assertEqual(ept.expected_comment("gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"),
+                         "GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0")
+        self.assertEqual(ept.expected_comment("x86_64-linux-gnu-gcc-13 (Ubuntu 13.3.0) 13.3.0"),
+                         "GCC: (Ubuntu 13.3.0) 13.3.0")
+        self.assertEqual(ept.expected_comment("Ubuntu clang version 18.1.3 (1ubuntu1)"),
+                         "Ubuntu clang version 18.1.3 (1ubuntu1)")
+        self.assertEqual(ept.expected_comment("tcc version 0.9.27"), "")
+
+    def test_the_python3_link_inside_the_prefix(self):
+        prefix = os.path.join(self.root, "p")
+        script(prefix, "bin/python3.13", "exit 0\n")
+        script(prefix, "bin/python3.13-config", "exit 0\n")
+        self.assertTrue(ept.ensure_python3_link(prefix))
+        self.assertEqual(os.readlink(os.path.join(prefix, "bin", "python3")), "python3.13")
+        self.assertFalse(ept.ensure_python3_link(prefix))                # make install made it: left alone
+
+    def test_a_new_tarball_forgets_both_modes_builds(self):
+        w = os.path.join(self.root, "w")
+        state = ept.State(os.path.join(w, "state.json"))
+        for key in ("3.14.8", "3.14.8-general"):
+            state.set_build(key, make_done="t")
+            put(w, "build-%s/Makefile" % key, "")
+        src = os.path.join(self.root, "t", "Python-3.14.8")
+        put(src, "configure", "x")
+        tb = os.path.join(self.root, "Python-3.14.8.tar.xz")
+        subprocess.check_call(["tar", "-cJf", tb, "-C", os.path.dirname(src), "Python-3.14.8"])
+        ctx = ept.Ctx(self.args(workdir=w), {"version": "3.14.8"})
+        ctx.tar = {"url": "file://" + tb, "sha256": "", "size": 0}
+        ept.fetch_and_unpack(ctx, state)
+        self.assertFalse(os.path.exists(os.path.join(w, "build-3.14.8")))
+        self.assertFalse(os.path.exists(os.path.join(w, "build-3.14.8-general")))
+        self.assertNotIn("make_done", state.build("3.14.8"))
+        self.assertNotIn("make_done", state.build("3.14.8-general"))
+
+
+class CurrentLink(TempRoot):
+    def test_atomic_link_relink_and_a_real_directory_is_left_alone(self):
+        opt = os.path.join(self.root, "opt")
+        a, b = os.path.join(opt, "cpython-3.14.8"), os.path.join(opt, "cpython-3.15.0")
+        os.makedirs(a)
+        os.makedirs(b)
+        self.assertTrue(ept.link_current(opt, a))
+        self.assertEqual(os.readlink(os.path.join(opt, ept.CURRENT)), a)
+        self.assertTrue(ept.link_current(opt, b))
+        self.assertEqual(os.readlink(os.path.join(opt, ept.CURRENT)), b)
+        self.assertFalse(os.path.lexists(os.path.join(opt, ept.CURRENT + ".new")))
+        os.unlink(os.path.join(opt, ept.CURRENT))
+        put(opt, ept.CURRENT + "/mine", "x")
+        self.assertFalse(ept.link_current(opt, a))
+        self.assertTrue(os.path.isfile(os.path.join(opt, ept.CURRENT, "mine")))
+
+
+class GeneralBuild(TempRoot):
+    """cmd_build in general mode with every slow step stubbed: install, verify (with the
+    compiler proof asked for), the general smoke test, then cpython-current."""
+
+    def run_build(self, verify_good=True, smoke_good=True, link=None, current_dir=False, no_check=False,
+                  banner="gcc (GCC) 16.2.0"):
+        opt = os.path.join(self.root, "opt")
+        self.prefix = os.path.join(opt, "cpython-3.14.8")
+        if current_dir:
+            put(opt, ept.CURRENT + "/mine", "x")
+        self.calls = {}
+
+        def verify(p, offline=False, quiet=False, expect_compiler=""):
+            self.calls["expect"] = expect_compiler
+            return verify_good, {"good": verify_good, "when": "t", "version": "3.14.8"}
+
+        def smoke(python, target, keep=False):
+            self.calls["smoke"] = (python, target)
+            return smoke_good, "" if smoke_good else "the venv's pip does not run"
+
+        def fake_install(ctx, state, rebuild, args_list, old=""):
+            put(ctx.prefix, "bin/python3", "")
+            put(ctx.prefix, ept.MARKER, json.dumps({"tool": ept.TOOL, "state": "unverified",
+                                                    "configure": args_list}))
+            return ""
+        stubs = {
+            "resolve_release": lambda args: ({"version": "3.14.8", "id": "", "date": ""}, "test", "test"),
+            "tarball_info": lambda rel: {"url": "", "sha256": "", "size": 0},
+            "preflight": lambda ctx, install_deps=False: {},
+            "show_plan": lambda ctx, m: None,
+            "fetch_and_unpack": lambda ctx, state: None,
+            "do_configure": lambda ctx, state, a, f: None,
+            "do_make": lambda ctx, state: {"missing": [], "failed": [], "removed": [], "disabled": [], "summary": ""},
+            "judge_modules": lambda rep, found, fam, mgr, **k: None,
+            "compiler_banner": lambda cc: banner,
+            "prog_paths": lambda cc, extra=None: {"as": "/b/bin/as", "ld": "/b/bin/ld"},
+            "verify_interpreter": verify, "general_smoke": smoke, "do_install": fake_install,
+        }
+        args = Ns(purpose="general", version=None, prefix=None, workdir=os.path.join(self.root, "w"), opt_root=opt,
+                  scraper=os.path.join(self.root, "scraper"), cc="", binutils="", jobs=1, no_optimize=False,
+                  install_deps=False, offline=True, constraints="", verbose=False, rebuild=False, no_check=no_check,
+                  keep=False, link_current=link)
+        with mock.patch.multiple(ept, **stubs):
+            try:
+                return ept.cmd_build(args), None
+            except ept.ToolError as e:
+                return None, e
+
+    def record(self):
+        return ept.State(os.path.join(self.root, "w", "state.json")).build("3.14.8-general")
+
+    def test_a_good_build_is_verified_with_its_compiler_smoke_tested_and_linked(self):
+        rc, err = self.run_build()
+        self.assertEqual((rc, err), (0, None))
+        current = os.path.join(self.root, "opt", ept.CURRENT)
+        self.assertEqual(os.readlink(current), self.prefix)
+        self.assertEqual(self.calls["expect"], "gcc (GCC) 16.2.0")                 # the .comment proof asked
+        self.assertEqual(self.calls["smoke"][0], os.path.join(self.prefix, "bin", "python3"))
+        rec = ept.prefix_record(self.prefix)
+        self.assertEqual((rec["for"], rec["as"], rec["state"]), ("general", "/b/bin/as", "verified"))
+        self.assertIn("for general use", ept.read_text(os.path.join(self.prefix, "BUILD-INFO.txt")))
+        self.assertEqual((self.record()["status"], self.record()["stage"], self.record()["for"]),
+                         ("done", "link", "general"))
+        self.assertIn("export PATH=\"%s/bin:$PATH\"" % current, "\n".join(self.printed))
+
+    def test_a_failed_smoke_test_rolls_back_and_links_nothing(self):
+        rc, err = self.run_build(smoke_good=False)
+        self.assertIn("general smoke test failed", str(err))
+        self.assertFalse(os.path.lexists(self.prefix))
+        self.assertTrue(any(n.startswith("cpython-3.14.8.failed-") for n in os.listdir(os.path.dirname(self.prefix))))
+        self.assertFalse(os.path.lexists(os.path.join(self.root, "opt", ept.CURRENT)))
+        self.assertEqual((self.record()["status"], self.record()["stage"]), ("failed", "smoke"))
+        self.assertIn("smoke test failed", self.record()["error"])
+
+    def test_a_build_that_does_not_verify_links_nothing(self):
+        rc, err = self.run_build(verify_good=False)
+        self.assertIn("does not verify", str(err))
+        self.assertNotIn("smoke", self.calls)
+        self.assertFalse(os.path.lexists(os.path.join(self.root, "opt", ept.CURRENT)))
+        self.assertEqual(self.record()["stage"], "verify")
+
+    def test_no_link_current_and_a_real_directory_named_cpython_current(self):
+        rc, _ = self.run_build(link=False)
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.lexists(os.path.join(self.root, "opt", ept.CURRENT)))
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        self.printed = []
+        rc, _ = self.run_build(current_dir=True)
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "opt", ept.CURRENT, "mine")))
+        self.assertIn("real directory", "\n".join(self.printed))
+
+    def test_no_check_skips_the_smoke_test(self):
+        rc, _ = self.run_build(no_check=True)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("smoke", self.calls)
+
+    def test_a_reused_prefix_is_proved_against_the_compiler_its_record_names(self):
+        rc, err = self.run_build()
+        self.assertEqual((rc, err), (0, None))
+        while ept._LOCKS:
+            ept._LOCKS.pop().close()
+        # The same compiler path, a distro update later: it answers another version now.
+        # `build` again only re-verifies, against what BUILT it (as `verify` does).
+        rc, err = self.run_build(banner="gcc (GCC) 16.2.1")
+        self.assertEqual((rc, err), (0, None))
+        self.assertEqual(self.calls["expect"], "gcc (GCC) 16.2.0")
+        self.assertIn("this build was made when it answered", "\n".join(self.printed))
+        rec = ept.prefix_record(self.prefix)
+        self.assertEqual((rec["compiler_banner"], rec["verify"]["good"]), ("gcc (GCC) 16.2.0", True))
+
+    def setUp(self):
+        TempRoot.setUp(self)
+        self.printed = []
+        p = mock.patch.object(ept, "out", lambda text="": self.printed.append(text))
+        p.start()
+        self.addCleanup(p.stop)
+
+
+class GeneralSmoke(TempRoot):
+    def test_a_real_venv_from_this_python(self):
+        target = os.path.join(self.root, "check-venv-x-general")
+        saved = ept.out
+        ept.out = lambda text="": None
+        try:
+            good, why = ept.general_smoke(sys.executable, target)
+        except ept.ToolError as e:
+            self.skipTest("this python cannot make a venv with pip here: %s" % str(e).splitlines()[0])
+        finally:
+            ept.out = saved
+        self.assertTrue(good, why)
+        self.assertFalse(os.path.exists(target))                     # removed once it passed
+
+    def test_a_pip_that_is_not_the_venvs_own_fails(self):
+        target = os.path.join(self.root, "v")
+
+        def fake_venv(python, t):
+            return script(t, "bin/python", 'echo "pip 25.2 from /usr/lib/python3/dist-packages/pip (python 3.14)"\n')
+        with mock.patch.object(ept, "create_venv", fake_venv), mock.patch.object(ept, "out", lambda text="": None):
+            good, why = ept.general_smoke("/x/python3", target)
+        self.assertFalse(good)
+        self.assertIn("not its own", why)
+        self.assertTrue(os.path.isdir(target))                       # kept for a look
+
+
+class VerifyGeneral(TempRoot):
+    def prefix(self):
+        p = os.path.join(self.root, "prefix")
+        os.makedirs(os.path.join(p, "bin"))
+        os.symlink(sys.executable, os.path.join(p, "bin", "python3"))
+        return p
+
+    def facts(self, comments):
+        return mock.patch.object(ept, "elf_facts", lambda path: {"runpath": [], "needed": [], "comment": comments})
+
+    def test_the_sh_core_and_nice_lists_are_checked(self):
+        good, summary = ept.verify_interpreter(self.prefix(), offline=True, quiet=True)
+        self.assertIn("sh_core", summary["missing"])
+        self.assertIn("sh_nice", summary["missing"])
+        self.assertEqual(summary["missing"]["sh_core"], [])
+
+    def test_the_binary_must_name_the_compiler_asked_for(self):
+        p = self.prefix()
+        with self.facts(["GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"]):
+            good, summary = ept.verify_interpreter(p, offline=True, quiet=True, expect_compiler="gcc (GCC) 16.2.0")
+        self.assertFalse(good)
+        self.assertTrue(any("not in the binary's .comment" in f for f in summary["failures"]))
+        with self.facts(["GCC: (Ubuntu 13.3.0) 13.3.0", "GCC: (GNU) 16.2.0"]):    # crt files keep the system's
+            good, summary = ept.verify_interpreter(p, offline=True, quiet=True, expect_compiler="gcc (GCC) 16.2.0")
+        self.assertEqual(summary["compiler_proof"], "GCC: (GNU) 16.2.0")
+        self.assertNotIn("failures", summary)
+
+
+DOCTOR_KEYS = ["enable_repos", "install_command", "missing", "ok", "package_manager", "tool"]
+ALMA = {"ID": "almalinux", "ID_LIKE": "rhel centos fedora", "VERSION_ID": "10.2"}
+
+
+class Doctor(TempRoot):
+    def report(self, found_missing=(), osr=ALMA, pm=("dnf", "dnf"), general=True, cc="/usr/bin/gcc", cc_ok=True,
+               euid=1000, missing_tools=()):
+        ctx = Ns(cc=cc, general=general)
+        found = dict((row[0], row[0] not in found_missing) for row in ept.DEPS)
+        return ept.doctor_report(ctx, found, cc_ok, euid=euid, osr=osr, pm=pm,
+                                 have=lambda name: name not in missing_tools)
+
+    def test_the_contract_shape_and_crb_on_enterprise_linux(self):
+        r = self.report(found_missing=("mpdecimal", "tk", "libxml2"), missing_tools=("pkg-config",))
+        self.assertEqual(sorted(r), DOCTOR_KEYS)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["package_manager"], "dnf")
+        self.assertEqual(r["enable_repos"], ["crb"])
+        self.assertEqual(r["install_command"], "sudo dnf install -y pkgconfig mpdecimal-devel")
+        levels = dict((m["package"], m["level"]) for m in r["missing"])
+        self.assertEqual(levels, {"pkgconfig": "wanted", "mpdecimal-devel": "wanted", "tk-devel": "optional"})
+        for m in r["missing"]:
+            self.assertEqual(sorted(m), ["level", "package", "what"])
+        scraper = self.report(found_missing=("libxml2",), general=False)
+        self.assertEqual([(m["package"], m["level"]) for m in scraper["missing"]], [("libxml2-devel", "optional")])
+        self.assertEqual(self.report(found_missing=("mpdecimal",), osr={"ID": "rocky", "VERSION_ID": "8.10"})
+                         ["enable_repos"], ["powertools"])
+        self.assertIn("codeready-builder-for-rhel-10-",
+                      self.report(found_missing=("mpdecimal",), osr={"ID": "rhel", "VERSION_ID": "10.1"})
+                      ["enable_repos"][0])
+        self.assertEqual(self.report(found_missing=("mpdecimal",), osr={"ID": "fedora", "VERSION_ID": "43"})
+                         ["enable_repos"], [])
+
+    def test_packages_per_distribution(self):
+        cases = ((("apt-get", "apt"), "apt-get", "sudo apt-get install -y libssl-dev libmpdec-dev"),
+                 (("zypper", "zypper"), "zypper", "sudo zypper install -y libopenssl-devel mpdecimal-devel"),
+                 (("pacman", "pacman"), "pacman", "sudo pacman -S --needed --noconfirm openssl mpdecimal"),
+                 (("yum", "dnf"), "dnf", "sudo yum install -y openssl-devel mpdecimal-devel"))
+        for pm, contract, cmd in cases:
+            r = self.report(found_missing=("openssl", "mpdecimal"), pm=pm, osr={"ID": "x"})
+            self.assertEqual((r["package_manager"], r["install_command"], r["ok"]), (contract, cmd, False), pm)
+        r = self.report(found_missing=("openssl",), pm=("", ""), osr={"ID": "x"})
+        self.assertEqual((r["package_manager"], r["install_command"]), (None, ""))
+
+    def test_root_no_compiler_and_a_broken_one(self):
+        self.assertFalse(self.report(euid=0)["ok"])
+        r = self.report(cc="", pm=("apt-get", "apt"), osr={"ID": "ubuntu"})
+        self.assertEqual(r["missing"][0]["package"], "build-essential")
+        self.assertEqual(len(r["missing"]), 1)                       # headers cannot be asked without one
+        r = self.report(cc_ok="t.c: cannot execute 'cc1'")
+        self.assertFalse(r["ok"])
+        self.assertIn("cc1", r["missing"][0]["what"])
+
+    def test_which_package_manager_fits_the_distribution(self):
+        every = lambda name: name in ("dnf", "apt-get", "zypper", "pacman", "yum")
+        self.assertEqual(ept.pkg_manager({"ID": "ubuntu", "ID_LIKE": "debian"}, every), ("apt-get", "apt"))
+        self.assertEqual(ept.pkg_manager(ALMA, every), ("dnf", "dnf"))
+        self.assertEqual(ept.pkg_manager({"ID": "opensuse-tumbleweed", "ID_LIKE": "opensuse suse"}, every),
+                         ("zypper", "zypper"))
+        self.assertEqual(ept.pkg_manager({"ID": "arch"}, every), ("pacman", "pacman"))
+        self.assertEqual(ept.pkg_manager({"ID": "centos", "VERSION_ID": "7"}, lambda n: n == "yum"), ("yum", "dnf"))
+        self.assertEqual(ept.pkg_manager({}, lambda n: False), ("", ""))
+
+
+class DoctorJson(Captured):
+    def test_doctor_json_through_main_is_pure_json_and_creates_nothing(self):
+        work = os.path.join(self.root, "w")
+        found = dict((row[0], row[0] != "zstd") for row in ept.DEPS)
+        with mock.patch.object(ept, "compiler_works", return_value=(True, "ok")), \
+                mock.patch.object(ept, "check_deps", return_value=found), \
+                mock.patch.object(ept, "pkg_manager", return_value=("apt-get", "apt")):
+            code, stdout, stderr = self.run_main("doctor", "--json", "--for", "general", "--opt-root",
+                                                 os.path.join(self.root, "opt"), "--workdir", work, "--yes")
+        self.assertEqual(code, 0, stderr)
+        r = json.loads(stdout)
+        self.assertEqual(sorted(r), DOCTOR_KEYS)
+        self.assertEqual(r["install_command"], "sudo apt-get install -y libzstd-dev")
+        self.assertFalse(os.path.exists(work))
+        self.assertIsNone(ept.UI.stream)                         # main() leaves the process as it found it
+
+    def test_as_root_doctor_json_answers_and_says_so(self):
+        with mock.patch.object(ept, "compiler_works", return_value=(True, "ok")), \
+                mock.patch.object(ept, "check_deps", return_value={}):
+            code, stdout, stderr = self.run_main("doctor", "--json", "--opt-root", self.root, "--workdir",
+                                                 os.path.join(self.root, "w"), euid=0)
+        self.assertEqual(code, 1)
+        self.assertIn("not root", json.loads(stdout)["missing"][0]["what"])
+
+    def test_an_opt_root_that_cannot_be_made_is_required(self):
+        put(self.root, "afile", "x")
+        with mock.patch.object(ept, "compiler_works", return_value=(True, "ok")), \
+                mock.patch.object(ept, "check_deps", return_value={}):
+            code, stdout, stderr = self.run_main("doctor", "--json", "--opt-root", os.path.join(self.root, "afile", "opt"),
+                                                 "--workdir", os.path.join(self.root, "w"))
+        r = json.loads(stdout)
+        self.assertEqual(code, 1)
+        self.assertIn("--opt-root", r["missing"][-1]["what"])
+        self.assertEqual(r["missing"][-1]["level"], "required")
+
+    def test_a_cc_that_is_not_there_is_reported_not_raised(self):
+        with mock.patch.object(ept, "compiler_works", return_value=(True, "ok")), \
+                mock.patch.object(ept, "check_deps", return_value={}):
+            code, stdout, stderr = self.run_main("doctor", "--json", "--cc", os.path.join(self.root, "gcc-current",
+                                                 "bin", "gcc"), "--opt-root", self.root)
+        self.assertEqual(code, 1)
+        r = json.loads(stdout)
+        self.assertIn("--cc", r["missing"][0]["what"])
+
+    def test_with_json_an_error_goes_to_stderr_and_stdout_stays_empty(self):
+        for argv, want in ((("status", "--json", "--profile", "nosuch"), 1),
+                           (("doctor", "--json", "--profile", "nosuch"), 1),
+                           (("detect", "--json", "--profile", "nosuch"), 1)):
+            code, stdout, stderr = self.run_main(*(argv + ("--opt-root", self.root)))
+            self.assertEqual(code, want, argv)
+            self.assertEqual(stdout, "", argv)
+            self.assertIn("ERROR:", stderr, argv)
+            self.assertIn("nosuch", stderr, argv)
+        code, stdout, stderr = self.run_main("status", "--profile", "nosuch", "--opt-root", self.root)
+        self.assertIn("ERROR:", stdout)                          # without --json, as always: stdout
+        self.assertEqual(stderr, "")
+
+
+STATUS_KEYS = ["builds", "current", "installed", "opt_root", "tool"]
+INSTALLED_KEYS = ["built_by_tool", "compiler", "for", "name", "prefix", "runs", "version"]
+BUILD_KEYS = ["error", "id", "stage", "status"]
+
+
+class Status(Captured):
+    def fake_opt(self):
+        opt = os.path.join(self.root, "opt")
+        ours = os.path.join(opt, "cpython-3.14.8")
+        fake_python(opt, "cpython-3.14.8")
+        marker(ours, compiler="/o/gcc-16.2.0/bin/gcc (gcc (GCC) 16.2.0)", binutils="/o/binutils-2.46")
+        scr = os.path.join(opt, "cpython-3.14.8-claude_scraper")
+        fake_python(opt, "cpython-3.14.8-claude_scraper")
+        marker(scr, **{"for": "/run/media/x/claude_scraper"})
+        fake_python(opt, "cpython-3.13.1", "3.13.1")                       # hand-built: not ours
+        fake_python(opt, "cpython-3.12.0", "3.12.0", runs=False)           # there, but it does not run
+        put(opt, "cpython-3.14.8.old-20261009-1000/bin/python3", "")
+        put(opt, "cpython-3.15.0/README", "")                               # no bin/python3
+        os.symlink(ours, os.path.join(opt, ept.CURRENT))
+        w = os.path.join(self.root, "w")
+        put(w, "state.json", json.dumps({"tool": ept.TOOL, "checks": [{"status": "ok"}], "builds": {
+            "3.14.8-general": {"status": "done", "stage": "link"},
+            "3.15.0-general": {"status": "running", "stage": "make", "pid": 2 ** 22 + 7},
+            "3.13.9-general": {"status": "failed", "stage": "configure", "error": "configure failed (exit 1)"},
+            "3.14.8": {"make_done": "t", "verified": "t"}}}))
+        return opt, w, ours
+
+    def test_status_is_the_toolkit_contract(self):
+        opt, w, ours = self.fake_opt()
+        d = ept.status_data(opt, w)
+        self.assertTrue(set(STATUS_KEYS) <= set(d))
+        self.assertEqual((d["tool"], d["opt_root"]), (ept.TOOL, opt))
+        self.assertEqual(d["current"], {"cpython-current": ours})
+        for e in d["installed"]:
+            self.assertTrue(set(INSTALLED_KEYS) <= set(e), e)
+        by = dict((os.path.basename(e["prefix"]), e) for e in d["installed"])
+        self.assertEqual(sorted(by), ["cpython-3.12.0", "cpython-3.13.1", "cpython-3.14.8",
+                                      "cpython-3.14.8-claude_scraper"])
+        self.assertEqual(dict((k, by["cpython-3.14.8"][k]) for k in INSTALLED_KEYS),
+                         {"name": "cpython", "version": "3.14.8", "prefix": ours, "runs": True, "built_by_tool": True,
+                          "compiler": "/o/gcc-16.2.0/bin/gcc (gcc (GCC) 16.2.0)", "for": "general"})
+        self.assertTrue(by["cpython-3.14.8"]["current"])
+        self.assertEqual(by["cpython-3.14.8-claude_scraper"]["for"], "/run/media/x/claude_scraper")
+        self.assertEqual((by["cpython-3.13.1"]["runs"], by["cpython-3.13.1"]["built_by_tool"],
+                          by["cpython-3.13.1"]["compiler"], by["cpython-3.13.1"]["for"], by["cpython-3.13.1"]["version"]),
+                         (True, False, None, None, "3.13.1"))                # the menu's third state
+        self.assertEqual((by["cpython-3.12.0"]["runs"], by["cpython-3.12.0"]["version"]), (False, None))
+        self.assertEqual(sorted(os.path.basename(p["path"]) for p in d["leftovers"]),
+                         ["cpython-3.14.8.old-20261009-1000", "cpython-3.15.0"])
+        builds = dict((b["id"], dict((k, b[k]) for k in BUILD_KEYS)) for b in d["builds"])
+        self.assertEqual(builds["3.14.8-general"], {"id": "3.14.8-general", "status": "done", "stage": "link",
+                                                    "error": None})
+        self.assertEqual(builds["3.15.0-general"]["status"], "killed")       # recorded running, nobody holds the lock
+        self.assertEqual(builds["3.13.9-general"], {"id": "3.13.9-general", "status": "failed", "stage": "configure",
+                                                    "error": "configure failed (exit 1)"})
+        self.assertEqual(builds["3.14.8"]["status"], "done")                   # a record from before the status
+        self.assertEqual(d["link"]["version"], "3.14.8")
+
+    def test_nothing_there_is_null_and_empty(self):
+        d = ept.status_data(os.path.join(self.root, "opt"), os.path.join(self.root, "w"))
+        self.assertEqual((d["current"], d["installed"], d["builds"]), ({"cpython-current": None}, [], []))
+
+    def test_status_json_through_main_is_pure_json_and_the_text_says_it_too(self):
+        opt, w, ours = self.fake_opt()
+        code, stdout, stderr = self.run_main("status", "--json", "--opt-root", opt, "--workdir", w, euid=0)
+        self.assertEqual(code, 0)
+        d = json.loads(stdout)
+        self.assertTrue(set(STATUS_KEYS) <= set(d))
+        self.assertEqual(d["mode"], "scraper")
+        code, stdout, stderr = self.run_main("status", "--for", "general", "--opt-root", opt, "--workdir", w)
+        self.assertEqual(code, 0)
+        self.assertIn("<- current", stdout)
+        self.assertIn("DOES NOT RUN", stdout)
+        self.assertIn("KILLED at make", stdout)
+        self.assertIn("not this tool's", stdout)
+
+
+class Profiles(TempRoot):
+    def test_round_trip_and_what_is_never_stored(self):
+        a = Ns(purpose="general", version=None, scraper=ept.DEFAULT_SCRAPER, workdir="~/w", opt_root="~/o",
+               prefix=None, cc="/x/gcc-16.2.0/bin/gcc", binutils="/x/binutils-2.46", jobs=6, constraints="",
+               no_optimize=True, link_current=False, rebuild=True, yes=True, install_deps=True)
+        path = ept.save_profile("mine", a)
+        text = ept.read_text(path)
+        self.assertTrue(text.startswith(ept.PROFILE_HEADER))
+        for line in ("for = general", "optimize = no", "link_current = no", "jobs = 6"):
+            self.assertIn("\n" + line + "\n", text)
+        for never in ("rebuild", "yes", "install_deps", "offline"):
+            self.assertNotIn("\n%s =" % never, text)
+        v = ept.load_profile("mine")
+        self.assertEqual((v["purpose"], v["version"], v["cc"], v["binutils"], v["jobs"], v["no_optimize"],
+                          v["link_current"], v["opt_root"]),
+                         ("general", None, "/x/gcc-16.2.0/bin/gcc", "/x/binutils-2.46", 6, True, False,
+                          os.path.expanduser("~/o")))
+        self.assertEqual([p["name"] for p in ept.list_profiles()], ["mine"])
+        put(ept.profiles_dir(), "stray.ini", "[build]\nfor = general\n")       # no header: not one of ours
+        self.assertEqual([p["name"] for p in ept.list_profiles()], ["mine"])
+        self.assertIn("general | CPython latest", ept.list_profiles()[0]["summary"])
+
+    def test_defaults_then_profile_then_command_line(self):
+        ept.save_profile("p", Ns(purpose="general", version="3.14", cc="/x/gcc", binutils="", jobs=0,
+                                 no_optimize=False, link_current=None))
+        args = ept.build_parser().parse_args(["build", "--profile", "p", "--version", "3.13"])
+        ept.merge_args(args)
+        self.assertEqual((args.purpose, args.version, args.cc, args.opt_root, args.link_current),
+                         ("general", "3.13", "/x/gcc", os.path.expanduser(ept.DEFAULT_OPT), None))
+        args = ept.build_parser().parse_args(["build", "--profile", "p", "--for", "scraper", "--no-link-current"])
+        ept.merge_args(args)
+        self.assertEqual((args.purpose, args.version, args.link_current), ("scraper", "3.14", False))
+        self.assertEqual(ept.build_parser().parse_args(["build", "--activate"]).link_current, True)
+        self.assertEqual(ept.build_parser().parse_args(["build", "--no-activate"]).link_current, False)
+
+
+class Main(Captured):
+    def test_every_command_takes_opt_root_yes_and_for(self):
+        p = ept.build_parser()
+        for cmd in ept.COMMANDS:
+            a = p.parse_args([cmd, "--opt-root", "/x/opt", "--yes", "--for", "general"])
+            self.assertEqual((a.opt_root, a.yes, a.purpose), ("/x/opt", True, "general"), cmd)
+        self.assertEqual(p.parse_args(["verify", "/some/prefix"]).prefix_arg, "/some/prefix")
+
+    def test_cxx_is_taken_by_build_plan_doctor_wizard_toolchains_and_kept_in_a_profile(self):
+        p = ept.build_parser()
+        for cmd in ("build", "plan", "doctor", "wizard", "toolchains"):
+            self.assertEqual(p.parse_args([cmd, "--cxx", "/x/g++"]).cxx, "/x/g++", cmd)
+        args = ept.merge_args(p.parse_args(["build", "--for", "general", "--cc", "/x/gcc", "--cxx", "/x/g++"]))
+        ept.save_profile("withcxx", args)
+        self.assertEqual(ept.load_profile("withcxx")["cxx"], "/x/g++")
+        self.assertIn("(c++ /x/g++)", ept.list_profiles()[0]["summary"])
+
+    def test_a_cxx_that_is_not_there_is_reported_not_raised(self):
+        with mock.patch.object(ept, "compiler_works", return_value=(True, "ok")), \
+                mock.patch.object(ept, "check_deps", return_value={}):
+            code, stdout, stderr = self.run_main("doctor", "--json", "--cxx", os.path.join(self.root, "no", "g++"),
+                                                 "--opt-root", self.root, "--workdir", os.path.join(self.root, "w"))
+        self.assertEqual(code, 1, stderr)
+        self.assertIn("--cxx", json.loads(stdout)["missing"][0]["what"])
+
+    def test_general_check_finds_a_bare_python_on_path_never_in_the_current_directory(self):
+        opt = os.path.join(self.root, "opt")
+        prefix = os.path.join(opt, "cpython-3.14.8")
+        fake_python(opt, "cpython-3.14.8")
+        os.makedirs(os.path.join(self.root, "path"))
+        os.symlink(os.path.join(prefix, "bin", "python3"), os.path.join(self.root, "path", "python3"))
+        os.symlink(prefix, os.path.join(opt, ept.CURRENT))
+        self.assertEqual(ept.python_prefix(os.path.join(prefix, "bin", "python3")), prefix)
+        cur = os.path.join(opt, ept.CURRENT)
+        self.assertEqual(ept.python_prefix(os.path.join(cur, "bin", "python3")), cur)     # the name kept
+        with mock.patch.dict(os.environ, {"PATH": os.path.join(self.root, "path")}):
+            self.assertEqual(ept.python_prefix("python3"), prefix)                         # by the link's target
+            with self.assertRaises(ept.ToolError) as cm:
+                ept.python_prefix("python3-nosuch")
+            self.assertIn("on your PATH", str(cm.exception))
+        script(self.root, "shims/python3", "exit 0\n")
+        with self.assertRaises(ept.UsageError):
+            ept.python_prefix(os.path.join(self.root, "shims", "python3"))
+        other = script(prefix, "bin/python3.13", "exit 0\n")       # bin/python3 is another interpreter
+        with self.assertRaises(ept.UsageError) as cm:
+            ept.python_prefix(other)
+        self.assertIn("another interpreter", str(cm.exception))
+        # through main, from a directory that has nothing to do with it
+        seen = {}
+
+        def verify(args):
+            seen["prefix"] = args.prefix_arg
+            return 0
+        here = os.getcwd()
+        os.chdir(os.path.join(self.root, "path"))
+        try:
+            with mock.patch.dict(os.environ, {"PATH": os.path.join(self.root, "path")}), \
+                    mock.patch.object(ept, "cmd_verify", verify), \
+                    mock.patch.object(ept, "general_smoke", lambda py, target, keep=False: (True, "")):
+                code, stdout, stderr = self.run_main("check", "--for", "general", "--python", "python3",
+                                                     "--opt-root", opt, "--workdir", os.path.join(self.root, "w"))
+        finally:
+            os.chdir(here)
+        self.assertEqual((code, seen), (0, {"prefix": prefix}), stdout + stderr)
+
+    def test_exit_codes(self):
+        with mock.patch.object(ept.sys.stdin, "isatty", return_value=False):
+            self.assertEqual(self.run_main()[0], 2)                                 # no command: the help
+            self.assertEqual(self.run_main("wizard")[0], 2)                         # nobody to ask
+        self.assertEqual(self.run_main("frobnicate")[0], 2)                         # argparse
+        self.assertEqual(self.run_main("build", "--for", "bogus")[0], 2)
+        code, stdout, _ = self.run_main("venv", "--for", "general", "--opt-root", self.root)
+        self.assertEqual(code, 2)                                                   # general mode has no scraper
+        self.assertIn("no scraper", stdout)
+        for cmd in ("build", "plan", "clean", "wizard"):
+            code, stdout, _ = self.run_main(cmd, "--opt-root", self.root, euid=0)
+            self.assertEqual(code, 1, cmd)
+            self.assertIn("as root", stdout)
+
+        def interrupted(args):
+            raise KeyboardInterrupt()
+        with mock.patch.dict(ept.COMMANDS, {"profiles": interrupted}):
+            self.assertEqual(self.run_main("profiles")[0], 130)
+
+    def test_dry_run_is_the_plan_and_builds_nothing(self):
+        called = []
+        with mock.patch.multiple(ept, resolve_release=lambda args: ({"version": "3.15.0", "id": ""}, "t", "t"),
+                                 tarball_info=lambda rel: {"url": "u", "sha256": "", "size": 0},
+                                 preflight=lambda ctx, install_deps=False: {"mpdecimal": True},
+                                 show_plan=lambda ctx, m: called.append(ctx.prefix),
+                                 fetch_and_unpack=lambda *a: called.append("FETCHED")):
+            code, stdout, stderr = self.run_main("build", "--dry-run", "--for", "general", "--opt-root", self.root,
+                                                 "--workdir", os.path.join(self.root, "w"))
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(called, [os.path.join(self.root, "cpython-3.15.0")])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "w")))
+
+    def test_verify_a_prefix_through_main_with_json(self):
+        prefix = os.path.join(self.root, "opt", "cpython-3.14.8")
+        fake_python(os.path.join(self.root, "opt"), "cpython-3.14.8")
+        marker(prefix, compiler_banner="gcc (GCC) 16.2.0")
+        os.symlink(prefix, os.path.join(self.root, "opt", ept.CURRENT))
+        seen = {}
+
+        def verify(p, offline=False, quiet=False, expect_compiler=""):
+            seen.update(p=p, expect=expect_compiler, quiet=quiet)
+            return True, {"good": True, "when": "now", "compiler_proof": "GCC: (GNU) 16.2.0"}
+        with mock.patch.object(ept, "verify_interpreter", verify):
+            code, stdout, stderr = self.run_main("verify", "--json", "--opt-root", os.path.join(self.root, "opt"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(seen, {"p": prefix, "expect": "gcc (GCC) 16.2.0", "quiet": True})
+        r = json.loads(stdout)
+        self.assertEqual((r["good"], r["for"], r["real"]), (True, "general", prefix))
+        self.assertEqual(ept.prefix_record(prefix)["verify"]["when"], "now")       # recorded
+        code, stdout, stderr = self.run_main("verify", os.path.join(self.root, "nothing"))
+        self.assertEqual(code, 1)
+        self.assertIn("no bin/python3", stdout)
+
+
+class Detection(TempRoot):
+    def test_current_links_come_first_and_are_shown_by_both_paths(self):
+        opt = os.path.join(self.root, "opt")
+        fake_gcc(opt, "gcc-16.2.0/bin/gcc")
+        fake_gcc(opt, "gcc-16.2.0/bin/g++")
+        fake_binutils(opt, "binutils-2.46")
+        os.symlink(os.path.join(opt, "gcc-16.2.0"), os.path.join(opt, "gcc-current"))
+        os.symlink(os.path.join(opt, "binutils-2.46"), os.path.join(opt, "binutils-current"))
+        fake_python(opt, "cpython-3.14.8")
+        marker(os.path.join(opt, "cpython-3.14.8"))
+        dirs = ept.tool_search_dirs(opt, home=self.root, path_env="")
+        self.assertIn(os.path.join(opt, "gcc-current", "bin"), dirs)
+        self.assertNotIn(os.path.join(opt, "gcc-16.2.0", "bin"), dirs)           # the same real directory
+        mine = [d for d in dirs if d.startswith(opt)]
+        [gcc] = ept.find_compilers(mine, opt)
+        self.assertEqual((gcc["kind"], gcc["version"], gcc["path"], gcc["real"], gcc["origin"]),
+                         ("gcc", (16, 2, 0), os.path.join(opt, "gcc-current", "bin", "gcc"),
+                          os.path.join(opt, "gcc-16.2.0", "bin", "gcc"), "toolkit, gcc-current"))
+        self.assertEqual(gcc["cxx"], os.path.join(opt, "gcc-current", "bin", "g++"))
+        [b] = ept.find_binutils(mine, opt)
+        self.assertEqual((b["version"], b["prefix"], b["system"]), ((2, 46), os.path.join(opt, "binutils-2.46"), False))
+        [py] = ept.find_pythons(mine, opt)
+        self.assertEqual((py["impl"], py["version"], py["built_by_tool"], py["for"]), ("CPython", "3.14.8", True,
+                                                                                         "general"))
+        self.assertEqual(ept.toolkit_pair(opt), (os.path.join(opt, "gcc-16.2.0", "bin", "gcc"),
+                                                 os.path.join(opt, "binutils-2.46")))
+
+    def test_the_wizard_offers_the_toolkits_pair_in_general_mode(self):
+        opt = os.path.join(self.root, "opt")
+        fake_gcc(opt, "gcc-16.2.0/bin/gcc")
+        fake_gcc(opt, "gcc-16.2.0/bin/g++")             # its partner beside it: no C++ question
+        fake_binutils(opt, "binutils-2.46")
+        os.symlink(os.path.join(opt, "gcc-16.2.0"), os.path.join(opt, "gcc-current"))
+        os.symlink(os.path.join(opt, "binutils-2.46"), os.path.join(opt, "binutils-current"))
+        dirs = [os.path.join(opt, "gcc-current", "bin"), os.path.join(opt, "binutils-current", "bin")]
+        machine = {"compilers": ept.find_compilers(dirs, opt), "binutils": ept.find_binutils(dirs, opt),
+                   "system_cc": "/usr/bin/gcc"}
+        args = ept.merge_args(ept.build_parser().parse_args(["wizard", "--opt-root", opt]))
+        answers = iter(["general", "", "", "", "", "n", "", "wiz"])
+        printed = []
+        with mock.patch("builtins.input", lambda prompt="": next(answers)), \
+                mock.patch.object(ept, "out", lambda text="": printed.append(text)):
+            ept.wizard(args, detect=lambda o: machine)
+        self.assertEqual((args.purpose, args.version, args.cc, args.binutils, args.no_optimize, args.link_current),
+                         ("general", "latest", os.path.join(opt, "gcc-16.2.0", "bin", "gcc"),
+                          os.path.join(opt, "binutils-2.46"), True, True))
+        self.assertEqual(ept.load_profile("wiz")["binutils"], os.path.join(opt, "binutils-2.46"))
+
+    def test_the_wizard_asks_for_the_cxx_when_none_is_beside_the_compiler(self):
+        opt = os.path.join(self.root, "opt")
+        fake_gcc(opt, "gcc-16.2.0/bin/gcc")                   # no g++ beside it
+        gxx = fake_gcc(self.root, "elsewhere/bin/g++")
+        fake_binutils(opt, "binutils-2.46")
+        os.symlink(os.path.join(opt, "gcc-16.2.0"), os.path.join(opt, "gcc-current"))
+        os.symlink(os.path.join(opt, "binutils-2.46"), os.path.join(opt, "binutils-current"))
+        dirs = [os.path.join(opt, "gcc-current", "bin"), os.path.join(opt, "binutils-current", "bin")]
+        machine = {"compilers": ept.find_compilers(dirs, opt), "binutils": ept.find_binutils(dirs, opt),
+                   "system_cc": "/usr/bin/gcc"}
+        self.assertEqual(machine["compilers"][0]["cxx"], "")     # detect: only what is beside it
+        args = ept.merge_args(ept.build_parser().parse_args(["wizard", "--opt-root", opt]))
+        answers = iter(["general", "", "", "", os.path.join(self.root, "nope"), gxx, "", "n", "", ""])
+        printed = []
+        with mock.patch("builtins.input", lambda prompt="": next(answers)), \
+                mock.patch.object(ept, "out", lambda text="": printed.append(text)):
+            ept.wizard(args, detect=lambda o: machine)
+        self.assertEqual((args.cc, args.cxx), (os.path.join(opt, "gcc-16.2.0", "bin", "gcc"), gxx))
+        text = "\n".join(printed)
+        self.assertIn("NONE there -- general mode refuses that", text)
+        self.assertIn("--cxx %s: not an executable" % os.path.join(self.root, "nope"), text)
 
 
 if __name__ == "__main__":

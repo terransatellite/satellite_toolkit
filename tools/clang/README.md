@@ -5,18 +5,19 @@ stage3, PGO + ThinLTO + BOLT optimised, every project, runtime and target the
 source tree declares. Successor to `build_clang_local.sh` and `build_clang_universal.sh`.
 
 One file. Standard library only. Runs under the Python your package manager
-depends on (`/usr/bin/python3`; syntax held to 3.6 for RHEL 8). Never run it as
+depends on (`/usr/bin/python3`; syntax held to 3.6 for RHEL 8, checked by the
+tests with `ast.parse(..., feature_version=(3, 6))`; pure ASCII). Never run it as
 root: only `--install-deps` calls `sudo`.
 
 ```
-./enterprise_clang_tool.py doctor                 # what is missing, and the command that installs it
+./enterprise_clang_tool.py doctor [--json]        # what is missing, and the command that installs it
 ./enterprise_clang_tool.py plan                   # resolve everything, print it, build nothing
 ./enterprise_clang_tool.py build                  # fetch, bootstrap, build everything, install, verify
 ./enterprise_clang_tool.py build --run 1          # ...or in two runs: the bootstrap compiler
 ./enterprise_clang_tool.py build --run 2          #    then everything, with it
-./enterprise_clang_tool.py status                 # every build, stage by stage
+./enterprise_clang_tool.py status [--json]        # what is installed in <opt-root>, clang-current, every build
 ./enterprise_clang_tool.py verify ~/opt/clang-X   # the post-install checks against any prefix
-./enterprise_clang_tool.py versions | detect | clean
+./enterprise_clang_tool.py versions [--json] | detect [--json] | clean | toolchains | profiles | wizard
 ```
 
 Expect several hours and about 95 GB of disk (75 without BOLT). `build` is **resumable**: a
@@ -24,6 +25,134 @@ failure, a `^C`, a dropped ssh session or a reboot costs the stage that was
 running, not the build. Run it again with the same options -- it shows what it
 finds and asks whether to resume it or delete everything and start over (see
 [Resume, or start over](#resume-or-start-over)).
+
+## In the satellite toolkit: step 2
+
+This tool is step 2 of the satellite toolkit (`PLAN.md` section 1), "build clang++
+with that clang++" -- with the system's clang that step 1 installs:
+
+| step | command the main file runs | done when |
+|---|---|---|
+| 2 `clang` | `enterprise_clang_tool.py --local build --host-cc /usr/bin/clang --host-cxx /usr/bin/clang++ --opt-root <opt> --activate --yes [--workdir W] [--jobs N]` | `<opt>/clang-current/bin/clang` runs, and the prefix it points to holds this tool's `BUILD-INFO.txt` (`status --json`: `runs` and `built_by_tool`) |
+
+`--host-cc /usr/bin/clang` is also what the tool picks by itself: the system's clang
+ranks first (then the system's gcc, a toolset, a distro LLVM package, a private
+build). Named with `--host-cc`, a broken one stops the preflight instead of being
+passed over for gcc. The prefix's `BUILD-INFO.txt` records the stage0 (`host cc`,
+its banner, and `host path`, its real path). The child contract's names (`PLAN.md`
+section 3) are accepted too: `--cc PATH` = `--host-cc`, `--cxx PATH` = `--host-cxx`,
+`--binutils DIR` = `--host-binutils` (a directory holding `as` and `ld`, or a prefix
+whose `bin/` does).
+
+Run again after the build finished -- the main file does that whenever
+`<opt>/clang-current` does not run -- `build --activate --yes` only links: every stage
+is done, so nothing is built, and neither the preflight nor the options the build was
+made with stand in the way (a system clang updated since, 18.1.2 -> 18.1.3, changes
+the stage0 identity in the record; that is said, not refused). Root still refuses.
+
+**`--opt-root DIR`** (default `~/opt`), on every subcommand: the default prefix is
+`<opt-root>/clang-<version>`, the link is `<opt-root>/clang-current`, and
+`<opt-root>/*/bin` is searched for compilers, pythons and binutils (before `~/opt/*/bin`,
+which is still searched). With an explicit `--prefix` and no `--opt-root` the link
+stays where it always was, beside the prefix. `--link-current` / `--no-link-current`
+are the toolkit's names for `--activate` / `--no-activate`.
+
+**Every subcommand** takes `--yes` (`-y`), `--opt-root`, `--workdir` and `--profile`,
+so the main file can pass the same flags to any of them; `doctor`, `status`,
+`detect` and `versions` take `--json`. With `--json`, stdout is the JSON and nothing
+else: every message -- an `ERROR:` included, and what a package manager run by
+`--install-deps` prints -- goes to stderr.
+
+**Local or remote.** Every invocation first goes through `where_to_run()` (satellite_remote,
+embedded between the `# >>> satellite_remote >>>` markers by `sync_remote.py`; never
+edit that block here). `--local` runs the tool here; `--remote[=USER@HOST]` uploads it
+and runs it on another machine inside a session that survives a dropped ssh
+connection (`Ctrl-]` detaches, the build goes on); `--attach[=SESSION]` comes back to
+it and `--sessions` lists them. On a terminal with neither `--local` nor `--remote`
+it asks; `SATELLITE_TOOLKIT_WHERE=local` means `--local`. Only `-h`, `--help` and
+`--tool-version` skip that question (`--version` is LLVM's version here, and asks).
+The session short name is `clang`.
+
+Exit codes: `0` done, `1` failed, `2` usage, `130` interrupted (^C, SIGTERM, SIGHUP).
+A remote run exits with the program's own code once it has ended there; while it
+still runs there: `75` detached (`Ctrl-]`), `255` the connection dropped
+(`--attach` goes back to it).
+
+### Doctor contract
+
+`doctor --json` prints exactly:
+
+    {"tool": "enterprise_clang_tool", "ok": bool, "package_manager": "dnf|apt-get|zypper|pacman"|null,
+     "missing": [{"what": ..., "package": ..., "level": "required|wanted|optional"}],
+     "enable_repos": ["crb" | "powertools" | "codeready-builder-for-rhel-N-ARCH-rpms"] | [],
+     "install_command": "sudo dnf install -y ..." | ""}
+
+and exits 0 when `ok`, 1 otherwise; the preflight's own words go to stderr.
+
+| level | what |
+|---|---|
+| required | the build cannot run: running as root (an entry with an empty package), no C++17 compiler that builds and runs the probe, no CPython >= the tree's minimum, no tar + xz for a release (git for `--ref`), cmake/ninja missing where they cannot be built (no compiler, or no make for cmake) |
+| wanted | it runs, slower or with less: the system's **clang** and **lld** (what `build_clang_universal.sh` installed first: LLVM builds faster and in less memory with clang, and stage1 links with lld), cmake / ninja-build (else built from source), PyYAML for the build's python (else no LLVM libc) |
+| optional | a feature is left out: zlib, zstd, libxml2, libedit, ncurses, lzma, libffi headers, binutils' `plugin-api.h`, swig 4, `Python.h` |
+
+`install_command` holds the **required and wanted** packages -- the same meaning as in
+every other tool of the toolkit (gcc, python, pypy); the main file runs it once for
+every step. `--install-deps` (and the command `doctor` prints) installs the optional ones
+too, since "everything" wants every feature the machine can give it. `package_manager`
+is the family: a machine with only `yum` reports `dnf` (the same package names), and its
+`install_command` says `sudo yum install`. `enable_repos` names the Enterprise Linux
+repository only with dnf, and only when a package that lives there is in
+`install_command` -- ninja-build, swig, a `-devel` package (AlmaLinux / Rocky / CentOS
+9 and 10: `crb`; EL 8: `powertools`; RHEL: `codeready-builder-for-rhel-<major>-<arch>-rpms`;
+nothing on Fedora, with yum, or elsewhere). `--install-deps` enables it first by the
+same rule over what it installs (`dnf config-manager --set-enabled`, on RHEL
+`subscription-manager repos --enable`).
+
+| package | dnf / yum | apt-get | zypper | pacman |
+|---|---|---|---|---|
+| compiler | gcc gcc-c++ | g++ | gcc gcc-c++ | gcc |
+| system clang, lld (wanted) | clang, lld | clang, lld | clang, lld | clang, lld |
+| cmake, ninja | cmake, ninja-build | cmake, ninja-build | cmake, ninja | cmake, ninja |
+| python | python3.12 (yum: python3.11) | python3 | python311 | python |
+| tar + xz | tar xz | tar xz-utils | tar xz | tar xz |
+
+**No network needed.** `doctor` (and `plan`, `toolchains`) make the preflight even when
+GitHub cannot be reached: when neither the API nor `git ls-remote` can say which release
+is the newest, and none is on disk, the minimums are assumed and it says so.
+`build --version X.Y.Z` does not need api.github.com either: when the API does not
+answer, the release tarball's own URL (a GitHub release asset) is downloaded, with
+its `.sha256` when one is published beside it -- LLVM publishes only a `.sig` today --
+else with no checksum and a warning saying so.
+
+### Status contract
+
+`status --json` prints the toolkit's status shape (`PLAN.md` section 3) at the top level:
+
+    {"tool": "enterprise_clang_tool", "opt_root": DIR,
+     "current": {"clang-current": TARGET|null},
+     "installed": [{"name": "clang", "version", "prefix", "runs": bool, "built_by_tool": bool,
+                    "compiler": STR|null, "for": null, ...}],
+     "builds": [{"id", "status", "stage", "error", ...}],
+     "workdir": DIR, "components": {"clang": {"current": {...}, "leftovers": [...]}}}
+
+- `current`: the realpath of `<opt-root>/clang-current` (a dangling link still names its
+  target), `null` when there is none.
+- `installed`: every `<opt-root>/clang-*` with a `bin/clang` (and the link's target when
+  it has another name). `runs`: `bin/clang --version` exits 0; `version` is what it
+  says (else what `BUILD-INFO.txt` says). `built_by_tool`: the prefix's `BUILD-INFO.txt`
+  says this tool built it -- the main file's third state, "present but not built by the
+  toolkit" (an old `~/opt/clang-24-4` of the .sh scripts), is `runs` and not
+  `built_by_tool`. `compiler`: the stage0 `BUILD-INFO.txt` records (its banner); `for`
+  is always null. Extra keys: `compiler_path` (the stage0's real path), `build_info`,
+  `current` (the link points here).
+- `builds`: one per `<workdir>/build/<id>/state.json`; `id` is the directory's name
+  (`--build-id`). `status`: `done` (verify done), `running`, `killed` (recorded running
+  while nobody holds the lock), `failed`, `interrupted`, `incomplete` or `new`; `stage`:
+  the one running, failed or interrupted, else the first one not done (the last one when
+  done); `error`: the first line recorded for it. Extra keys: `dir`, `prefix`,
+  `installed`, `source`, `stages`, `running`, `dropped`.
+- `workdir` and `components` (the link in detail; leftovers: `clang-*` directories
+  without `bin/clang`, and install staging directories) are what the text output reads.
 
 ## The pipeline
 
@@ -156,9 +285,25 @@ after each one it looks in `rules.ninja` and `build.ninja` for the stage's
 compiler, `-fprofile-use` and `-flto` -- a profile that was silently not picked
 up costs the whole build and produces an ordinary compiler · run as root ·
 activate what it built when a check in `verify` failed, when `verify` did not
-run in this invocation, or when told `--no-activate` (otherwise it asks once,
+run in this invocation (the one exception: a finished build re-run with
+`--activate`, below), or when told `--no-activate` (otherwise it asks once,
 next to Proceed, and the default is yes: the result is meant to be used) ·
-replace a `clang-current` that is a real directory rather than a link.
+replace a `clang-current` that is a real directory rather than a link (a
+warning -- an error, exit 1, when `--activate` / `--link-current` asked for the
+link by name, so that whoever asked never sees exit 0 without it; that error comes
+in the plan, before Proceed and before anything is built, not after the hours of
+building).
+
+**A finished build that was never linked** (an earlier `--no-activate`, a "n" at
+the question, a `clang-current` that was a real directory then) is linked by the
+same `build` with `--activate`: every stage is done, so instead of only "nothing to
+do" it points `clang-current` at the prefix the record says passed verify -- if its
+clang still runs. Without the flag it is asked on a terminal, and said otherwise.
+Such a run builds nothing, so the options the build was made with need not be this
+run's (a newer system clang, other `--tune` flags: shown, then linked; with nobody to
+ask it is never refused for them) and the preflight's problems do not stop it (a
+stage0, python or tar removed since) -- root does. `--restart`, `--from`,
+`--retry-dropped` and `--only source|tools` are real work and are treated as before.
 
 ## Choosing the tools
 
@@ -172,8 +317,8 @@ replace a `clang-current` that is a real directory rather than a link.
 
 | flag | default | |
 |---|---|---|
-| `--host-cc PATH` `--host-cxx PATH` | the system's clang, else its gcc, else a toolset | the stage0 compiler. `toolchains` lists every gcc and clang in `/usr/bin`, your `PATH`, `~/opt/*/bin`, `/opt/*/bin`, `/usr/local`, Red Hat toolsets and distro LLVM packages -- with what each one would mean |
-| `--host-binutils auto\|DIR` | auto | see below |
+| `--host-cc PATH` `--host-cxx PATH` (or `--cc`, `--cxx`) | the system's clang, else its gcc, else a toolset | the stage0 compiler. `toolchains` lists every gcc and clang in `/usr/bin`, your `PATH`, `<opt-root>/*/bin`, `~/opt/*/bin`, `/opt/*/bin`, `/usr/local`, Red Hat toolsets and distro LLVM packages -- with what each one would mean |
+| `--host-binutils auto\|DIR` (or `--binutils DIR`) | auto | a directory holding `as` and `ld`, or a prefix whose `bin/` does; see below |
 | `--host-linker default\|lld\|gold\|bfd\|mold` | lld with a clang stage0 | stage1 only; later stages use their own lld |
 | `--python PATH` | a CPython >= the tree's minimum **that has yaml** | your `PATH` may lead to PyPy or a pyenv build without it |
 | `--cmake PATH` `--ninja PATH` `--provision cmake,ninja` | the machine's, if new enough for this tree | else pinned versions are built from source |
@@ -221,7 +366,9 @@ makes a build repeatable on the next machine.
 | flag | default | |
 |---|---|---|
 | `--version X.Y.Z` / `--ref REF` / `--source DIR` | latest release | tarball (sha256 checked when GitHub publishes one) / shallow git clone / your tree, read-only |
-| `--prefix` | `~/opt/clang-<version>` | must not exist |
+| `--opt-root DIR` | `~/opt` | where the prefixes and `clang-current` live |
+| `--prefix` | `<opt-root>/clang-<version>` | must not exist |
+| `--activate` / `--link-current`, `--no-activate` / `--no-link-current` | asked on a terminal, default yes | point `clang-current` at the result once `verify` passed; on a finished, never-linked build `--activate` alone links it |
 | `--tune` | `auto` | the x86-64 level this CPU has (read from the CPUID bits in `/proc/cpuinfo`, the ones glibc's own v2/v3/v4 checks use) and `-mtune` for this CPU (what the stage0 compiler resolves `-march=native` to: `haswell` here). A level rather than the CPU's name because `-march=haswell` also licenses AES, RDRND, PCLMUL, INVPCID, which no v3 check verifies. `portable` builds for any machine of this architecture; `native`, an ISA level (`x86-64-v3`), or raw flags are the manual choices. Applies to the toolchain's own binaries, never to the runtime libraries |
 | `--lto thin\|full\|off` | thin | stage3 |
 | `--no-pgo` | PGO on | skips the instrumented stage and training |
@@ -240,8 +387,10 @@ ordinary native code -- `verify` checks.
 
 `doctor` prints the one command for this machine. Required: a C++17 compiler,
 CPython >= the tree's minimum, tar + xz (or git). cmake and ninja are built if
-missing. On RHEL-likes ninja and several `-devel` packages live in CRB /
-PowerTools: `sudo dnf config-manager --set-enabled crb`.
+missing. Wanted: the system's clang and lld, as the old scripts installed them. On
+RHEL-likes ninja and several `-devel` packages live in CRB / PowerTools: `sudo dnf
+config-manager --set-enabled crb` (`--install-deps` does that first). The levels and
+the JSON are in [Doctor contract](#doctor-contract).
 
 ## Files
 
@@ -261,14 +410,29 @@ In the prefix: `BUILD-INFO.txt`.
 ## Tests
 
 ```
-/usr/bin/python3 tests/test_tool.py
+/usr/bin/python3 -I tests/test_tool.py
 ```
 
-79 tests, no network, no root, no LLVM tree (a twelve-line fake one): reading a
-tree, component selection and its dependencies, **blaming a failed build on the
-right component** from real ninja and cmake output, resuming, the
+124 tests, no network, no root needed, no LLVM tree (a twelve-line fake one):
+reading a tree, component selection and its dependencies, **blaming a failed build
+on the right component** from real ninja and cmake output, resuming, the
 resume-or-start-over summary and question (with the answers injected), job
-sizing, the environment allow-list, atomic extraction.
+sizing, the environment allow-list, atomic extraction; and the toolkit's contract:
+the file parses as Python 3.6 and is pure ASCII, the satellite_remote block is what
+`sync_remote.py` writes and `where_to_run` is the first statement of `main()`,
+`--opt-root` (prefix, link, search), every subcommand taking `--yes` / `--opt-root` /
+`--workdir` / `--profile`, `--cc` / `--cxx` / `--binutils` (a prefix too), the doctor
+contract (shape, levels, clang + lld wanted, `install_command` = required + wanted,
+packages and repositories per distribution, CRB only for what lives there and only
+with dnf, yum reported as the dnf family, `--install-deps` enabling CRB first),
+`doctor --json` offline, pure JSON on stdout with errors (and a child's output) on
+stderr, the status contract against a fake opt root, build statuses, re-activation of
+a finished build through `build --activate --yes` -- also when it was built with
+another stage0, or the preflight now fails, but never as root (and the errors when the
+link cannot be made, before any building when `--activate` was given),
+`--version X.Y.Z` without the API, and the system clang as step 2's stage0
+(for real, where `/usr/bin/clang` exists). As root one test is skipped (root ignores
+directory permissions); as an ordinary user none is.
 
 ## What has been tested, and what has not (2026-09-20, AlmaLinux 10.2, x86_64, LLVM trunk 3c2eaf3920a8)
 
@@ -338,6 +502,23 @@ sizing, the environment allow-list, atomic extraction.
   separate configure of clang + lld: `--emit-relocs` on exactly two of 121
   link lines.
 
+- **The toolkit contract, 2026-10-09** (Ubuntu 24.04 container, x86_64, as an
+  ordinary user, scratch HOME and `--opt-root`; api.github.com answering 403):
+  `doctor --json` (offline: `latest` resolved through `git ls-remote`, and with git
+  out of reach too, the preflight with assumed minimums), `status --json`, `plan`
+  and `toolchains` (the system clang 18.1.3 chosen by itself, and with `--host-cc
+  /usr/bin/clang`); `build --version 23.1.3 --only source --yes`: the release
+  tarball downloaded from its release-asset URL without the API (170.9 MB, no
+  checksum, said) and extracted; then a record with every stage done and a never-linked
+  prefix (simulated `bin/clang`): `build --no-activate` left it, `build --activate --yes`
+  linked it, a third run said "(already)". No full build was run in that container.
+  After review, the same way: such a record made with stage0 "clang 18.1.2" (the
+  system has 18.1.3) linked by `build --activate --yes --host-cc /usr/bin/clang`
+  (exit 0; it was refused before); `doctor --json` with only optional packages
+  missing: `ok`, empty `install_command`; `plan --cc /usr/bin/clang --cxx
+  /usr/bin/clang++ --binutils /usr`; `build --activate --yes` of a fresh build with a
+  real-directory `clang-current`: refused in the plan, nothing built or recorded.
+
 **What those runs found, all fixed**
 
 | found by | what was wrong |
@@ -359,8 +540,9 @@ sizing, the environment allow-list, atomic extraction.
 - A Red Hat **toolset** gcc as stage0 beyond detection (`--gcc-toolchain` for
   later stages): written from documentation. Here the system clang already
   defaults to gcc-toolset-15, so it could not be isolated cheaply.
-- Release tarballs (`--version`), `--ref`, `--install-deps` (sudo needs a
-  password), `--lto full`, `--no-pgo`, `--link dylib`, `--check`, `--activate`.
+- `--ref`, `--install-deps` (sudo needs a password), `--lto full`, `--no-pgo`,
+  `--link dylib`, `--check`, and `--activate` at the end of a real build (its
+  re-activation path was run for real, above).
 - Any machine but this one: apt / zypper / pacman package names, aarch64,
   Python 3.6 at run time (syntax is checked with `ast`; the runtime is not).
 

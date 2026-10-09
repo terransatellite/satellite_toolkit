@@ -1,6 +1,17 @@
 #!/usr/bin/python3 -I
 # -*- coding: utf-8 -*-
-"""enterprise_python_tool.py -- build a CPython 3 for claude_scraper, and prove it runs it.
+"""enterprise_python_tool.py -- build a CPython 3 for claude_scraper, and prove it runs it;
+or (--for general) the latest CPython for general use, the satellite toolkit's step 5.
+
+Two modes, one builder:
+
+  --for scraper (the default)  what this tool was written for, described below:
+      <opt>/cpython-<ver>-<scraper dir name>, proved by the scraper's smoke test.
+  --for general                build_python_universal.sh's CPython part, as the toolkit's
+      step 5 runs it ("build python, the latest, with that gcc/binutils"): the newest final
+      release (auto = latest here), built with --cc PATH and --binutils DIR (the gcc and
+      binutils of steps 4 and 3, by their real paths), into <opt>/cpython-<ver>, verified,
+      smoke-tested (a venv, its pip, the stdlib), then <opt>/cpython-current points at it.
 
 Successor to build_python_universal.sh, narrowed to what the scraper needs: one
 CPython 3 (no PyPy), with its own pip, in a prefix of its own, and a venv for
@@ -35,7 +46,8 @@ What is different, and why:
   not picked the week it ships.  `latest` does pick it.
 
 One file, standard library only, syntax held to Python 3.6.  Never run it as
-root: only --install-deps calls sudo.
+root: only --install-deps calls sudo.  (doctor --json, status, versions,
+detect, toolchains, verify and profiles only look, and answer as root too.)
 
 Licence: public domain / CC0.  No warranty.
 """
@@ -47,6 +59,7 @@ if sys.version_info < (3, 6):
 
 import argparse
 import ast
+import configparser
 import errno
 import fcntl
 import glob
@@ -72,6 +85,9 @@ USER_AGENT = TOOL + "/" + VERSION
 DEFAULT_SCRAPER = "/run/media/madness/purple10/claude_scraper"
 DEFAULT_WORKDIR = "~/src/python_build_tool"
 DEFAULT_OPT = "~/opt"
+FOR_CHOICES = ("scraper", "general")    # --for: what the interpreter is for (default scraper)
+CURRENT = "cpython-current"            # <opt>/cpython-current: the link the toolkit reads (general mode)
+GENERAL_TAG = "-general"               # general mode's build tree, stage and record carry it: never shared
 # The scraper's entry points, from its README.  Everything they import, directly
 # or not, is "the scraper"; the other top-level .py files are an older version.
 ENTRY_POINTS = ("main.py", "extract_existing.py", "fetch_repos.py", "reseed.py")
@@ -96,42 +112,55 @@ VENV_MARKER = ".python_build_tool-venv.json"   # in a venv it made: a DIFFERENT 
 #   wanted    without it something real is lost: said loudly, the build goes on
 #   optional  interactive niceties
 #   fallback  only if pip finds no wheel for this Python and has to compile lxml
+#             (scraper mode only; the doctor contract calls it "optional")
 DEPS = (
-    # key        headers (any one)                 dnf               apt               level
-    ("openssl", ("openssl/ssl.h",), "openssl-devel", "libssl-dev", "required",
+    # key        headers (any one)       dnf               apt                zypper              pacman      level
+    ("openssl", ("openssl/ssl.h",), "openssl-devel", "libssl-dev", "libopenssl-devel", "openssl", "required",
      "ssl + hashlib: every HTTPS fetch the scraper makes, and pip itself"),
-    ("sqlite", ("sqlite3.h",), "sqlite-devel", "libsqlite3-dev", "required",
+    ("sqlite", ("sqlite3.h",), "sqlite-devel", "libsqlite3-dev", "sqlite3-devel", "sqlite", "required",
      "sqlite3: crawler_data.db -- the queue, what was visited, robots"),
-    ("zlib", ("zlib.h",), "zlib-devel", "zlib1g-dev", "required",
+    ("zlib", ("zlib.h",), "zlib-devel", "zlib1g-dev", "zlib-devel", "zlib", "required",
      "zlib: the html/*.html.gz pages, gzip'd responses, pip's wheels"),
-    ("libffi", ("ffi.h",), "libffi-devel", "libffi-dev", "required", "ctypes"),
-    ("bzip2", ("bzlib.h",), "bzip2-devel", "libbz2-dev", "required", "bz2"),
-    ("xz", ("lzma.h",), "xz-devel", "liblzma-dev", "required", "lzma"),
-    ("mpdecimal", ("mpdecimal.h",), "mpdecimal-devel", "libmpdec-dev", "wanted",
+    ("libffi", ("ffi.h",), "libffi-devel", "libffi-dev", "libffi-devel", "libffi", "required", "ctypes"),
+    ("bzip2", ("bzlib.h",), "bzip2-devel", "libbz2-dev", "libbz2-devel", "bzip2", "required", "bz2"),
+    ("xz", ("lzma.h",), "xz-devel", "liblzma-dev", "xz-devel", "xz", "required", "lzma"),
+    ("mpdecimal", ("mpdecimal.h",), "mpdecimal-devel", "libmpdec-dev", "mpdecimal-devel", "mpdecimal", "wanted",
      "decimal against the system libmpdec (CPython's bundled copy is deprecated)"),
-    ("zstd", ("zstd.h",), "libzstd-devel", "libzstd-dev", "wanted",
+    ("zstd", ("zstd.h",), "libzstd-devel", "libzstd-dev", "libzstd-devel", "zstd", "wanted",
      "compression.zstd (3.14+): requests can then accept zstd-encoded pages"),
-    ("libuuid", ("uuid/uuid.h",), "libuuid-devel", "uuid-dev", "optional", "_uuid: fast uuid1()"),
-    ("readline", ("readline/readline.h",), "readline-devel", "libreadline-dev", "optional",
-     "line editing at the >>> prompt"),
-    ("ncurses", ("ncurses.h", "curses.h"), "ncurses-devel", "libncurses-dev", "optional", "curses"),
-    ("gdbm", ("gdbm.h",), "gdbm-devel", "libgdbm-dev", "optional", "dbm.gnu"),
-    ("libxml2", ("pkg:libxml-2.0",), "libxml2-devel", "libxml2-dev", "fallback",
+    ("libuuid", ("uuid/uuid.h",), "libuuid-devel", "uuid-dev", "libuuid-devel", "util-linux-libs", "optional",
+     "_uuid: fast uuid1()"),
+    ("readline", ("readline/readline.h",), "readline-devel", "libreadline-dev", "readline-devel", "readline",
+     "optional", "line editing at the >>> prompt"),
+    ("ncurses", ("ncurses.h", "curses.h"), "ncurses-devel", "libncurses-dev", "ncurses-devel", "ncurses",
+     "optional", "curses"),
+    ("gdbm", ("gdbm.h",), "gdbm-devel", "libgdbm-dev", "gdbm-devel", "gdbm", "optional", "dbm.gnu"),
+    # build_python_universal.sh installs tk-devel / tk-dev; Debian keeps tk.h under
+    # /usr/include/tcl8.6, so pkg-config is asked first (it is what configure asks too).
+    ("tk", ("pkg:tk", "tk.h"), "tk-devel", "tk-dev", "tk-devel", "tk", "optional", "tkinter"),
+    ("libxml2", ("pkg:libxml-2.0",), "libxml2-devel", "libxml2-dev", "libxml2-devel", "libxml2", "fallback",
      "only if pip has to compile lxml (no lxml wheel for this Python)"),
-    ("libxslt", ("pkg:libxslt",), "libxslt-devel", "libxslt1-dev", "fallback",
+    ("libxslt", ("pkg:libxslt",), "libxslt-devel", "libxslt1-dev", "libxslt-devel", "libxslt", "fallback",
      "only if pip has to compile lxml (no lxml wheel for this Python)"),
 )
-DEPS_BY_KEY = tuple((row[0], row[5]) for row in DEPS)
-# name on PATH, dnf package, apt package
-BUILD_TOOLS = (("make", "make", "make"), ("tar", "tar", "tar"), ("xz", "xz", "xz-utils"),
-               ("pkg-config", "pkgconfig", "pkg-config"), ("readelf", "binutils", "binutils"),
-               ("ldd", "glibc-common", "libc-bin"))
+DEPS_BY_KEY = tuple((row[0], row[7]) for row in DEPS)
+# The package column of DEPS / BUILD_TOOLS rows for each package-manager family.
+PKG_COLUMN = {"dnf": 2, "apt": 3, "zypper": 4, "pacman": 5}
+# name on PATH, dnf package, apt package, zypper package, pacman package
+BUILD_TOOLS = (("make", "make", "make", "make", "make"), ("tar", "tar", "tar", "tar", "tar"),
+               ("xz", "xz", "xz-utils", "xz", "xz"),
+               ("pkg-config", "pkgconfig", "pkg-config", "pkg-config", "pkgconf"),
+               ("readelf", "binutils", "binutils", "binutils", "binutils"),
+               ("ldd", "glibc-common", "libc-bin", "glibc", "glibc"))
+CC_PACKAGES = ("gcc", "build-essential", "gcc", "gcc")          # dnf, apt, zypper, pacman
+# On Enterprise Linux this lives in CodeReady Builder (EL 9/10; PowerTools on EL 8), off by default.
+CRB_PACKAGES = ("mpdecimal-devel",)
 # Which system library each C module comes from: a module missing from CPython's
 # own build report is turned back into "install this".
 MODULE_DEP = {"_ssl": "openssl", "_hashlib": "openssl", "_sqlite3": "sqlite", "zlib": "zlib",
               "binascii": "zlib", "_bz2": "bzip2", "_lzma": "xz", "_ctypes": "libffi",
               "_decimal": "mpdecimal", "_zstd": "zstd", "_uuid": "libuuid", "readline": "readline",
-              "_curses": "ncurses", "_curses_panel": "ncurses", "_gdbm": "gdbm"}
+              "_curses": "ncurses", "_curses_panel": "ncurses", "_gdbm": "gdbm", "_tkinter": "tk"}
 
 # Imported in the INSTALLED interpreter.  One of these not importing fails the
 # build: a Python that "built" without _ssl is worse than a failed build, because
@@ -144,6 +173,14 @@ MODULES_REQUIRED = ("_ssl", "_hashlib", "_sqlite3", "zlib", "_bz2", "_lzma", "_c
                     "multiprocessing", "subprocess", "socket", "urllib.request", "ensurepip", "venv")
 MODULES_WANTED = (("_decimal", (3, 0)), ("_zstd", (3, 14)))     # (module, from which version)
 MODULES_OPTIONAL = ("_uuid", "readline", "_curses", "_gdbm")
+# build_python_universal.sh's verify_interpreter, py3 flavour (its lines 229-230), by its own
+# names: CORE missing fails the build there and here; NICE missing is a note.
+SH_CORE = ("zlib", "bz2", "lzma", "ctypes", "sqlite3", "hashlib", "decimal", "select", "socket", "ssl")
+SH_NICE = ("curses", "readline", "dbm.gnu", "uuid")
+# The general smoke test imports these in a venv made from the new interpreter.
+GENERAL_SMOKE_MODULES = ("json", "sqlite3", "ssl", "hashlib", "ctypes", "decimal", "lzma", "bz2", "zlib",
+                         "socket", "select", "asyncio", "multiprocessing", "urllib.request", "xml.etree.ElementTree",
+                         "csv", "venv", "ensurepip")
 
 # --------------------------------------------------------------- local or remote
 # --local, --remote[=USER@HOST], --attach, --sessions: satellite_remote.py, written here
@@ -1238,6 +1275,7 @@ def where_to_run(argv, tool_file, tool_name, upload=None, entry=None, before=Non
 class UI(object):
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     tty = sys.stdout.isatty()
+    stream = None             # None: stdout.  With --json, stderr: stdout is the JSON alone.
 
 
 def _c(code, text):
@@ -1247,14 +1285,29 @@ def _c(code, text):
 def out(text=""):
     """Never raises: a closed pipe or a dead terminal must not turn into an
     exception in the middle of a rollback."""
+    s = UI.stream or sys.stdout
     try:
         try:
-            print(text)
+            s.write(text + "\n")
         except UnicodeEncodeError:
-            print(text.encode("ascii", "replace").decode("ascii"))
-        sys.stdout.flush()
+            s.write(text.encode("ascii", "replace").decode("ascii") + "\n")
+        s.flush()
     except (OSError, IOError, ValueError):
         pass
+
+
+def emit_json(data, default=None):
+    """The one thing --json puts on stdout."""
+    sys.stdout.write(json.dumps(data, indent=1, sort_keys=True, default=default) + "\n")
+    sys.stdout.flush()
+
+
+def json_mode():
+    """--json (the toolkit contract): stdout is the JSON and nothing else; every message,
+    an ERROR included, goes to stderr."""
+    UI.stream = sys.stderr
+    UI.tty = False
+    UI.color = sys.stderr.isatty() and "NO_COLOR" not in os.environ
 
 
 def say(msg):
@@ -1298,6 +1351,10 @@ def clear_status():
 
 class ToolError(Exception):
     """A failure with a message fit to show the user.  No traceback."""
+
+
+class UsageError(ToolError):
+    """A wrong option: exit 2, like argparse's own."""
 
 
 # ----------------------------------------------------------------------- process
@@ -1460,6 +1517,17 @@ def expand(path):
 
 def same_path(a, b):
     return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+
+
+def real_tool_path(path):
+    """A program's path with its DIRECTORY resolved: <opt>/gcc-current/bin/gcc becomes
+    <opt>/gcc-16.2.0/bin/gcc (the toolkit's contract: what was used is recorded by its real
+    path, never through a -current link a later rebuild moves), while /usr/bin/gcc stays
+    /usr/bin/gcc and keeps its name (its g++ is found beside it by name)."""
+    if not path:
+        return path
+    path = os.path.abspath(os.path.expanduser(path))
+    return os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
 
 
 # ---------------------------------------------------------------------- versions
@@ -1712,37 +1780,83 @@ def crb_command(osr):
     return "sudo dnf config-manager --set-enabled crb"
 
 
-def pkg_manager():
-    """-> (command, family): ('dnf', 'dnf'), ('apt-get', 'apt'), or ('', '')."""
-    for name, family in (("dnf", "dnf"), ("yum", "dnf"), ("apt-get", "apt")):
-        if which(name):
+def crb_repo(osr):
+    """The id of that repository, for doctor --json's enable_repos (the gcc tool's rule): crb
+    (EL 9+ rebuilds), powertools (EL 8), codeready-builder-for-rhel-N-ARCH-rpms (RHEL itself,
+    a subscription-manager channel).  '' elsewhere (Fedora has it all in its main repositories)."""
+    osid, like = osr.get("ID", ""), osr.get("ID_LIKE", "")
+    major = (osr.get("VERSION_ID") or "").split(".")[0]
+    if osid == "rhel":
+        return "codeready-builder-for-rhel-%s-%s-rpms" % (major or "9", os.uname().machine)
+    if osid in ("almalinux", "rocky", "centos") or (osid != "fedora" and "rhel" in like.split()):
+        return "powertools" if major == "8" else "crb"
+    return ""
+
+
+def enable_repo_command(repo):
+    """-> the argv that enables it: RHEL's channel through subscription-manager (dnf
+    config-manager cannot: 'No matching repo to modify'), the rebuilds' through dnf."""
+    if not repo:
+        return []
+    if repo.startswith("codeready-builder-for-rhel-"):
+        return ["sudo", "subscription-manager", "repos", "--enable", repo]
+    return ["sudo", "dnf", "config-manager", "--set-enabled", repo]
+
+
+# (manager, family, the ID / ID_LIKE words of /etc/os-release that mean it)
+PKG_MANAGER_OF = (("apt-get", "apt", ("debian", "ubuntu")), ("zypper", "zypper", ("suse", "opensuse", "sles", "sled")),
+                  ("pacman", "pacman", ("arch", "manjaro")),
+                  ("dnf", "dnf", ("fedora", "rhel", "centos", "almalinux", "rocky", "amzn", "ol")))
+PKG_MANAGERS = (("dnf", "dnf"), ("yum", "dnf"), ("apt-get", "apt"), ("zypper", "zypper"), ("pacman", "pacman"))
+# What doctor --json calls each family (the toolkit contract: dnf|apt-get|zypper|pacman|null).
+CONTRACT_PM = {"dnf": "dnf", "apt": "apt-get", "zypper": "zypper", "pacman": "pacman"}
+
+
+def pkg_manager(osr=None, have=None):
+    """-> (command, family): ('dnf', 'dnf'), ('yum', 'dnf'), ('apt-get', 'apt'), ('zypper',
+    'zypper'), ('pacman', 'pacman'), or ('', '').  The one that fits the distribution first: a
+    dnf installed on Ubuntu for rpm work is not Ubuntu's package manager."""
+    osr = parse_os_release(read_text("/etc/os-release")) if osr is None else osr
+    have = have or which
+    ids = (osr.get("ID", "") + " " + osr.get("ID_LIKE", "")).lower().split()
+    preferred = [(pm, fam) for pm, fam, names in PKG_MANAGER_OF
+                 if any(i == n or i.startswith(n + "-") for i in ids for n in names)]
+    for name, family in preferred + list(PKG_MANAGERS):
+        if have(name):
             return name, family
     return "", ""
 
 
 def install_command(packages, mgr, family):
+    packages = [p for i, p in enumerate(packages) if p and p not in packages[:i]]
     if not packages:
         return ""
     if family == "dnf":
         return "sudo %s install -y %s" % (mgr, " ".join(packages))
     if family == "apt":
         return "sudo apt-get install -y %s" % " ".join(packages)
+    if family == "zypper":
+        return "sudo zypper install -y %s" % " ".join(packages)
+    if family == "pacman":
+        return "sudo pacman -S --needed --noconfirm %s" % " ".join(packages)
     return ""
 
 
 def packages_for(rows, family):
-    return [r[2] if family != "apt" else r[3] for r in rows]
+    return [r[PKG_COLUMN.get(family, 2)] for r in rows]
 
 
-def pick_cc(forced=""):
+def pick_cc(forced="", option="--cc"):
     """The SYSTEM compiler unless told otherwise: extensions pip compiles later use
     the compiler recorded in sysconfig, and the system one is the one that is
-    still there next year."""
+    still there next year.  --cc PATH (the toolkit passes step 4's gcc) is taken by
+    its real directory: see real_tool_path.  (--cxx PATH is taken the same way.)"""
     if forced:
-        path = forced if os.path.isabs(forced) else which(forced)
-        if not path or not os.access(path, os.X_OK):
-            raise ToolError("--cc %s: not an executable" % forced)
-        return path
+        forced = os.path.expanduser(forced)
+        path = forced if os.path.isabs(forced) else (os.path.abspath(forced) if os.sep in forced else which(forced))
+        if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise ToolError("%s %s: not an executable" % (option, forced))
+        return real_tool_path(path)
     for name in ("gcc", "cc", "clang"):
         path = which(name)
         if path:
@@ -1750,15 +1864,110 @@ def pick_cc(forced=""):
     return ""
 
 
+def binutils_dir(given):
+    """--binutils DIR: a prefix whose bin/ holds as and ld (step 3's binutils), by its REAL
+    path -- the toolkit's contract: what was used is recorded, and a later rebuild of
+    binutils-current must not silently change it.  DIR/bin is taken for DIR."""
+    if not given:
+        return ""
+    d = os.path.realpath(os.path.expanduser(given))
+    if os.path.basename(d) == "bin" and not os.path.isdir(os.path.join(d, "bin")):
+        d = os.path.dirname(d)
+    for name in ("as", "ld"):
+        if not os.access(os.path.join(d, "bin", name), os.X_OK):
+            raise ToolError("--binutils %s: no %s in %s -- it takes a binutils prefix, e.g. the realpath of "
+                            "~/opt/binutils-current" % (given, name, os.path.join(d, "bin")))
+    return d
+
+
+def prog_paths(cc, extra_path=None):
+    """{'as': path, 'ld': path}: what this compiler will really run.  A gcc configured
+    --with-as/--with-ld (the gcc tool pairs gcc with its binutils so) names them itself;
+    otherwise -print-prog-name answers a bare name, found on the build's PATH -- the
+    --binutils bin directory first, then the system's."""
+    found = {}
+    search = ":".join(list(extra_path or []) + SYSTEM_PATH)
+    for name in ("as", "ld"):
+        try:
+            p = run([cc, "-print-prog-name=" + name], env=scrubbed_env(extra_path=extra_path), check=False, timeout=30)
+            ans = (p.stdout or "").strip().splitlines()[-1].strip() if p.returncode == 0 and (p.stdout or "").strip() else ""
+        except ToolError:
+            ans = ""
+        if ans and os.sep not in ans:
+            ans = which(ans, path=search) or ans
+        found[name] = os.path.normpath(ans) if ans and os.sep in ans else ans
+    return found
+
+
+def expected_comment(banner):
+    """The .comment string a compiler leaves in what it builds, from its --version banner.
+    gcc: "GCC: " + pkgversion + version, where an unset pkgversion -- "(GCC) " in the
+    banner -- is written "(GNU) " (gcc/toplev.cc); clang: its banner as it is."""
+    banner = (banner or "").strip()
+    if "clang version" in banner:
+        return banner
+    m = re.match(r"^\S*(gcc|g\+\+|cc)(-[\d.]+)?\s+(\(.*)$", banner)
+    if not m:
+        return ""
+    rest = m.group(3)
+    return "GCC: " + ("(GNU) " + rest[len("(GCC) "):] if rest.startswith("(GCC) ") else rest)
+
+
+CXX_OF = (("clang", "clang++"), ("gcc", "g++"), ("cc", "c++"))
+
+
+def cxx_name(cc):
+    """-> (the C++ driver's name beside cc, its plain name): gcc-14 -> g++-14,
+    x86_64-linux-gnu-gcc-13 -> x86_64-linux-gnu-g++-13, clang-18 -> clang++-18, cc -> c++.
+    ("", "") for a compiler of no known kind."""
+    base = os.path.basename(cc or "")
+    for c, cxx in CXX_OF:
+        m = re.match(r"^(.*-)?%s(-[^/]*)?$" % re.escape(c), base)
+        if m:
+            return (m.group(1) or "") + cxx + (m.group(2) or ""), cxx
+    return "", ""
+
+
+def cxx_partner(cc):
+    """The C++ driver installed BESIDE cc (same directory), or ""."""
+    name = cxx_name(cc)[0]
+    cand = os.path.join(os.path.dirname(cc), name) if name else ""
+    return cand if cand and os.path.isfile(cand) and os.access(cand, os.X_OK) else ""
+
+
 def cxx_for(cc):
-    d, base = os.path.split(cc)
-    for c, cxx in (("clang", "clang++"), ("gcc", "g++"), ("cc", "c++")):
-        if base == c or base.startswith(c + "-"):
-            cand = os.path.join(d, cxx + base[len(c):])
-            if os.access(cand, os.X_OK):
-                return cand
-            return which(cxx) or ""
-    return ""
+    """cc's C++ partner: the one beside it, else the system's driver of its kind (g++ for a
+    gcc) on the scrubbed PATH -- what the DEFAULT compiler gets.  An explicit --cc with no
+    partner beside it is choose_cxx's question, never answered quietly with this."""
+    partner = cxx_partner(cc)
+    if partner:
+        return partner
+    plain = cxx_name(cc)[1]
+    return (which(plain) or "") if plain else ""
+
+
+def choose_cxx(forced, cc, cc_given, general):
+    """-> (the C++ compiler for CXX=, a problem or "").  --cxx wins (taken like --cc: a bare
+    name on the system PATH, a path by its real directory); else the partner BESIDE the C
+    compiler; else, for the default compiler only, the system's (cxx_for).  An explicit
+    --cc with no partner beside it is never paired silently with the distro's g++: CPython
+    records CXX in sysconfig and pip compiles C++ extensions with it.  General mode refuses
+    (the toolkit's step 5 is "with that gcc"); scraper mode says so and carries on."""
+    if forced:
+        return pick_cc(forced, "--cxx"), ""
+    if not cc:
+        return "", ""
+    partner = cxx_partner(cc)
+    if partner or not cc_given:
+        return partner or cxx_for(cc), ""
+    fallback = cxx_for(cc)
+    where = os.path.join(os.path.dirname(cc), cxx_name(cc)[0] or "g++")
+    if general:
+        return fallback, ("no C++ compiler beside --cc %s (no %s): name the one that goes with it, --cxx PATH%s"
+                          % (cc, where, "  (the system's is %s: --cxx %s takes it knowingly)" % (fallback, fallback)
+                             if fallback else ""))
+    return fallback, ("no C++ compiler beside --cc %s (no %s): CXX is %s (name another with --cxx PATH)"
+                      % (cc, where, fallback or "left to configure's own search"))
 
 
 def compiler_banner(cc):
@@ -1766,7 +1975,7 @@ def compiler_banner(cc):
     return ((p.stdout or "").strip().splitlines() or ["?"])[0]
 
 
-def compiler_works(cc, scratch_parent=None):
+def compiler_works(cc, scratch_parent=None, extra_path=None):
     """Compile, link and RUN a hello-world, in the work directory: configure has
     to run its test programs there anyway, and with /tmp mounted noexec (CIS
     hardening) a probe in /tmp would blame a compiler that works."""
@@ -1781,7 +1990,7 @@ def compiler_works(cc, scratch_parent=None):
         with open(src, "w") as f:
             f.write("#include <stdio.h>\nint main(void) { puts(\"ok\"); return 0; }\n")
         exe = os.path.join(tmp, "t")
-        p = run([cc, src, "-o", exe], env=scrubbed_env(), check=False, timeout=120)
+        p = run([cc, src, "-o", exe], env=scrubbed_env(extra_path=extra_path), check=False, timeout=120)
         if p.returncode != 0:
             return False, (p.stdout or "").strip()[-600:]
         try:
@@ -1796,35 +2005,201 @@ def compiler_works(cc, scratch_parent=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def have_header(cc, header):
-    p = run([cc, "-E", "-x", "c", "-o", os.devnull, "-"], env=scrubbed_env(), check=False,
+def have_header(cc, header, extra_path=None):
+    p = run([cc, "-E", "-x", "c", "-o", os.devnull, "-"], env=scrubbed_env(extra_path=extra_path), check=False,
             stdin_data="#include <%s>\n" % header, timeout=60)
     return p.returncode == 0
 
 
-def have_dep(cc, probe):
+def have_dep(cc, probe, extra_path=None):
     if probe.startswith("pkg:"):
         return bool(which("pkg-config")) and run(["pkg-config", "--exists", probe[4:]], env=scrubbed_env(),
                                                  check=False, timeout=60).returncode == 0
-    return have_header(cc, probe)
+    return have_header(cc, probe, extra_path)
 
 
 def probe_label(probe):
     return "pkg-config %s" % probe[4:] if probe.startswith("pkg:") else probe
 
 
-def check_deps(cc):
+def check_deps(cc, extra_path=None):
     """-> {key: True/False} for every DEPS row, by asking the compiler (or pkg-config)."""
-    return dict((row[0], any(have_dep(cc, h) for h in row[1])) for row in DEPS)
+    return dict((row[0], any(have_dep(cc, h, extra_path) for h in row[1])) for row in DEPS)
 
 
 def missing_rows(found, levels):
-    return [row for row in DEPS if row[4] in levels and not found.get(row[0])]
+    return [row for row in DEPS if row[6] in levels and not found.get(row[0])]
 
 
-def meminfo_gb():
-    m = re.search(r"MemTotal:\s+(\d+)", read_text("/proc/meminfo"))
+def meminfo_gb(field="MemTotal"):
+    m = re.search(r"%s:\s+(\d+)" % field, read_text("/proc/meminfo"))
     return int(m.group(1)) / 1048576.0 if m else 0.0
+
+
+# ------------------------------------------------- detect: compilers, binutils, pythons
+
+# Where else compilers, binutils and pythons live (the gcc tool's list; <opt> is added by
+# tool_search_dirs, the -current links first).
+TOOL_GLOBS = ["~/.local/bin", "/usr/local/bin", "/usr/local/*/bin", "/opt/*/bin", "/opt/rh/*/root/usr/bin",
+              "/usr/lib/llvm*/bin", "/usr/lib64/llvm*/bin"]
+COMPILER_NAME = re.compile(r"^(gcc|clang)(-\d+(\.\d+)*)?$")
+PYTHON_NAME = re.compile(r"^(python3(\.\d+)?|pypy3?(\.\d+)?)$")
+PY_ASK = ("import platform, sys; sys.stdout.write(platform.python_implementation() + ' ' + "
+          "'.'.join(str(x) for x in sys.version_info[:3]) + ' ' + sys.prefix)")
+
+
+def tool_search_dirs(opt_root=None, home=None, path_env=None):
+    """/usr/bin, your PATH, then <opt>/*-current/bin (the links the toolkit's steps make:
+    found there, a program is shown by its -current path and its real one), the rest of
+    <opt>/*/bin, and the usual other places.  One entry per real directory."""
+    home = os.path.expanduser("~") if home is None else home
+    opt = expand(opt_root or DEFAULT_OPT)
+    path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    dirs = ["/usr/bin"] + [d for d in path_env.split(":") if d]
+    dirs += sorted(glob.glob(os.path.join(glob.escape(opt), "*-current", "bin")))
+    dirs += sorted(glob.glob(os.path.join(glob.escape(opt), "*", "bin")))
+    for pat in TOOL_GLOBS:
+        dirs.extend(sorted(glob.glob(home + pat[1:] if pat.startswith("~") else pat)))
+    seen, res = set(), []
+    for d in dirs:
+        real = os.path.realpath(d)
+        if real not in seen and os.path.isdir(d):
+            seen.add(real)
+            res.append(d)
+    return res
+
+
+def scan_names(dirs, pattern):
+    """Executable FILES whose names match, one per real file."""
+    seen, found = set(), []
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d), key=lambda n: (len(n), n))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            if not pattern.match(name) or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                found.append(path)
+    return found
+
+
+def compiler_info(cc):
+    """-> {path, kind, version, banner} or None.  The compiler is ASKED; a name like `gcc`
+    says nothing (on some systems it is clang)."""
+    if not cc or not os.path.isfile(cc) or not os.access(cc, os.X_OK):
+        return None
+    try:
+        o = run([cc, "--version"], check=False, env=scrubbed_env(), timeout=30).stdout or ""
+    except ToolError:
+        return None
+    banner = (o.strip().splitlines() or [""])[0]
+    if "clang version" in o:
+        kind, ver = "clang", numver(o.split("clang version", 1)[1])
+    elif "Free Software Foundation" in o or re.search(r"\bg(cc|\+\+)\b", banner, re.I):
+        kind = "gcc"
+        try:
+            d = run([cc, "-dumpfullversion", "-dumpversion"], check=False, env=scrubbed_env(), timeout=30).stdout
+        except ToolError:
+            d = ""
+        ver = numver(d) or numver(banner)
+    else:
+        return None
+    return {"path": cc, "kind": kind, "version": ver, "banner": banner}
+
+
+def origin_of(path, opt_root=None):
+    d, name = os.path.split(path)
+    opt = expand(opt_root or DEFAULT_OPT)
+    if d in ("/usr/bin", "/bin"):
+        return "system" if re.match(r"^(gcc|clang|cc|python3|as|ld)$", name) else "system, versioned"
+    if d == opt or d.startswith(opt + os.sep):
+        return ("toolkit, %s" % os.path.basename(os.path.dirname(d))) if d.endswith("-current/bin") else "in <opt>"
+    if d.startswith("/opt/rh/"):
+        return "toolset"
+    if re.match(r"^/usr/lib(64)?/llvm", d):
+        return "distro LLVM package"
+    return "private"
+
+
+def find_compilers(dirs=None, opt_root=None):
+    """Every gcc and clang here, with its C++ partner (the one BESIDE it, or "") and its real path."""
+    found = []
+    for cc in scan_names(tool_search_dirs(opt_root) if dirs is None else dirs, COMPILER_NAME):
+        ci = compiler_info(cc)
+        if ci:
+            ci.update(cxx=cxx_partner(cc), real=real_tool_path(cc), origin=origin_of(cc, opt_root))
+            found.append(ci)
+    return found
+
+
+def find_binutils(dirs=None, opt_root=None):
+    """Every GNU binutils set: a directory holding both `as` and `ld`.  `prefix` is what
+    --binutils takes (the directory above bin/), by its real path."""
+    sets, seen = [], set()
+    dirs = tool_search_dirs(opt_root) if dirs is None else dirs
+    for d in dirs:
+        a_, l_ = os.path.join(d, "as"), os.path.join(d, "ld")
+        if not (os.access(a_, os.X_OK) and os.access(l_, os.X_OK)) or os.path.realpath(a_) in seen:
+            continue
+        seen.add(os.path.realpath(a_))
+        try:
+            line = ((run([a_, "--version"], check=False, env=scrubbed_env(), timeout=20).stdout or "")
+                    .splitlines() or [""])[0]
+        except ToolError:
+            continue
+        if "GNU assembler" not in line:
+            continue
+        v = numver(re.sub(r"^.*?(\d+\.\d+)", r"\1", line))
+        sets.append({"dir": d, "prefix": os.path.realpath(os.path.dirname(d)), "version": v, "banner": line.strip(),
+                     "system": os.path.realpath(d) in ("/usr/bin", "/bin"), "origin": origin_of(a_, opt_root),
+                     "gold": os.access(os.path.join(d, "ld.gold"), os.X_OK)})
+    return sets
+
+
+def find_pythons(dirs=None, opt_root=None):
+    """Every python3 / pypy here: implementation, version, prefix, and whether this tool
+    built it (its record in the prefix) and for what."""
+    found = []
+    for py in scan_names(tool_search_dirs(opt_root) if dirs is None else dirs, PYTHON_NAME):
+        try:
+            p = run([py, "-E", "-s", "-c", PY_ASK], env=scrubbed_env(), check=False, timeout=30)
+        except ToolError:
+            continue
+        words = (p.stdout or "").strip().split(" ", 2) if p.returncode == 0 else []
+        if len(words) < 3:
+            continue
+        rec = prefix_record(words[2]) or {}
+        found.append({"path": py, "real": os.path.realpath(py), "impl": words[0], "version": words[1],
+                      "prefix": words[2], "origin": origin_of(py, opt_root),
+                      "built_by_tool": bool(rec), "for": rec.get("for") if rec else None})
+    return found
+
+
+def detect_machine(opt_root=None):
+    """What `detect` shows (and prints as JSON): the machine, every compiler, binutils set
+    and python found, the -current links, and which headers the system compiler sees."""
+    osr = parse_os_release(read_text("/etc/os-release"))
+    mgr, family = pkg_manager(osr)
+    opt = expand(opt_root or DEFAULT_OPT)
+    cc = pick_cc("")
+    current = {}
+    for name in ("gcc-current", "binutils-current", CURRENT):
+        link = os.path.join(opt, name)
+        current[name] = os.path.realpath(link) if os.path.lexists(link) else None
+    return {"os": osr.get("PRETTY_NAME") or "%s %s" % (osr.get("NAME", "Linux"), osr.get("VERSION_ID", "")),
+            "os_id": osr.get("ID", ""), "os_like": osr.get("ID_LIKE", ""), "os_version": osr.get("VERSION_ID", ""),
+            "arch": os.uname().machine, "cpus": os.cpu_count() or 0,
+            "mem_total_gb": round(meminfo_gb(), 1), "mem_avail_gb": round(meminfo_gb("MemAvailable"), 1),
+            "pkg_manager": CONTRACT_PM.get(family) or None, "opt_root": opt, "current": current,
+            "system_cc": cc, "compilers": find_compilers(opt_root=opt), "binutils": find_binutils(opt_root=opt),
+            "pythons": find_pythons(opt_root=opt),
+            "tools": dict((t[0], which(t[0]) or "") for t in BUILD_TOOLS),
+            "headers": check_deps(cc) if cc else {}}
 
 
 # ------------------------------------------------------------------- bookkeeping
@@ -1878,6 +2253,26 @@ def lock_dir(path):
         f.close()
         raise ToolError("another %s is working in %s right now" % (TOOL, path))
     _LOCKS.append(f)
+
+
+def lock_is_held(path):
+    """Is a build running in this work directory now?  (status: a record that says
+    "running" while nobody holds the lock was killed.)  Never creates anything."""
+    lock = os.path.join(path, ".lock")
+    if not os.path.exists(lock):
+        return False
+    try:
+        f = open(lock, "r")
+    except (OSError, IOError):
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except (OSError, IOError):
+        return True
+    finally:
+        f.close()
 
 
 # --------------------------------------------------------------- running make
@@ -2017,13 +2412,19 @@ def scraper_tag(scraper):
     return re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(os.path.normpath(scraper))) or "app"
 
 
-def default_prefix(version, scraper):
-    return os.path.join(expand(DEFAULT_OPT), "cpython-%s-%s" % (version, scraper_tag(scraper)))
+def default_prefix(version, scraper, opt_root=None, purpose="scraper"):
+    """<opt>/cpython-<ver>-<scraper dir name> for the scraper; <opt>/cpython-<ver> -- the
+    .sh's name, no suffix -- for general use."""
+    opt = expand(opt_root or DEFAULT_OPT)
+    if purpose == "general":
+        return os.path.join(opt, "cpython-%s" % version)
+    return os.path.join(opt, "cpython-%s-%s" % (version, scraper_tag(scraper)))
 
 
-def configure_args(prefix, cc, cxx, optimize=True, system_mpdec=True):
+def configure_args(prefix, cc, cxx, optimize=True, system_mpdec=True, ar=""):
     """--enable-shared is deliberately NOT used (as in the .sh): a libpython3.so
-    has to be found at run time, and nothing the scraper does needs it."""
+    has to be found at run time, and nothing the scraper does needs it.  AR is
+    given only with --binutils: that binutils' ar, recorded in sysconfig."""
     a = ["--prefix=" + prefix]
     if optimize:
         a += ["--enable-optimizations", "--with-lto"]
@@ -2033,6 +2434,8 @@ def configure_args(prefix, cc, cxx, optimize=True, system_mpdec=True):
     a.append("CC=" + cc)
     if cxx:
         a.append("CXX=" + cxx)
+    if ar:
+        a.append("AR=" + ar)
     return a
 
 
@@ -2041,48 +2444,86 @@ class Ctx(object):
 
     def __init__(self, args, release=None, why="", source=""):
         self.args = args
-        self.scraper = expand(args.scraper)
-        self.workdir = expand(args.workdir)
+        self.purpose = getattr(args, "purpose", None) or "scraper"
+        self.general = self.purpose == "general"
+        self.scraper = expand(getattr(args, "scraper", None) or DEFAULT_SCRAPER)
+        self.workdir = expand(getattr(args, "workdir", None) or DEFAULT_WORKDIR)
+        self.opt_root = expand(getattr(args, "opt_root", None) or DEFAULT_OPT)
         self.release = release or {}
         self.version = self.release.get("version", "")
         self.why, self.source = why, source
         self.prefix = expand(args.prefix) if getattr(args, "prefix", None) else \
-            (default_prefix(self.version, self.scraper) if self.version else "")
+            (default_prefix(self.version, self.scraper, self.opt_root, self.purpose) if self.version else "")
+        # The two modes never share a build tree, a stage or a record: the same 3.14.8 can
+        # be configured for both (other options, another compiler) without thrashing one tree.
+        tag = GENERAL_TAG if self.general else ""
+        self.key = self.version + tag
         self.downloads = os.path.join(self.workdir, "downloads")
         self.tarball = os.path.join(self.downloads, "Python-%s.tar.xz" % self.version)
         self.src = os.path.join(self.workdir, "Python-" + self.version)
-        self.build = os.path.join(self.workdir, "build-" + self.version)
-        self.stage = os.path.join(self.workdir, "stage-" + self.version)
-        self.check_venv = os.path.join(self.workdir, "check-venv-" + self.version)
-        self.logs = os.path.join(self.workdir, "logs", self.version or "misc")
+        self.build = os.path.join(self.workdir, "build-" + self.version + tag)
+        self.stage = os.path.join(self.workdir, "stage-" + self.version + tag)
+        self.check_venv = os.path.join(self.workdir, "check-venv-" + self.version + tag)
+        self.logs = os.path.join(self.workdir, "logs", (self.version + tag) if self.version else "misc")
         self.cc = pick_cc(getattr(args, "cc", "") or "")
-        self.cxx = cxx_for(self.cc) if self.cc else ""
+        self.set_cxx()
+        # --binutils DIR: its bin/ goes FIRST on the build's PATH (as, ld, ar, readelf as
+        # configure and gcc look them up), and its ar is named to configure.
+        self.binutils = binutils_dir(getattr(args, "binutils", "") or "")
+        self.path_extra = [os.path.join(self.binutils, "bin")] if self.binutils else []
+        ar = os.path.join(self.binutils, "bin", "ar") if self.binutils else ""
+        self.ar = ar if ar and os.access(ar, os.X_OK) else ""
         self.jobs = getattr(args, "jobs", None) or os.cpu_count() or 2
         self.optimize = not getattr(args, "no_optimize", False)
+        lc = getattr(args, "link_current", None)
+        self.link_current = self.general if lc is None else bool(lc)
+        self.for_label = "general" if self.general else self.scraper
         self.tar = {}
+
+    def set_cxx(self):
+        """CXX: --cxx, else the partner beside the C compiler (choose_cxx); a problem with
+        it is preflight's to report (general mode: refused)."""
+        self.cxx, self.cxx_problem = choose_cxx(getattr(self.args, "cxx", "") or "", self.cc,
+                                                bool(getattr(self.args, "cc", "")), self.general)
 
     def python(self):
         return os.path.join(self.prefix, "bin", "python3")
 
     def configure(self, system_mpdec):
-        return configure_args(self.prefix, self.cc, self.cxx, self.optimize, system_mpdec)
+        return configure_args(self.prefix, self.cc, self.cxx, self.optimize, system_mpdec, self.ar)
+
+
+def ctx_env(ctx, **kw):
+    """The build's scrubbed environment: --binutils' bin first, when there is one."""
+    return scrubbed_env(extra_path=getattr(ctx, "path_extra", None), **kw)
+
+
+def ctx_key(ctx):
+    """The record's key: the version (scraper mode, as it always was) or <version>-general."""
+    return getattr(ctx, "key", "") or ctx.version
 
 
 def resolve_release(args):
     want = args.version or "auto"
+    general = getattr(args, "purpose", None) == "general"
+    if general and want == "auto":
+        want = "latest"         # his words: "build python, the latest"
     if re.match(r"^\d+\.\d+\.\d+$", want):
         try:
             rels, source = get_releases(want)
         except ToolError as e:
             warn(str(e).splitlines()[0])
-            rels, source = [], "the command line"
+            rels, source = [], "command line"
         if source != "python.org API" and not any(r["version"] == want for r in rels):
             rels = []           # the FTP fallback cannot prove a NEGATIVE: build it unconfirmed
     else:
         rels, source = get_releases(want)
-    rel, why = pick_version(rels, args.version or "auto")
+    rel, why = pick_version(rels, want)
+    if general and want == "latest" and (args.version or "auto") == "auto":
+        why = "the newest final release (--for general: auto is latest)"
     if numver(rel["version"])[:2] < MIN_SERIES:
-        raise ToolError("CPython %s is older than the scraper supports (%s+)" % (rel["version"], vstr(MIN_SERIES)))
+        raise ToolError("CPython %s is older than %s supports (%s+)" % (
+            rel["version"], "this tool" if general else "the scraper", vstr(MIN_SERIES)))
     return rel, why, source
 
 
@@ -2108,7 +2549,7 @@ def writable_parent(path):
 
 def preflight(ctx, install_deps=False):
     """Everything that can be known before ten minutes of compiling.  Raises on
-    what would make the build fail or the scraper not run."""
+    what would make the build fail or the scraper (general mode: CPython) not run."""
     problems = []
 
     def line(kind, msg):
@@ -2133,7 +2574,7 @@ def preflight(ctx, install_deps=False):
     def check_cc():
         if not ctx.cc:
             return "no C compiler (gcc) found in %s" % ":".join(SYSTEM_PATH)
-        works, detail = compiler_works(ctx.cc, ctx.workdir if not why else None)
+        works, detail = compiler_works(ctx.cc, ctx.workdir if not why else None, getattr(ctx, "path_extra", None))
         if works:
             line("ok", "C compiler %s -- %s" % (ctx.cc, compiler_banner(ctx.cc)))
             return ""
@@ -2141,25 +2582,44 @@ def preflight(ctx, install_deps=False):
     cc_problem = check_cc()
     if cc_problem:
         line("bad", cc_problem)
+    if getattr(ctx, "cxx_problem", ""):
+        line("bad" if getattr(ctx, "general", False) else "warn", ctx.cxx_problem)
+    elif getattr(ctx, "cxx", ""):
+        line("ok", "C++ compiler %s (CXX, recorded in sysconfig for pip's C++ extensions)" % ctx.cxx)
+    if getattr(ctx, "binutils", "") and ctx.cc:
+        progs = prog_paths(ctx.cc, ctx.path_extra)
+        line("ok", "binutils %s (--binutils: its bin/ first on the build's PATH%s)"
+             % (ctx.binutils, ", AR=" + ctx.ar if ctx.ar else ""))
+        for name in ("as", "ld"):
+            where = progs.get(name) or "?"
+            if where.startswith(os.path.join(ctx.binutils, "")) or \
+                    os.path.realpath(os.path.dirname(where)) == os.path.join(ctx.binutils, "bin"):
+                line("ok", "%-3s %s" % (name, where))
+            else:
+                line("warn", "%s: the compiler runs %s, not the one in --binutils %s (a gcc configured --with-%s "
+                     "names its own pair)" % (name, where, ctx.binutils, name))
     mgr, family = pkg_manager()
     tool_rows = []
-    for name, dnf_pkg, apt_pkg in BUILD_TOOLS:
-        if which(name):
+    for t in BUILD_TOOLS:
+        if which(t[0]):
             continue
-        tool_rows.append((name, (), dnf_pkg, apt_pkg, "required", name))
-        line("bad" if name in ("make", "tar", "xz") else "warn", "%s not found" % name)
+        tool_rows.append((t[0], ()) + tuple(t[1:5]) + ("required", t[0]))
+        line("bad" if t[0] in ("make", "tar", "xz") else "warn", "%s not found" % t[0])
     if not tool_rows:
         line("ok", "make, tar, xz, pkg-config, readelf, ldd")
     needed_tools = [r for r in tool_rows if r[0] in ("make", "tar", "xz")]
-    cc_rows = [] if ctx.cc else [("gcc", (), "gcc", "build-essential", "required", "a C compiler")]
+    cc_rows = [] if ctx.cc else [("gcc", ()) + CC_PACKAGES + ("required", "a C compiler")]
+    general = getattr(ctx, "general", False)
 
-    found = check_deps(ctx.cc) if ctx.cc else {}
+    found = check_deps(ctx.cc, getattr(ctx, "path_extra", None)) if ctx.cc else {}
     say("Libraries CPython's modules need (headers, as the compiler sees them)")
     if not ctx.cc:
         line("note", "(cannot ask without a compiler)")
     for row in DEPS if ctx.cc else ():
-        key, headers, dnf_pkg, apt_pkg, level, what = row
-        pkg = apt_pkg if family == "apt" else dnf_pkg
+        key, headers, level, what = row[0], row[1], row[6], row[7]
+        if general and level == "fallback":
+            continue                            # lxml's headers: the scraper's business only
+        pkg = row[PKG_COLUMN.get(family, 2)]
         text = "%-26s %-16s %s" % (probe_label(headers[0]), pkg, what)
         if found.get(key):
             line("ok", text)
@@ -2178,10 +2638,20 @@ def preflight(ctx, install_deps=False):
     req, want = missing_now()
     if (req or want or cc_problem) and install_deps:
         if not family:
-            raise ToolError("--install-deps: no dnf, yum or apt-get here; install what is listed above yourself")
+            raise ToolError("--install-deps: no dnf, yum, apt-get, zypper or pacman here; install what is listed "
+                            "above yourself")
         say("Installing build dependencies (sudo)")
         if family == "apt":
             run(["sudo", "apt-get", "update"], interactive=True, check=False)
+        # CRB first when what is missing lives there (the gcc tool's rule): enabled by the
+        # command for THIS distribution, or said and carried on without.
+        repo = crb_repo(osr) if family == "dnf" else ""
+        if repo and any(p in CRB_PACKAGES for p in packages_for(req + want, family)):
+            cmd = enable_repo_command(repo)
+            info(" ".join(cmd))
+            if run(cmd, interactive=True, check=False).returncode != 0:
+                warn("could not enable the %s repository -- what lives there (mpdecimal-devel) may not install"
+                     % repo)
         for attempt in (1, 2):
             had_cc = bool(ctx.cc)
             if req:
@@ -2198,9 +2668,9 @@ def preflight(ctx, install_deps=False):
             # repo makes dnf exit 1); what is now on disk decides.
             if not ctx.cc:
                 ctx.cc = pick_cc(getattr(ctx.args, "cc", "") or "")
-                ctx.cxx = cxx_for(ctx.cc) if ctx.cc else ""
+                ctx.set_cxx()
             cc_problem = check_cc()
-            found = check_deps(ctx.cc) if ctx.cc else {}
+            found = check_deps(ctx.cc, getattr(ctx, "path_extra", None)) if ctx.cc else {}
             req, want = missing_now()
             # A second pass only when this one brought the compiler: without it the
             # headers could not even be asked about.
@@ -2208,10 +2678,12 @@ def preflight(ctx, install_deps=False):
                 break
     if cc_problem:
         problems.append(cc_problem)
+    if general and getattr(ctx, "cxx_problem", ""):
+        problems.append(ctx.cxx_problem)
     if req:
         cmd = install_command(packages_for(req, family), mgr, family)
-        problems.append("missing what the scraper's Python cannot do without: %s.%s" % (
-            ", ".join(r[0] for r in req),
+        problems.append("missing what %s cannot do without: %s.%s" % (
+            "CPython" if general else "the scraper's Python", ", ".join(r[0] for r in req),
             ("\n  Install with:  " + cmd + "\n  (or re-run with --install-deps)") if cmd else
             "\n  Install the development packages that provide: " + ", ".join((r[1][0] if r[1] else r[0])
                                                                                   for r in req)))
@@ -2221,7 +2693,7 @@ def preflight(ctx, install_deps=False):
             ", ".join(r[0] for r in want), cmd or "install their headers",
             "\n  (mpdecimal-devel is in the CodeReady Builder repository: %s)" % crb_command(osr)
             if rhel_like and family == "dnf" and any(r[0] == "mpdecimal" for r in want) else ""))
-    fallback = missing_rows(found, ("fallback",)) if ctx.cc else []
+    fallback = missing_rows(found, ("fallback",)) if ctx.cc and not general else []
     if fallback:
         cmd = install_command(packages_for(fallback, family), mgr, family)
         note("not needed while lxml publishes a wheel for this Python; if pip ever has to compile it: %s" % cmd)
@@ -2236,7 +2708,7 @@ def preflight(ctx, install_deps=False):
             note("python3 on your PATH is %s -- this tool never uses it" % py3)
 
     say("Disk")
-    prefix = ctx.prefix or expand(DEFAULT_OPT)
+    prefix = ctx.prefix or getattr(ctx, "opt_root", "") or expand(DEFAULT_OPT)
     where, why_prefix = writable_parent(os.path.dirname(prefix) if ctx.prefix else prefix)
     if why_prefix:
         problems.append("the prefix %s cannot be installed: %s" % (prefix, why_prefix))
@@ -2251,6 +2723,99 @@ def preflight(ctx, install_deps=False):
     if problems:
         raise ToolError("\n\n".join(problems))
     return found
+
+
+def doctor_report(ctx, found, cc_ok, euid=None, osr=None, pm=None, have=None, binutils_problem=""):
+    """The toolkit contract's shape, exactly (PLAN.md section 3): {tool, ok, package_manager,
+    missing: [{what, package, level}], enable_repos, install_command}.  found: check_deps()'s
+    answer; cc_ok: True, or why the compiler failed its hello-world.  ok is false when
+    anything required is missing or this runs as root.  Probed, never asked of rpm/dpkg."""
+    osr = parse_os_release(read_text("/etc/os-release")) if osr is None else osr
+    mgr, family = pkg_manager(osr) if pm is None else pm
+    have = have or which
+    col = PKG_COLUMN.get(family, 2)
+    general = getattr(ctx, "general", False)
+    missing = []
+    euid = os.geteuid() if euid is None else euid
+    if euid == 0:
+        missing.append({"what": "not root: this runs as root -- build as yourself (only --install-deps uses sudo)",
+                        "package": "", "level": "required"})
+    if not ctx.cc:
+        missing.append({"what": "a C compiler (gcc)", "package": CC_PACKAGES[col - 2] if family else "",
+                        "level": "required"})
+    elif cc_ok is not True:
+        missing.append({"what": "a C compiler that builds and runs a hello-world: %s cannot (%s)"
+                        % (ctx.cc, str(cc_ok or "?").strip().splitlines()[-1][:200] if str(cc_ok or "").strip()
+                           else "no output"), "package": "", "level": "required"})
+    if binutils_problem:
+        missing.append({"what": binutils_problem, "package": "", "level": "required"})
+    if general and getattr(ctx, "cxx_problem", ""):
+        missing.append({"what": ctx.cxx_problem, "package": "", "level": "required"})
+    for t in BUILD_TOOLS:
+        if not have(t[0]):
+            missing.append({"what": t[0], "package": t[col - 1] if family else "",
+                            "level": "required" if t[0] in ("make", "tar", "xz") else "wanted"})
+    for row in DEPS if ctx.cc else ():
+        level = row[6]
+        if found.get(row[0]) or (general and level == "fallback"):
+            continue
+        missing.append({"what": "%s (%s)" % (row[7], probe_label(row[1][0])), "package": row[col] if family else "",
+                        "level": "optional" if level == "fallback" else level})
+    pk = []
+    for m in missing:
+        if m["level"] in ("required", "wanted"):
+            for p in m["package"].split():
+                if p not in pk:
+                    pk.append(p)
+    repo = crb_repo(osr) if family == "dnf" else ""
+    return {"tool": TOOL, "ok": not any(m["level"] == "required" for m in missing),
+            "package_manager": CONTRACT_PM.get(family) or None, "missing": missing,
+            "enable_repos": [repo] if repo and any(p in CRB_PACKAGES for p in pk) else [],
+            "install_command": install_command(pk, mgr, family)}
+
+
+def doctor_json(args):
+    """doctor --json: no network, nothing created -- the main file asks every tool this up
+    front, before the toolchain of steps 3-4 exists.  A --cc or --binutils that is not
+    there is reported as missing, not raised."""
+    cc_problem = cxx_problem = binutils_problem = ""
+    saved = (getattr(args, "cc", ""), getattr(args, "binutils", ""), getattr(args, "cxx", ""))
+    try:
+        pick_cc(saved[0] or "")
+    except ToolError as e:
+        cc_problem, args.cc = str(e), ""
+    try:
+        binutils_dir(saved[1] or "")
+    except ToolError as e:
+        binutils_problem, args.binutils = str(e), ""
+    try:
+        pick_cc(saved[2] or "", "--cxx")
+    except ToolError as e:
+        cxx_problem, args.cxx = str(e), ""
+    try:
+        ctx = Ctx(args)
+    finally:
+        args.cc, args.binutils, args.cxx = saved
+    cc_ok = True
+    if ctx.cc:
+        scratch = ctx.workdir if os.path.isdir(ctx.workdir) and os.access(ctx.workdir, os.W_OK) else None
+        good, detail = compiler_works(ctx.cc, scratch, ctx.path_extra)
+        cc_ok = True if good else (detail or "it does not work")
+    found = check_deps(ctx.cc, ctx.path_extra) if ctx.cc and cc_ok is True else {}
+    if cc_ok is not True and ctx.cc:
+        found = dict((row[0], True) for row in DEPS)        # cannot be asked: the compiler is what is missing
+    report = doctor_report(ctx, found, cc_ok, binutils_problem=binutils_problem)
+    for problem in (cxx_problem, cc_problem):
+        if problem:
+            report["missing"].insert(0, {"what": problem, "package": "", "level": "required"})
+            report["ok"] = False
+    for what, path in (("the work directory", ctx.workdir), ("--opt-root", ctx.opt_root)):
+        _, why = writable_parent(path)          # asked, not made: --json creates nothing
+        if why:
+            report["missing"].append({"what": "%s %s cannot be made: %s" % (what, path, why), "package": "",
+                                      "level": "required"})
+            report["ok"] = False
+    return report
 
 
 def describe_venv(venv):
@@ -2292,6 +2857,12 @@ def show_scraper(scraper):
 
 
 def cmd_doctor(args):
+    merge_args(args)
+    if getattr(args, "json", False):
+        report = doctor_json(args)
+        emit_json(report)
+        return 0 if report["ok"] else 1
+    refuse_root("run doctor (it makes the work directory and test-compiles in it); doctor --json only looks")
     ctx = Ctx(args)
     try:
         rel, why, source = resolve_release(args)
@@ -2312,7 +2883,8 @@ def cmd_doctor(args):
             ok("reachable: %s" % url)
         except ToolError as e:
             warn(str(e).splitlines()[0])
-    show_scraper(ctx.scraper)
+    if not ctx.general:
+        show_scraper(ctx.scraper)
     say("Verdict")
     if verdict:
         bad("not ready:")
@@ -2330,11 +2902,29 @@ def show_plan(ctx, system_mpdec):
     sha = ctx.tar.get("sha256")
     info("source       %s" % ctx.tar.get("url", TARBALL_URL % {"v": ctx.version}))
     info("             %s" % ("sha256 %s (python.org)" % sha if sha else "no published checksum"))
+    info("for          %s" % ("general use (--for general)" if getattr(ctx, "general", False) else
+                                  "the scraper at %s (--for scraper)" % ctx.scraper))
     info("compiler     %s -- %s" % (ctx.cc, compiler_banner(ctx.cc) if ctx.cc else "?"))
+    info("c++          %s%s" % (getattr(ctx, "cxx", "") or "none (configure looks for one)",
+                                "  (--cxx)" if getattr(getattr(ctx, "args", None), "cxx", "") else ""))
+    if getattr(ctx, "binutils", ""):
+        progs = prog_paths(ctx.cc, ctx.path_extra) if ctx.cc else {}
+        info("binutils     %s  (its bin/ first on the build's PATH)" % ctx.binutils)
+        info("as / ld      %s / %s" % (progs.get("as") or "?", progs.get("ld") or "?"))
     info("configure    %s" % " ".join(ctx.configure(system_mpdec)))
     info("jobs         %d" % ctx.jobs)
     info("work dir     %s  (logs: %s)" % (ctx.workdir, ctx.logs))
     info("prefix       %s%s" % (ctx.prefix, "  (exists)" if os.path.exists(ctx.prefix) else ""))
+    if getattr(ctx, "general", False):
+        info("then         verify; a throwaway venv, its pip --version, %d stdlib imports (--no-check skips it)"
+             % len(GENERAL_SMOKE_MODULES))
+    if getattr(ctx, "link_current", False):
+        info("link         %s -> the prefix, once verified (--no-link-current leaves it)"
+             % os.path.join(ctx.opt_root, CURRENT))
+    elif getattr(ctx, "general", False):
+        info("link         %s is left alone (--no-link-current)" % os.path.join(ctx.opt_root, CURRENT))
+    if getattr(ctx, "general", False):
+        return
     if os.path.isdir(ctx.scraper):
         info("then         throwaway venv + pip install -r requirements.txt + the scraper smoke test")
         info(".venv        left alone: %s" % describe_venv(os.path.join(ctx.scraper, ".venv")))
@@ -2461,10 +3051,15 @@ def fetch_and_unpack(ctx, state):
         return
     # A tree from ANOTHER tarball -- one replaced after a checksum mismatch, a
     # re-rolled release -- is not built: unpack again, and forget its build.
-    for path in (ctx.src, ctx.build):
+    # Both modes' build trees of this version come from this tree: both are forgotten.
+    builds = [ctx.build, os.path.join(os.path.dirname(ctx.src), "build-" + ctx.version),
+              os.path.join(os.path.dirname(ctx.src), "build-" + ctx.version + GENERAL_TAG)]
+    for path in [ctx.src] + builds:
         if os.path.exists(path):
             shutil.rmtree(path)
-    state.build(ctx.version).pop("make_done", None)
+    for key in (ctx_key(ctx), ctx.version, ctx.version + GENERAL_TAG):
+        if key in state.d["builds"] or key == ctx_key(ctx):
+            state.build(key).pop("make_done", None)
     state.save()
     extract(ctx.tarball, ctx.src)
     write_atomic(stamp_file, digest + "\n")
@@ -2475,7 +3070,7 @@ def do_configure(ctx, state, args_list, found):
     """Configured again when the options OR the libraries on the machine changed:
     `dnf install libzstd-devel` and build --rebuild has to rebuild WITH it."""
     say("Configure")
-    record = state.build(ctx.version)
+    record = state.build(ctx_key(ctx))
     stamp_file = os.path.join(ctx.build, ".configured-by-" + TOOL)
     stamp_text = json.dumps([args_list, sorted(k for k, v in found.items() if v)])
     if read_text(stamp_file) == stamp_text and os.path.isfile(os.path.join(ctx.build, "Makefile")):
@@ -2485,14 +3080,14 @@ def do_configure(ctx, state, args_list, found):
         shutil.rmtree(ctx.build)
     os.makedirs(ctx.build)
     log = os.path.join(ctx.logs, "configure.log")
-    rc, secs = run_logged([os.path.join(ctx.src, "configure")] + args_list, ctx.build, scrubbed_env(),
+    rc, secs = run_logged([os.path.join(ctx.src, "configure")] + args_list, ctx.build, ctx_env(ctx),
                           log, "configure", verbose=ctx.args.verbose)
     if rc != 0:
         raise ToolError("configure failed (exit %d).  Its log: %s\n  and the details: %s\n%s"
                         % (rc, log, os.path.join(ctx.build, "config.log"), tail(read_text(log), 20)))
     write_atomic(stamp_file, stamp_text)
     record.pop("make_done", None)
-    state.set_build(ctx.version, configure=args_list, configured=now())
+    state.set_build(ctx_key(ctx), configure=args_list, configured=now())
     ok("configured in %s" % hms(secs))
     for line in read_text(log).splitlines():
         if "WARNING" in line:
@@ -2501,7 +3096,7 @@ def do_configure(ctx, state, args_list, found):
 
 def do_make(ctx, state):
     say("Build (PGO + LTO)" if ctx.optimize else "Build (no PGO/LTO: --no-optimize)")
-    record = state.build(ctx.version)
+    record = state.build(ctx_key(ctx))
     exe = os.path.join(ctx.build, "python")
     if record.get("make_done") and os.access(exe, os.X_OK):
         ok("already built: %s" % exe)
@@ -2511,21 +3106,21 @@ def do_make(ctx, state):
                          ("Expect 10-25 minutes; most of it is the PGO training run, which is mostly one core."
                           if ctx.optimize else "A few minutes.")))
     log = os.path.join(ctx.logs, "make.log")
-    rc, secs = run_logged(["make", "-j%d" % ctx.jobs], ctx.build, scrubbed_env(), log, "make",
+    rc, secs = run_logged(["make", "-j%d" % ctx.jobs], ctx.build, ctx_env(ctx), log, "make",
                           verbose=ctx.args.verbose, phases=ctx.optimize)
     if rc != 0 or not os.access(exe, os.X_OK):
         errs = error_summary(log)
         raise ToolError("make failed (exit %d) after %s.  Log: %s\n  The first errors:\n%s"
                         % (rc, hms(secs), log, "\n".join(errs) or tail(read_text(log), 25)))
     rep = module_report(read_text(log))
-    state.set_build(ctx.version, make_done=now(), make_seconds=secs, modules=rep)
+    state.set_build(ctx_key(ctx), make_done=now(), make_seconds=secs, modules=rep)
     ok("built in %s" % hms(secs))
     return rep
 
 
-def judge_modules(rep, found, family, mgr):
+def judge_modules(rep, found, family, mgr, general=False):
     """CPython's own report of modules it could not build -> raise if the
-    scraper needs one of them, warn otherwise."""
+    scraper (general mode: any real use) needs one of them, warn otherwise."""
     if rep.get("summary"):
         info(rep["summary"])
     lost = rep["missing"] + rep["failed"] + rep["removed"]
@@ -2535,12 +3130,30 @@ def judge_modules(rep, found, family, mgr):
     rows = [r for r in DEPS if r[0] in set(MODULE_DEP.get(m) for m in needed + wanted)]
     cmd = install_command(packages_for(rows, family), mgr, family)
     if needed:
-        raise ToolError("CPython built WITHOUT %s, which the scraper needs.%s"
-                        % (", ".join(needed), ("\n  Install:  %s\n  then build again." % cmd) if cmd else ""))
+        raise ToolError("CPython built WITHOUT %s, which %s.%s"
+                        % (", ".join(needed), "no usable CPython is without" if general else "the scraper needs",
+                           ("\n  Install:  %s\n  then build again." % cmd) if cmd else ""))
     if wanted:
         warn("built without %s%s" % (", ".join(wanted), ("; to have them: %s and build --rebuild" % cmd) if cmd else ""))
     if other:
-        note("not built (the scraper does not use them): %s" % " ".join(sorted(other)))
+        note("not built (%s): %s" % ("optional" if general else "the scraper does not use them",
+                                     " ".join(sorted(other))))
+
+
+def ensure_python3_link(prefix):
+    """build_python_universal.sh: `make altinstall`, then `ln -sfn python3.X $prefix/bin/python3`
+    -- inside the prefix only.  `make install` (used here: there is nothing in a private
+    prefix to shadow) makes that link itself; this makes it only if it is missing.
+    -> True when it made one."""
+    bindir = os.path.join(prefix, "bin")
+    if os.path.lexists(os.path.join(bindir, "python3")) or not os.path.isdir(bindir):
+        return False
+    exes = sorted((n for n in os.listdir(bindir) if re.match(r"^python3\.\d+$", n)
+                   and os.access(os.path.join(bindir, n), os.X_OK)), key=numver)
+    if not exes:
+        return False
+    os.symlink(exes[-1], os.path.join(bindir, "python3"))
+    return True
 
 
 def do_install(ctx, state, rebuild, args_list, old=""):
@@ -2569,9 +3182,12 @@ def do_install(ctx, state, rebuild, args_list, old=""):
         if os.path.exists(ctx.stage):
             shutil.rmtree(ctx.stage)
         log = os.path.join(ctx.logs, "install.log")
-        rc, secs = run_logged(["make", "install", "DESTDIR=" + ctx.stage], ctx.build, scrubbed_env(), log,
+        rc, secs = run_logged(["make", "install", "DESTDIR=" + ctx.stage], ctx.build, ctx_env(ctx), log,
                               "make install", verbose=ctx.args.verbose)
         staged = os.path.join(ctx.stage, ctx.prefix.lstrip(os.sep))
+        if rc == 0 and ensure_python3_link(staged):
+            note("bin/python3 -> %s made inside the prefix (the .sh's link)" % os.readlink(
+                os.path.join(staged, "bin", "python3")))
         if rc != 0 or not os.access(os.path.join(staged, "bin", "python3"), os.X_OK):
             raise ToolError("make install failed (exit %d).  Log: %s\n%s" % (rc, log, tail(read_text(log), 25)))
         if not glob.glob(os.path.join(glob.escape(staged), "lib", "python3*", "site-packages", "pip")):
@@ -2676,9 +3292,11 @@ def elf_facts(path):
     return facts
 
 
-def verify_interpreter(prefix, offline=False, quiet=False):
+def verify_interpreter(prefix, offline=False, quiet=False, expect_compiler=""):
     """One place that decides whether an installed interpreter is usable.
-    -> (good, summary dict).  Prints as it goes unless quiet."""
+    -> (good, summary dict).  Prints as it goes unless quiet.  expect_compiler: the
+    --version banner of the compiler that was asked for (general mode): the binary's
+    .comment must name it, or the build did not use it."""
     show = not quiet
     py = os.path.join(prefix, "bin", "python3")
     env = scrubbed_env()
@@ -2699,7 +3317,8 @@ def verify_interpreter(prefix, offline=False, quiet=False):
     ver = numver(p.stdout or "")
     groups = {"required": list(MODULES_REQUIRED),
               "wanted": [m for m, since in MODULES_WANTED if ver[:2] >= since],
-              "optional": list(MODULES_OPTIONAL)}
+              "optional": list(MODULES_OPTIONAL),
+              "sh_core": list(SH_CORE), "sh_nice": list(SH_NICE)}
     p = run([py, "-I", "-c", VERIFY_SCRIPT, json.dumps(groups)], env=env, check=False, timeout=300)
     try:
         res = json.loads((p.stdout or "").strip().splitlines()[-1])
@@ -2716,6 +3335,13 @@ def verify_interpreter(prefix, offline=False, quiet=False):
     elif show:
         ok("%d required modules import (ssl, hashlib, sqlite3, zlib, bz2, lzma, ctypes, multiprocessing, ...)"
            % len(groups["required"]))
+    if res["missing"].get("sh_core"):
+        good = fail("build_python_universal.sh's CORE modules missing: %s" % "; ".join(
+            "%s (%s)" % (m, res["errors"].get(m, "")) for m in res["missing"]["sh_core"]))
+    elif show:
+        ok("build_python_universal.sh's CORE imports too: %s" % " ".join(SH_CORE))
+    if show and res["missing"].get("sh_nice"):
+        note("the .sh's NICE modules missing: %s" % " ".join(res["missing"]["sh_nice"]))
     for m in res["missing"].get("wanted", []):
         if show:
             warn("%s missing: %s" % (m, dict(DEPS_BY_KEY).get(MODULE_DEP.get(m, ""), "")))
@@ -2768,6 +3394,17 @@ def verify_interpreter(prefix, offline=False, quiet=False):
         ok("no RPATH/RUNPATH in the binary (nothing leaked from LD_RUN_PATH)")
     if show and facts["comment"]:
         info("     built by: %s" % "; ".join(facts["comment"]))
+    want = expected_comment(expect_compiler) if expect_compiler else ""
+    if want:
+        summary["compiler_proof"] = want if want in facts["comment"] else ""
+        if want in facts["comment"]:
+            if show:
+                ok("its .comment names %s: built by the compiler that was asked for" % want)
+        elif facts["comment"]:
+            good = fail("the compiler asked for (%s) is not in the binary's .comment (%s): it was built by "
+                        "another one" % (want, "; ".join(facts["comment"])))
+        elif show:
+            note("no .comment in %s to prove which compiler built it" % exe)
     if which("ldd"):
         libdir = glob.glob(os.path.join(glob.escape(prefix), "lib", "python3.*", "lib-dynload"))
         targets = [exe]
@@ -2801,17 +3438,26 @@ def verify_interpreter(prefix, offline=False, quiet=False):
 
 def write_build_info(ctx, args_list, verify_summary, rep):
     """<prefix>/.python_build_tool.json (what `build` and `status` read back) and
-    BUILD-INFO.txt (for people)."""
-    rec = {"tool": "%s %s" % (TOOL, VERSION), "for": ctx.scraper, "version": ctx.version,
+    BUILD-INFO.txt (for people).  "for" is the scraper's path, or "general"; the
+    toolchain (compiler, binutils, the as/ld it ran) is recorded by real paths."""
+    banner = compiler_banner(ctx.cc)
+    progs = prog_paths(ctx.cc, getattr(ctx, "path_extra", None)) if ctx.cc else {}
+    rec = {"tool": "%s %s" % (TOOL, VERSION), "for": getattr(ctx, "for_label", ctx.scraper), "version": ctx.version,
            "source": ctx.tar.get("url"), "sha256": ctx.tar.get("sha256") or "",
-           "configure": args_list, "built": now(), "compiler": "%s (%s)" % (ctx.cc, compiler_banner(ctx.cc)),
+           "configure": args_list, "built": now(), "compiler": "%s (%s)" % (ctx.cc, banner),
+           "cc": ctx.cc, "cxx": ctx.cxx, "compiler_banner": banner, "binutils": getattr(ctx, "binutils", ""),
+           "as": progs.get("as", ""), "ld": progs.get("ld", ""), "ar": getattr(ctx, "ar", ""),
            "optimized": ctx.optimize, "modules": rep, "verify": verify_summary, "state": "verified"}
     write_atomic(os.path.join(ctx.prefix, MARKER), json.dumps(rec, indent=1, sort_keys=True) + "\n")
-    lines = ["Built by %s for %s" % (rec["tool"], ctx.scraper),
+    lines = ["Built by %s for %s" % (rec["tool"], "general use (--for general)" if rec["for"] == "general"
+                                      else ctx.scraper),
              "CPython   %s" % ctx.version,
              "source    %s" % rec["source"],
              "sha256    %s" % (rec["sha256"] or "(python.org published none)"),
              "compiler  %s" % rec["compiler"],
+             "c++       %s" % (rec["cxx"] or "none named (configure's own search)"),
+             "binutils  %s" % (rec["binutils"] or "the system's (no --binutils)"),
+             "as / ld   %s / %s" % (rec["as"] or "?", rec["ld"] or "?"),
              "configure %s" % " ".join(args_list),
              "built     %s" % rec["built"],
              "modules   %s" % (rep.get("summary") or "?"),
@@ -2822,22 +3468,33 @@ def write_build_info(ctx, args_list, verify_summary, rep):
 
 
 def cmd_plan(args):
+    merge_args(args)
     rel, why, source = resolve_release(args)
     ctx = Ctx(args, rel, why, source)
     ctx.tar = tarball_info(rel)
     found = preflight(ctx)
     show_plan(ctx, found.get("mpdecimal", False))
-    show_scraper(ctx.scraper)
+    if ctx.general:
+        cur = os.path.join(ctx.opt_root, CURRENT)
+        say("Now")
+        info("%s -> %s" % (cur, os.path.realpath(cur) if os.path.lexists(cur) else "(not there)"))
+    else:
+        show_scraper(ctx.scraper)
+    if getattr(args, "save_profile", None):
+        save_profile(args.save_profile, args)
     return 0
 
 
 def own_flags(ctx):
     """The options a follow-up command needs to find exactly what this one made
     (`venv` alone would take the NEWEST build, which need not be this one)."""
-    if ctx.prefix != default_prefix(ctx.version, ctx.scraper):
+    opt_root = getattr(ctx, "opt_root", "") or expand(DEFAULT_OPT)
+    if ctx.prefix != default_prefix(ctx.version, ctx.scraper, opt_root):
         flags = ["--prefix", ctx.prefix]
     else:
         flags = ["--version", ctx.version]
+        if opt_root != expand(DEFAULT_OPT):
+            flags += ["--opt-root", opt_root]
     if ctx.workdir != expand(DEFAULT_WORKDIR):
         flags += ["--workdir", ctx.workdir]
     if ctx.scraper != expand(DEFAULT_SCRAPER):
@@ -2849,14 +3506,49 @@ def verified(rec):
     return bool(rec) and rec.get("state") != "unverified" and bool((rec.get("verify") or {}).get("good"))
 
 
+def record_build(state, key, **kv):
+    """The build's status in state.json -- running, failed (with the stage and the
+    error), interrupted, done -- for `status`.  A full disk must not turn the real
+    error into another one."""
+    try:
+        state.set_build(key, **kv)
+    except (OSError, IOError) as e:
+        warn("could not record the build's status in %s: %s" % (state.path, e))
+
+
 def cmd_build(args):
+    merge_args(args)
+    if getattr(args, "dry_run", False):
+        return cmd_plan(args)
     started = time.time()
     rel, why, source = resolve_release(args)
     ctx = Ctx(args, rel, why, source)
     lock_dir(ctx.workdir)
     state = State(os.path.join(ctx.workdir, "state.json"))
     state.save()                                # stamped as this tool's from the first moment (see clean)
-    ctx.tar = tarball_info(rel)
+    if getattr(args, "save_profile", None):
+        save_profile(args.save_profile, args)
+    record_build(state, ctx.key, status="running", stage="preflight", error=None, started=now(),
+                 pid=os.getpid(), **{"for": ctx.for_label})
+    try:
+        rc = build_steps(ctx, state, started)
+    except KeyboardInterrupt:
+        record_build(state, ctx.key, status="interrupted", error="interrupted")
+        raise
+    except (ToolError, OSError, IOError) as e:
+        record_build(state, ctx.key, status="failed", error=(str(e).strip().splitlines() or ["?"])[0][:300])
+        raise
+    record_build(state, ctx.key, status="done" if rc == 0 else "failed",
+                 error=None if rc == 0 else "the scraper's smoke test failed")
+    return rc
+
+
+def build_steps(ctx, state, started):
+    args = ctx.args
+
+    def stage(name):
+        record_build(state, ctx.key, stage=name)
+    ctx.tar = tarball_info(ctx.release)
     found = preflight(ctx, install_deps=args.install_deps)
     mgr, family = pkg_manager()
     system_mpdec = bool(found.get("mpdecimal"))
@@ -2868,7 +3560,7 @@ def cmd_build(args):
     have = prefix_record(ctx.prefix) if os.path.lexists(ctx.prefix) else None
     reuse = False
     venv = os.path.join(ctx.scraper, ".venv")
-    vi = venv_info(venv)
+    vi = venv_info(venv) if not ctx.general else None
     venv_on_prefix = bool(vi) and same_path(vi["home"], os.path.join(ctx.prefix, "bin"))
     if os.path.lexists(ctx.prefix):
         if is_venv_dir(ctx.prefix):
@@ -2883,7 +3575,7 @@ def cmd_build(args):
                                 "would leave the venv without its packages: a venv belongs to ONE X.Y series.\n"
                                 "  Build %s into another --prefix (the default names carry the version), then "
                                 "`venv --replace`." % (ctx.prefix, vi["version"], ctx.version, ctx.version))
-            tried = not args.no_check and os.path.isdir(ctx.scraper)
+            tried = not args.no_check and (ctx.general or os.path.isdir(ctx.scraper))
             note("--rebuild: %s is replaced once the new build has verified%s" % (
                 ctx.prefix, " and passed the smoke test" if tried else ""))
         elif have.get("state") == "unverified":
@@ -2908,10 +3600,13 @@ def cmd_build(args):
     if reuse:
         rep = have.get("modules") or {}
     else:
+        stage("source")
         fetch_and_unpack(ctx, state)
+        stage("configure")
         do_configure(ctx, state, args_list, found)
+        stage("make")
         rep = do_make(ctx, state)
-        judge_modules(rep, found, family, mgr)
+        judge_modules(rep, found, family, mgr, general=ctx.general)
 
     def roll_back():
         """The new tree to <prefix>.failed-<date>, the previous build (if any)
@@ -2930,13 +3625,30 @@ def cmd_build(args):
         return "\n  The new build is kept for inspection at %s%s." % (
             failed, "; the previous build is back in %s" % ctx.prefix if old else "")
 
-    # Phase 1: from the install until the interpreter has verified, ANY failure
-    # (a timeout, ^C, a full disk) puts things back the way they were.
+    # General mode: the build must carry the compiler that was asked for (--cc), and
+    # verify proves it from the binary's .comment.  A prefix reused as it is is proved
+    # against the compiler its RECORD names, as `verify` does: the same path may answer
+    # another version by now (a distro update of /usr/bin/gcc), which says nothing
+    # against what was built then -- told, not failed, and the record is not rewritten
+    # as a failed verify.
+    expect = compiler_banner(ctx.cc) if ctx.general and ctx.cc else ""
+    if reuse and expect:
+        built_with = have.get("compiler_banner", "")
+        if built_with and built_with != expect:
+            note("%s answers %r now; this build was made when it answered %r.  Kept: `build --rebuild` "
+                 "rebuilds it with the compiler as it is now" % (ctx.cc, expect, built_with))
+        expect = built_with
+
+    # Phase 1: from the install until the interpreter has verified (general mode: and
+    # passed its smoke test), ANY failure (a timeout, ^C, a full disk) puts things back
+    # the way they were.
     try:
         if not reuse:
+            stage("install")
             do_install(ctx, state, args.rebuild, args_list, old)
+        stage("verify")
         say("Verify the interpreter")
-        good, vsum = verify_interpreter(ctx.prefix, offline=args.offline)
+        good, vsum = verify_interpreter(ctx.prefix, offline=args.offline, expect_compiler=expect)
         if reuse:
             have["verify"] = vsum               # a failure is recorded too: `venv` will not use it
             write_atomic(os.path.join(ctx.prefix, MARKER), json.dumps(have, indent=1, sort_keys=True) + "\n")
@@ -2946,7 +3658,18 @@ def cmd_build(args):
                 "" if not reuse else ".  Rebuild it: build --rebuild"))
         if not reuse:
             write_build_info(ctx, args_list, vsum, rep)
-        state.set_build(ctx.version, installed=ctx.prefix, verified=vsum.get("when"), configure=args_list)
+        state.set_build(ctx.key, installed=ctx.prefix, verified=vsum.get("when"), configure=args_list)
+        if ctx.general:
+            if args.no_check:
+                note("--no-check: the general smoke test was not run")
+            else:
+                stage("smoke")
+                say("Does it make a working venv?  (throwaway: %s)" % ctx.check_venv)
+                smoke_good, smoke_why = general_smoke(ctx.python(), ctx.check_venv, keep=args.keep)
+                state.add_check({"when": now(), "python": ctx.python(), "version": ctx.version, "for": "general",
+                                 "status": "ok" if smoke_good else "fail"})
+                if not smoke_good:
+                    raise ToolError("the general smoke test failed: %s" % smoke_why)
     except BaseException as e:
         extra = roll_back()
         if isinstance(e, ToolError):
@@ -2954,6 +3677,15 @@ def cmd_build(args):
         out(extra)
         raise
     shutil.rmtree(ctx.stage, ignore_errors=True)
+
+    if ctx.general:
+        if old and os.path.lexists(old):
+            shutil.rmtree(old, ignore_errors=True)
+            note("removed the previous build")
+        stage("link")
+        linked = activate(ctx)
+        general_summary(ctx, vsum, linked, started)
+        return 0
 
     # Phase 2: the scraper.  A failure here says nothing against a FRESH build
     # (pip may have lost the network), so that stays; a --rebuild's previous
@@ -2967,6 +3699,7 @@ def cmd_build(args):
                  "again WITHOUT --rebuild -- it re-verifies this interpreter instead of rebuilding it, then tries "
                  "the scraper." % ctx.scraper)
         else:
+            stage("smoke")
             say("Can it run the scraper?  (throwaway venv: %s)" % ctx.check_venv)
             if os.path.exists(ctx.check_venv):
                 shutil.rmtree(ctx.check_venv)
@@ -3002,6 +3735,9 @@ def cmd_build(args):
         bad("the scraper smoke test FAILED with this interpreter -- see above; the venv is kept at %s"
             % ctx.check_venv)
         return 1
+    if ctx.link_current:                        # scraper mode links only when asked (--link-current)
+        stage("link")
+        activate(ctx)
     if result:
         ok("the scraper's smoke test passed with it")
         vi = venv_info(venv)
@@ -3016,6 +3752,119 @@ def cmd_build(args):
             info("then run the scraper with that venv's python (not a bare python3 / python3.12):")
             info("    cd %s && .venv/bin/python main.py" % ctx.scraper)
     return 0
+
+
+# ------------------------------------------------------------- general mode
+
+GENERAL_SMOKE_SCRIPT = r"""
+import importlib, json, sys
+res = {"prefix": sys.prefix, "base_prefix": sys.base_prefix, "version": sys.version.split()[0], "missing": {}}
+for name in json.loads(sys.argv[1]):
+    try:
+        importlib.import_module(name)
+    except Exception as e:
+        res["missing"][name] = "%s: %s" % (type(e).__name__, e)
+print(json.dumps(res))
+"""
+
+
+def general_smoke(python, target, keep=False):
+    """General mode's proof, in place of the scraper's: a venv made from the new
+    interpreter, that venv's OWN pip, and the stdlib a program reaches first, imported
+    inside it.  The throwaway venv is removed when it passed.  -> (good, why not)."""
+    if os.path.exists(target):
+        shutil.rmtree(target)
+    good, why = False, ""
+    try:
+        vpy = create_venv(python, target)
+        p = run([vpy, "-m", "pip", "--version"], env=scrubbed_env(), check=False, timeout=300)
+        said = (p.stdout or "").strip()
+        pip_from = said.split(" from ", 1)[1].rsplit(" (python", 1)[0].strip() if " from " in said else ""
+        if p.returncode != 0:
+            why = "the venv's pip does not run:\n%s" % tail(said, 8)
+        elif not pip_from or not os.path.realpath(pip_from).startswith(os.path.realpath(target) + os.sep):
+            why = "the venv's pip is not its own: %s" % said
+        else:
+            ok("the venv's own pip: %s" % said.split(" from ")[0])
+            p = run([vpy, "-c", GENERAL_SMOKE_SCRIPT, json.dumps(GENERAL_SMOKE_MODULES)], env=scrubbed_env(),
+                    check=False, timeout=300)
+            try:
+                res = json.loads((p.stdout or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                res = None
+            if not isinstance(res, dict):
+                why = "the venv's python cannot run the import check (exit %d):\n%s" % (p.returncode, tail(p.stdout))
+            elif not same_path(res.get("prefix", ""), target):
+                why = "the venv's python does not run as the venv (sys.prefix is %s)" % res.get("prefix")
+            elif res.get("missing"):
+                why = "in the venv these do not import: %s" % "; ".join(
+                    "%s (%s)" % kv for kv in sorted(res["missing"].items()))
+            else:
+                ok("%d stdlib modules import in the venv: %s" % (len(GENERAL_SMOKE_MODULES),
+                                                                 " ".join(GENERAL_SMOKE_MODULES)))
+                good = True
+    finally:
+        if good and not keep:
+            shutil.rmtree(target, ignore_errors=True)
+        elif os.path.exists(target):
+            note("the throwaway venv is kept for a look: %s" % target)
+    return good, why
+
+
+def link_current(opt_root, prefix, name=CURRENT):
+    """<opt>/cpython-current -> prefix, atomically: a symlink beside it, renamed over (the
+    gcc tool's code).  A real directory of that name is never touched.  -> True when linked."""
+    current = os.path.join(opt_root, name)
+    if os.path.isdir(current) and not os.path.islink(current):
+        warn("%s is a real directory, not a link: left alone.  Move it aside, then:  ln -sfn %s %s"
+             % (current, prefix, current))
+        return False
+    os.makedirs(opt_root, exist_ok=True)
+    tmp = current + ".new"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(prefix, tmp)
+    os.replace(tmp, current)
+    ok("%s -> %s" % (current, prefix))
+    return True
+
+
+def activate(ctx):
+    """cpython-current, once the build has proved itself -- or said how, when it is not
+    to be touched.  A failure to link is a warning: the interpreter itself is good."""
+    current = os.path.join(ctx.opt_root, CURRENT)
+    if not ctx.link_current:
+        if ctx.general:
+            note("not linked (--no-link-current):  ln -sfn %s %s" % (ctx.prefix, current))
+        return False
+    say("Link")
+    try:
+        return link_current(ctx.opt_root, ctx.prefix)
+    except OSError as e:
+        warn("could not point %s at %s: %s" % (current, ctx.prefix, e))
+        return False
+
+
+def general_summary(ctx, vsum, linked, started):
+    """build_python_universal.sh's summary: BUILT, where, the PATH line and its caution."""
+    base = os.path.join(ctx.opt_root, CURRENT) if linked else ctx.prefix
+    say("Done in %s" % hms(time.time() - started))
+    info("BUILT        cpython-%s  %s" % (vsum.get("version", ctx.version), ctx.prefix))
+    info("interpreter  %s  (%s)" % (ctx.python(), vsum.get("version", ctx.version)))
+    info("its pip      %s -m pip   (or %s)" % (ctx.python(), os.path.join(ctx.prefix, "bin", "pip3")))
+    info("build notes  %s" % os.path.join(ctx.prefix, "BUILD-INFO.txt"))
+    if linked:
+        info("current      %s -> %s" % (base, ctx.prefix))
+    info("")
+    info("Add it to PATH, newest-first, e.g.:")
+    info("")
+    info("    export PATH=\"%s/bin:$PATH\"" % base)
+    info("")
+    info("A caution worth internalising (the .sh's): if you put a PyPy on PATH ahead of CPython,")
+    info("then 'python3' IS PyPy for every script and build system on this machine.  PyPy does not")
+    info("ship the same third-party modules, so anything that shells out to python3 may fail in a")
+    info("way that looks like a broken build rather than a shadowed interpreter.  Pin the")
+    info("interpreter explicitly in build scripts instead of trusting PATH.")
 
 
 # ------------------------------------------------------------------------ venvs
@@ -3126,9 +3975,10 @@ def restore_venv(target, aside):
                                                if os.path.lexists(failed) else ""))
 
 
-def newest_built_prefix(scraper):
+def newest_built_prefix(scraper, opt_root=None):
     found = []
-    for path in glob.glob(os.path.join(glob.escape(expand(DEFAULT_OPT)), "cpython-*-%s" % scraper_tag(scraper))):
+    opt = expand(opt_root or DEFAULT_OPT)
+    for path in glob.glob(os.path.join(glob.escape(opt), "cpython-*-%s" % scraper_tag(scraper))):
         rec = prefix_record(path)
         if rec and os.access(os.path.join(path, "bin", "python3"), os.X_OK):
             found.append((numver(rec.get("version", "")), path, rec))
@@ -3138,24 +3988,25 @@ def newest_built_prefix(scraper):
 
 def pick_prefix(args, scraper):
     want = getattr(args, "version", None)
+    opt_root = getattr(args, "opt_root", None)
     if getattr(args, "prefix", None):
         prefix = expand(args.prefix)
     elif want and re.match(r"^\d+\.\d+\.\d+$", want):
-        prefix = default_prefix(want, scraper)
+        prefix = default_prefix(want, scraper, opt_root)
     elif want and not re.match(r"^\d+\.\d+$", want):
         raise ToolError("--version takes X.Y or X.Y.Z of a BUILT interpreter here (got %r)" % want)
     else:
-        built = [b for b in newest_built_prefix(scraper) if verified(b[2])]
+        built = [b for b in newest_built_prefix(scraper, opt_root) if verified(b[2])]
         if want:
             built = [b for b in built if b[0][:2] == numver(want)]
         if not built:
             raise ToolError("no verified %sinterpreter built for %s under %s.  Run `build%s` first."
-                            % ("%s.x " % want if want else "", scraper_tag(scraper), expand(DEFAULT_OPT),
+                            % ("%s.x " % want if want else "", scraper_tag(scraper), expand(opt_root or DEFAULT_OPT),
                                " --version " + want if want else ""))
         prefix = built[0][1]
     if is_venv_dir(prefix):
         raise ToolError("%s is a venv, not an interpreter this tool built: --prefix wants e.g. %s"
-                        % (prefix, default_prefix("X.Y.Z", scraper)))
+                        % (prefix, default_prefix("X.Y.Z", scraper, opt_root)))
     if not os.access(os.path.join(prefix, "bin", "python3"), os.X_OK):
         raise ToolError("%s has no bin/python3 -- build it first" % prefix)
     rec = prefix_record(prefix)
@@ -3167,6 +4018,11 @@ def pick_prefix(args, scraper):
 
 
 def cmd_venv(args):
+    merge_args(args)
+    if args.purpose == "general":
+        raise UsageError("`venv` makes the scraper's .venv; --for general has no scraper.  A venv from the "
+                         "general build:  %s -m venv DIR" % os.path.join(expand(args.opt_root), CURRENT, "bin",
+                                                                         "python3"))
     scraper = expand(args.scraper)
     if not os.path.isdir(scraper):
         raise ToolError("%s is not there (drive not mounted?)" % scraper)
@@ -3841,7 +4697,45 @@ def run_check(python, scraper, workdir, offline=False, keep=False, label="check"
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def python_prefix(given):
+    """check --for general --python NAME|PATH -> the prefix that interpreter belongs to.  A
+    bare name is looked up on your PATH (as scraper mode does), a path is expanded -- never
+    a bare name taken against the current directory.  The binary's REAL path must be
+    <prefix>/bin/python3*, and that prefix's bin/python3 the same interpreter (verify checks
+    a prefix through it), so a link (a venv's python, a python3 on PATH) names the
+    interpreter it really is; cpython-current/bin/python3 stays cpython-current."""
+    path = expand(given) if os.sep in os.path.expanduser(given) else shutil.which(given)
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        raise ToolError("--python %s: not an executable%s" % (given, "" if os.sep in given else " on your PATH"))
+    real = os.path.realpath(path)
+    bindir, name = os.path.split(real)
+    if os.path.basename(bindir) != "bin" or not name.startswith("python3"):
+        raise UsageError("--python %s is %s: --for general checks a CPython prefix's bin/python3*" % (given, real))
+    prefix = os.path.dirname(bindir)
+    if not same_path(os.path.join(prefix, "bin", "python3"), real):
+        raise UsageError("--python %s is %s, but %s is another interpreter (or none): --for general checks a "
+                         "prefix through its bin/python3 -- give that one" % (given, real,
+                                                                            os.path.join(prefix, "bin", "python3")))
+    here = os.path.dirname(os.path.dirname(path))
+    return here if os.path.basename(os.path.dirname(path)) == "bin" and same_path(here, prefix) else prefix
+
+
 def cmd_check(args):
+    merge_args(args)
+    if args.purpose == "general":
+        # General mode has no scraper: `check` is `verify` of the interpreter (--python's
+        # prefix, else cpython-current), then the general smoke test in a throwaway venv.
+        args.prefix_arg = python_prefix(args.python) if args.python else None
+        rc = cmd_verify(args)
+        prefix = verify_target(args)
+        workdir = expand(args.workdir)
+        say("Does it make a working venv?")
+        os.makedirs(workdir, exist_ok=True)
+        good, why = general_smoke(os.path.join(prefix, "bin", "python3"),
+                                  tempfile.mkdtemp(prefix="check-", dir=workdir), keep=args.keep)
+        if not good:
+            bad("the general smoke test failed: %s" % why)
+        return 0 if rc == 0 and good else 1
     scraper = expand(args.scraper)
     if not os.path.isdir(scraper):
         raise ToolError("%s is not there (drive not mounted?)" % scraper)
@@ -3865,6 +4759,7 @@ def cmd_check(args):
 # ------------------------------------------------------------- other commands
 
 def cmd_versions(args):
+    merge_args(args)
     rels, source = get_releases()
     groups = by_series(rels)
     auto, why = pick_version(rels, "auto")
@@ -3881,24 +4776,178 @@ def cmd_versions(args):
                                                  " ".join(tags)))
     info("")
     info("auto: %s -- %s" % (auto["version"], why))
+    info("--for general: auto is latest: %s" % latest["version"])
+    return 0
+
+
+def python_answers(py):
+    """-> (runs, X.Y.Z): an interpreter is RUN -- a file proves nothing (build_everything.sh's
+    rule), and a build killed during `make install` leaves one."""
+    if not py or not os.path.isfile(py) or not os.access(py, os.X_OK):
+        return False, ""
+    try:
+        p = run([py, "-I", "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"], env=scrubbed_env(),
+                check=False, timeout=60)
+    except ToolError:
+        return False, ""
+    lines = (p.stdout or "").strip().splitlines()
+    return p.returncode == 0, (lines[-1].strip() if p.returncode == 0 and lines else "")
+
+
+def prefix_entry(path):
+    """One prefix -> the status contract's `installed` entry {name, version, prefix, runs,
+    built_by_tool, compiler, for}, + what this tool's record adds (verified, optimized,
+    built, binutils, the .comment proof)."""
+    good, ver = python_answers(os.path.join(path, "bin", "python3"))
+    rec = prefix_record(path) or {}
+    mine = str(rec.get("tool", "")).split()[:1] == [TOOL]
+    d = {"name": "cpython", "version": ver or (str(rec.get("version") or "") if mine else "") or None,
+         "prefix": path, "runs": good, "built_by_tool": mine,
+         "compiler": (rec.get("compiler") or None) if mine else None,
+         "for": (rec.get("for") or None) if mine else None}
+    d.update(verified=verified(rec) if mine else False, optimized=bool(rec.get("optimized")) if mine else None,
+             built=rec.get("built", "") if mine else "", binutils=rec.get("binutils", "") if mine else "",
+             compiler_proof=((rec.get("verify") or {}).get("compiler_proof") or "") if mine else "")
+    return d
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError):
+        return True                             # no pid recorded: the lock alone decides
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def build_summary(rec, held):
+    """A record in state.json -> (status, stage, error): done | running | killed (recorded
+    running, nobody holds the lock) | failed | interrupted | incomplete | new."""
+    st = rec.get("status") or ""
+    stage = rec.get("stage") or None
+    if st == "running":
+        return ("running" if held and pid_alive(rec.get("pid")) else "killed"), stage, rec.get("error") or None
+    if st in ("failed", "interrupted"):
+        return st, stage, rec.get("error") or ("interrupted" if st == "interrupted" else None)
+    if st == "done" or rec.get("verified"):
+        return "done", stage or "verify", None
+    if rec.get("make_done"):                    # a record from before the status was kept
+        return "incomplete", "install", None
+    if rec.get("configured"):
+        return "incomplete", "make", None
+    return "new", "source", None
+
+
+LEFTOVER = re.compile(r"\.(old|failed|partial)-")
+
+
+def status_data(opt_root, workdir):
+    """The toolkit's status contract (PLAN.md section 3), exactly, at the top level:
+    {tool, opt_root, current: {"cpython-current": TARGET|null}, installed: [{name, version,
+    prefix, runs, built_by_tool, compiler, for}], builds: [{id, status, stage, error}]} --
+    + workdir, link (cpython-current in detail), leftovers and the recent smoke tests.
+    Every <opt>/cpython-* prefix is listed, the scraper's builds too: "for" tells them
+    apart ("general", or the scraper's path).  A build's id is its record's key: the
+    version, or <version>-general."""
+    data = {"tool": TOOL, "opt_root": opt_root, "workdir": workdir, "current": {}, "installed": [],
+            "builds": [], "leftovers": []}
+    cur = os.path.join(opt_root, CURRENT)
+    target = os.path.realpath(cur) if os.path.lexists(cur) else None
+    data["current"][CURRENT] = target
+    for p in sorted(glob.glob(os.path.join(glob.escape(opt_root), "cpython-*"))):
+        base = os.path.basename(p)
+        if base in (CURRENT, CURRENT + ".new"):
+            continue
+        if LEFTOVER.search(base):
+            data["leftovers"].append({"path": p, "why": "set aside by a build (.old-/.failed-/.partial-): "
+                                                        "yours to delete once you do not need it"})
+            continue
+        if os.path.islink(p) or not os.path.isdir(p):
+            continue
+        if not os.path.lexists(os.path.join(p, "bin", "python3")):
+            data["leftovers"].append({"path": p, "why": "no bin/python3: not an installed prefix"})
+            continue
+        e = prefix_entry(p)
+        e["current"] = bool(target) and os.path.realpath(p) == target
+        data["installed"].append(e)
+    link = {"link": cur, "target": target or "", "is_link": os.path.islink(cur), "exists": os.path.lexists(cur),
+            "runs": False, "version": "", "built_by_tool": False, "for": None, "compiler": None}
+    if target and os.path.isdir(target):
+        e = prefix_entry(target)
+        link.update((k, e[k]) for k in ("runs", "built_by_tool", "for", "compiler"))
+        link["version"] = e["version"] or ""
+    data["link"] = link
+    rec = read_json(os.path.join(workdir, "state.json")) or {}      # read quietly: this may be printed as JSON
+    held = lock_is_held(workdir)
+    for key, b in sorted((rec.get("builds") or {}).items()):
+        if not isinstance(b, dict):
+            continue
+        status, stage, error = build_summary(b, held)
+        general = key.endswith(GENERAL_TAG)
+        data["builds"].append({"id": key, "status": status, "stage": stage, "error": error,
+                               "version": key[:-len(GENERAL_TAG)] if general else key,
+                               "for": b.get("for") or ("general" if general else "scraper"),
+                               "prefix": b.get("installed", ""), "started": b.get("started", "")})
+    data["checks"] = [c for c in (rec.get("checks") or []) if isinstance(c, dict)][-6:]
+    return data
+
+
+def show_status_general(data):
+    say("CPython in %s" % data["opt_root"])
+    cur = data["link"]
+    if cur["is_link"]:
+        (ok if cur["runs"] else bad)("%s -> %s  %s%s" % (
+            cur["link"], cur["target"], cur["version"] or "(does not run)",
+            "" if cur["built_by_tool"] else "  (not built by this tool)"))
+    elif cur["exists"]:
+        warn("%s is a real directory, not a link" % cur["link"])
+    else:
+        info("%s: not there" % cur["link"])
+    if not data["installed"]:
+        note("no cpython-* prefixes")
+    for p in data["installed"]:
+        who = ("this tool, for %s" % ("general use" if p["for"] == "general" else "the scraper")) \
+            if p["built_by_tool"] else "not this tool's"
+        (info if p["runs"] else warn)("  %-44s %-8s %s%s%s%s" % (
+            p["prefix"], p["version"] or "", who,
+            (", verify ok" if p["verified"] else ", NOT verified") if p["built_by_tool"] else "",
+            "  <- current" if p.get("current") else "", "" if p["runs"] else "  DOES NOT RUN"))
+    for p in data["leftovers"]:
+        note("left over: %s -- %s" % (p["path"], p["why"]))
+    if data["builds"]:
+        say("Builds recorded in %s" % data["workdir"])
+        for b in data["builds"]:
+            info("%-16s %s%s%s" % (b["id"], b["status"].upper(),
+                                   " at " + b["stage"] if b["stage"] and b["status"] != "done" else "",
+                                   ": " + b["error"] if b["error"] else ""))
     return 0
 
 
 def cmd_status(args):
+    merge_args(args)
+    if getattr(args, "json", False):
+        data = status_data(expand(args.opt_root), expand(args.workdir))
+        data["mode"] = args.purpose
+        emit_json(data)
+        return 0
+    if args.purpose == "general":
+        return show_status_general(status_data(expand(args.opt_root), expand(args.workdir)))
     scraper = expand(args.scraper)
     workdir = expand(args.workdir)
+    opt = expand(args.opt_root)
     say("Interpreters built for %s" % scraper_tag(scraper))
-    built = newest_built_prefix(scraper)
+    built = newest_built_prefix(scraper, opt)
     if not built:
-        note("none under %s" % expand(DEFAULT_OPT))
+        note("none under %s" % opt)
     for _, path, rec in built:
         v = rec.get("verify") or {}
         info("%-52s %s  built %s  %s  verify %s" % (path, rec.get("version", "?"), (rec.get("built") or "?")[:16],
                                                  "PGO+LTO" if rec.get("optimized") else "no PGO/LTO",
                                                  "ok" if v.get("good") else "FAILED"))
-    leftovers = sorted(glob.glob(os.path.join(glob.escape(expand(DEFAULT_OPT)), "cpython-*-%s.old-*"
+    leftovers = sorted(glob.glob(os.path.join(glob.escape(opt), "cpython-*-%s.old-*"
                                               % scraper_tag(scraper))) +
-                       glob.glob(os.path.join(glob.escape(expand(DEFAULT_OPT)), "cpython-*-%s.failed-*"
+                       glob.glob(os.path.join(glob.escape(opt), "cpython-*-%s.failed-*"
                                               % scraper_tag(scraper))))
     for path in leftovers:
         note("left over, yours to delete once you do not need it: %s" % path)
@@ -3906,9 +4955,10 @@ def cmd_status(args):
     info(describe_venv(os.path.join(scraper, ".venv")) if os.path.isdir(scraper) else
          "%s is not there (drive not mounted?)" % scraper)
     state = State(os.path.join(workdir, "state.json"))
-    if state.d["checks"]:
+    checks = [c for c in state.d["checks"] if c.get("for") != "general"]     # general mode's are its own
+    if checks:
         say("Recent smoke tests")
-        for c in state.d["checks"][-6:]:
+        for c in checks[-6:]:
             info("%s  %-4s  %s" % (c.get("when", "?")[:16], c.get("status", "?"), c.get("venv") or c.get("python")))
     say("Work directory %s" % workdir)
     if os.path.isdir(workdir):
@@ -3930,6 +4980,7 @@ def cmd_clean(args):
     """Only in a work directory that is demonstrably this tool's, and only the
     names this tool gives things: a mistyped --workdir must not cost anyone a
     directory."""
+    merge_args(args)
     workdir = expand(args.workdir)
     if not os.path.isdir(workdir):
         note("nothing to clean: %s does not exist" % workdir)
@@ -3964,46 +5015,551 @@ def cmd_clean(args):
     return 0
 
 
+# ------------------------------------------------------- detect, toolchains, verify
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path and (path == home or path.startswith(home + os.sep)) else path
+
+
+def cmd_detect(args):
+    merge_args(args)
+    m = detect_machine(args.opt_root)
+    if getattr(args, "json", False):
+        emit_json(m, default=str)
+        return 0
+    say("This machine")
+    info("%s, %s, %d CPUs, %.0f GB RAM (%.0f available), packages: %s"
+         % (m["os"], m["arch"], m["cpus"], m["mem_total_gb"], m["mem_avail_gb"], m["pkg_manager"] or "?"))
+    for name, target in sorted(m["current"].items()):
+        info("%-17s %s" % (name, target or "(not there)"))
+    say("Compilers")
+    for c in m["compilers"]:
+        info("%-5s %-10s %s%s  [%s]" % (c["kind"], vstr(c["version"]), tilde(c["path"]),
+                                       "  = " + tilde(c["real"]) if c["real"] != c["path"] else "", c["origin"]))
+    say("GNU binutils")
+    for b in m["binutils"]:
+        info("%-8s %s%s  [%s]" % (vstr(b["version"]), tilde(b["dir"]), "  (gold)" if b["gold"] else "", b["origin"]))
+    say("Pythons")
+    for py in m["pythons"]:
+        info("%-7s %-8s %s  [%s]%s" % (py["impl"], py["version"], tilde(py["path"]), py["origin"],
+                                      "  built by this tool for %s" % py["for"] if py["built_by_tool"] else ""))
+    say("Tools and headers (as %s sees them)" % (m["system_cc"] or "no compiler"))
+    info("tools   : " + " ".join("%s=%s" % (k, "yes" if v else "no") for k, v in sorted(m["tools"].items())))
+    info("headers : " + " ".join("%s=%s" % (k, "yes" if v else "no") for k, v in sorted(m["headers"].items())))
+    return 0
+
+
+def toolkit_pair(opt_root):
+    """What the toolkit's step 5 hands this tool: --cc and --binutils, the REAL paths of
+    <opt>/gcc-current and <opt>/binutils-current (or '' where a step has not run)."""
+    gcc = os.path.join(opt_root, "gcc-current", "bin", "gcc")
+    bdir = os.path.join(opt_root, "binutils-current")
+    return (real_tool_path(gcc) if os.access(gcc, os.X_OK) else "",
+            os.path.realpath(bdir) if os.access(os.path.join(bdir, "bin", "ld"), os.X_OK) else "")
+
+
+def cmd_toolchains(args):
+    merge_args(args)
+    opt = expand(args.opt_root)
+    comps, sets, pys = find_compilers(opt_root=opt), find_binutils(opt_root=opt), find_pythons(opt_root=opt)
+    try:
+        cc = pick_cc(args.cc or "")
+    except ToolError as e:
+        warn(str(e))
+        cc = ""
+    try:
+        bdir = binutils_dir(args.binutils or "")
+    except ToolError as e:
+        warn(str(e))
+        bdir = ""
+    try:
+        cxx, cxx_problem = choose_cxx(args.cxx or "", cc, bool(args.cc), args.purpose == "general")
+    except ToolError as e:
+        cxx, cxx_problem = "", str(e)
+    if cxx_problem:
+        warn(cxx_problem)
+    extra = [os.path.join(bdir, "bin")] if bdir else []
+    progs = prog_paths(cc, extra) if cc else {}
+    t_cc, t_bin = toolkit_pair(opt)
+    if getattr(args, "json", False):
+        emit_json({"tool": TOOL, "opt_root": opt, "compilers": comps, "binutils": sets, "pythons": pys,
+                   "chosen": {"cc": cc, "cxx": cxx, "binutils": bdir,
+                              "as": progs.get("as", ""), "ld": progs.get("ld", "")},
+                   "toolkit_step5": {"cc": t_cc, "binutils": t_bin}}, default=str)
+        return 0
+    say("Compilers  (--cc PATH; default: the system's gcc, %s)" % (which("gcc") or "none found"))
+    for c in comps:
+        out("  - %-5s %-10s %s%s%s" % (c["kind"], vstr(c["version"]), tilde(c["path"]),
+                                      "  = " + tilde(c["real"]) if c["real"] != c["path"] else "",
+                                      "    <- would be used" if cc and same_path(c["path"], cc) else ""))
+        tags = [c["origin"]]
+        if not c.get("cxx"):
+            tags.append("no C++ partner beside it")
+        if not getattr(args, "no_check", False):
+            good, why = compiler_works(c["path"], None, extra)
+            tags.append("builds and runs a C program" if good else
+                        "BROKEN in a clean environment: " + ((why or "?").strip().splitlines() or ["?"])[-1][:100])
+        out("        " + "; ".join(tags))
+    if cc and not any(same_path(c["path"], cc) for c in comps):
+        out("  - %s    <- would be used (--cc)" % cc)
+    if cc:
+        info("C++ (CXX): %s%s" % (tilde(cxx) or "none", "  (--cxx)" if args.cxx else ""))
+    say("GNU binutils  (--binutils DIR: its bin/ first on the build's PATH, its ar named to configure)")
+    for b in sets:
+        out("  - %-8s %s%s%s%s" % (vstr(b["version"]), tilde(b["dir"]),
+                                  "  = " + tilde(b["prefix"]) if not b["system"] and
+                                  b["prefix"] != os.path.dirname(b["dir"]) else "",
+                                  "  (gold)" if b["gold"] else "",
+                                  "    <- would be used" if bdir and same_path(os.path.join(bdir, "bin"), b["dir"]) else
+                                  "    (the system's)" if b["system"] else ""))
+    if cc:
+        info("%s would run  as %s  and  ld %s" % (tilde(cc), progs.get("as") or "?", progs.get("ld") or "?"))
+    say("Pythons")
+    for py in pys:
+        out("  - %-7s %-8s %s%s" % (py["impl"], py["version"], tilde(py["path"]),
+                                   "  [this tool's, for %s]" % py["for"] if py["built_by_tool"] else
+                                   "  [%s]" % py["origin"]))
+    say("The toolkit's step 5 (build python, the latest, with that gcc/binutils)")
+    if t_cc and t_bin:
+        info("--for general --cc %s --binutils %s" % (t_cc, t_bin))
+    else:
+        info("%s not there yet: the toolkit's steps 3 (binutils) and 4 (gcc) come first" % " and ".join(
+            n for n, v in (("gcc-current", t_cc), ("binutils-current", t_bin)) if not v))
+    return 0
+
+
+def verify_target(args):
+    """verify's PREFIX: as given, else <opt>/cpython-current."""
+    p = getattr(args, "prefix_arg", None)
+    return expand(p) if p else os.path.join(expand(args.opt_root), CURRENT)
+
+
+def cmd_verify(args):
+    """The post-install checks against any prefix (default cpython-current).  A prefix this
+    tool built for general use must also carry, in its .comment, the compiler it records."""
+    merge_args(args)
+    prefix = verify_target(args)
+    real = os.path.realpath(prefix)
+    if not os.access(os.path.join(prefix, "bin", "python3"), os.X_OK):
+        raise ToolError("%s has no bin/python3 to verify" % prefix)
+    rec = prefix_record(real) or {}
+    as_json = getattr(args, "json", False)
+    say("Verify %s%s" % (prefix, "  (-> %s)" % real if real != prefix else ""))
+    if rec:
+        info("built by %s for %s, compiler %s" % (rec.get("tool", "?"), rec.get("for", "?"), rec.get("compiler", "?")))
+    else:
+        note("not built by this tool: no record of what built it")
+    expect = rec.get("compiler_banner", "") if rec.get("for") == "general" else ""
+    good, vsum = verify_interpreter(real, offline=getattr(args, "offline", False), quiet=as_json,
+                                    expect_compiler=expect)
+    if rec and os.geteuid() != 0 and os.access(real, os.W_OK):
+        rec["verify"] = vsum                    # what `venv` and `status` read; an unverified install stays one
+        try:
+            write_atomic(os.path.join(real, MARKER), json.dumps(rec, indent=1, sort_keys=True) + "\n")
+        except OSError as e:
+            warn("could not record the result in %s: %s" % (real, e))
+    if as_json:
+        emit_json({"tool": TOOL, "prefix": prefix, "real": real, "good": good, "built_by_tool": bool(rec),
+                   "for": rec.get("for") if rec else None, "summary": vsum})
+    elif good:
+        ok("%s verifies" % prefix)
+    else:
+        bad("%s does NOT verify (see above)" % prefix)
+    return 0 if good else 1
+
+
+# --------------------------------------------------- options, profiles, the wizard
+
+DEFAULTS = {"purpose": "scraper", "scraper": DEFAULT_SCRAPER, "workdir": DEFAULT_WORKDIR, "opt_root": DEFAULT_OPT,
+            "version": None, "prefix": None, "cc": "", "cxx": "", "binutils": "", "jobs": 0, "no_optimize": False,
+            "link_current": None, "constraints": ""}
+# What a profile holds: the CHOICES.  Never --rebuild, --yes, --install-deps, --offline:
+# those belong to one run.
+PROFILE_KEYS = ("purpose", "version", "scraper", "workdir", "opt_root", "prefix", "cc", "cxx", "binutils", "jobs",
+                "constraints")
+PROFILE_FLAGS = ("no_optimize", "link_current")
+PROFILE_NAMES = {"purpose": "for", "no_optimize": "optimize"}   # how they are spelled in the file
+PROFILE_HEADER = "# %s profile" % TOOL
+PATH_KEYS = ("scraper", "workdir", "opt_root", "prefix", "cc", "cxx", "binutils", "constraints")
+
+
+def merge_args(args):
+    """Defaults, then the profile (--profile), then the command line -- onto args itself, so
+    every command reads args.<name> as it always has.  Idempotent; checked."""
+    if getattr(args, "_merged", False):
+        return args
+    prof = load_profile(args.profile) if getattr(args, "profile", None) else {}
+    for k, d in DEFAULTS.items():
+        if getattr(args, k, None) is None:
+            setattr(args, k, prof.get(k, d))
+    check_args(args)
+    args._merged = True
+    return args
+
+
+def check_args(args):
+    if args.purpose not in FOR_CHOICES:
+        raise UsageError("--for is scraper or general, not %r" % args.purpose)
+    try:
+        args.jobs = int(args.jobs or 0)
+    except (TypeError, ValueError):
+        raise UsageError("--jobs is a number")
+    if args.jobs < 0:
+        raise UsageError("--jobs is a number >= 1 (0 = one per CPU)")
+    return args
+
+
+def profiles_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), TOOL, "profiles")
+
+
+def profile_path(name, must_exist=False):
+    """A bare name lives in the profiles directory; anything with a slash is a path."""
+    name = os.path.expanduser(name)
+    if os.sep in name or (must_exist and os.path.isfile(name)):
+        return name
+    base = os.path.join(profiles_dir(), name)
+    if must_exist:
+        return next((c for c in (base, base + ".ini") if os.path.isfile(c)), base + ".ini")
+    return base if base.endswith(".ini") else base + ".ini"
+
+
+def load_profile(path):
+    path = profile_path(path, must_exist=True)
+    cp = configparser.RawConfigParser()
+    try:
+        read = cp.read(path)
+    except configparser.Error:
+        read = []
+    if not read or not cp.has_section("build"):
+        raise ToolError("cannot read profile %s (no [build] section?)" % path)
+    spelled = dict((v, k) for k, v in PROFILE_NAMES.items())
+    vals = {}
+    for k, v in cp.items("build"):
+        k = spelled.get(k, k)
+        yes = v.strip().lower() in ("yes", "true", "1", "on")
+        if k == "no_optimize":
+            vals[k] = not yes                   # spelled "optimize = yes|no" in the file
+        elif k in PROFILE_FLAGS:
+            vals[k] = yes
+        elif k == "jobs":
+            vals[k] = int(v) if v.strip().isdigit() else 0
+        elif k in PROFILE_KEYS:
+            vals[k] = v if v != "" or k not in ("version", "prefix") else None
+    return vals
+
+
+def profile_values(args):
+    return dict((k, getattr(args, k, DEFAULTS.get(k))) for k in PROFILE_KEYS + PROFILE_FLAGS)
+
+
+def save_profile(name, args):
+    cp = configparser.RawConfigParser()
+    cp.add_section("build")
+    v = profile_values(args)
+    for k in PROFILE_KEYS:
+        value = v[k] if v[k] is not None else ""
+        if k in PATH_KEYS and value and (os.sep in str(value) or str(value).startswith("~")):
+            value = os.path.abspath(os.path.expanduser(value))   # replayed from any directory
+        cp.set("build", PROFILE_NAMES.get(k, k), str(value))
+    cp.set("build", "optimize", "no" if v["no_optimize"] else "yes")
+    if v["link_current"] is not None:                         # None: the mode's default
+        cp.set("build", "link_current", "yes" if v["link_current"] else "no")
+    path = profile_path(name)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        f.write("%s.  Replay with:  %s.py build --profile %s\n"
+                % (PROFILE_HEADER, TOOL, os.path.basename(path)[:-4] if os.path.dirname(path) == profiles_dir() else path))
+        cp.write(f)
+    info("profile saved: %s" % path)
+    return path
+
+
+def profile_summary(v):
+    general = v.get("purpose") == "general"
+    return "%s | CPython %s | cc %s%s | binutils %s | %s%s" % (
+        "general" if general else "scraper " + scraper_tag(v.get("scraper") or DEFAULT_SCRAPER),
+        v.get("version") or ("latest" if general else "auto"), tilde(v.get("cc") or "") or "system",
+        " (c++ %s)" % tilde(v["cxx"]) if v.get("cxx") else "",
+        tilde(v.get("binutils") or "") or "system", "no PGO/LTO" if v.get("no_optimize") else "PGO+LTO",
+        " | cpython-current" if (v.get("link_current") if v.get("link_current") is not None else general) else "")
+
+
+def list_profiles():
+    found = []
+    try:
+        names = sorted(os.listdir(profiles_dir()))[:500]
+    except OSError:
+        names = []
+    for n in names:
+        path = os.path.join(profiles_dir(), n)
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > 8192:
+                continue
+            with open(path, "r", errors="replace") as f:
+                if not f.readline().startswith(PROFILE_HEADER):
+                    continue
+            vals = load_profile(path)
+        except (OSError, ToolError):
+            continue
+        found.append({"name": n[:-4] if n.endswith(".ini") else n, "path": path,
+                      "mtime": os.path.getmtime(path), "values": vals, "summary": profile_summary(vals)})
+    found.sort(key=lambda pr: -pr["mtime"])
+    return found
+
+
+def refuse_root(what):
+    if os.geteuid() == 0:
+        raise ToolError("do not %s as root: it builds, installs and makes venvs as you, and root-owned files would "
+                        "be left in your home.  Only --install-deps uses sudo, by itself." % what)
+
+
+def cmd_profiles(args):
+    merge_args(args)
+    profs = list_profiles()
+    say("Saved profiles  (%s)" % profiles_dir())
+    if not profs:
+        info("none yet: the wizard offers to save one, and so does --save-profile NAME")
+    for pr in profs:
+        out("  %-24s %s   %s" % (pr["name"], time.strftime("%Y-%m-%d %H:%M", time.localtime(pr["mtime"])),
+                                 pr["summary"]))
+    return 0
+
+
+def ask(prompt, default=""):
+    try:
+        ans = input("%s [%s]: " % (prompt, default)).strip()
+    except EOFError:
+        ans = ""
+    return ans or default
+
+
+def ask_choice(title, options, default):
+    """options: [(key, label)].  Accepts the number or the key."""
+    if default not in [k for k, _ in options]:
+        options = list(options) + [(default, "as given on the command line / in the profile")]
+    out("\n" + _c("1", title))
+    for i, (key, label) in enumerate(options, 1):
+        out("  %2d) %-10s %s%s" % (i, key, label, "   <- default" if key == default else ""))
+    while True:
+        ans = ask("choose", default)
+        if ans.isdigit() and 1 <= int(ans) <= len(options):
+            return options[int(ans) - 1][0]
+        if ans in [k for k, _ in options]:
+            return ans
+        out("  a number from the list, or one of the keys")
+
+
+def ask_yes(prompt, default):
+    return ask(prompt + " (y/n)", "y" if default else "n").lower().startswith("y")
+
+
+def choose_profile(profs):
+    """The FIRST thing the wizard shows.  -> {path, name, as_is} or None (new)."""
+    if not profs:
+        return None
+    say("Saved profiles")
+    for i, pr in enumerate(profs, 1):
+        out("  %2d) %-24s %s" % (i, pr["name"], pr["summary"]))
+    out("   n) new -- answer the questions")
+    while True:
+        ans = ask("profile", "1")
+        if ans.lower() in ("n", "new"):
+            return None
+        pick = profs[int(ans) - 1] if ans.isdigit() and 1 <= int(ans) <= len(profs) else \
+            next((pr for pr in profs if pr["name"] == ans), None)
+        if pick:
+            break
+        out("  a number from the list, a profile's name, or n")
+    how = ask("use it as it is, or edit it? (u/e)", "u")
+    return {"path": pick["path"], "name": pick["name"], "as_is": not how.lower().startswith("e")}
+
+
+def wizard(args, detect=None):
+    """Every question is also a flag, and every answer can be saved as a profile.  Enter
+    through all of them builds what the flags (or the profile) already say; in general
+    mode the default compiler and binutils are <opt>/gcc-current and binutils-current
+    when they run -- the toolkit's step 5."""
+    detect = detect or detect_machine
+    args.purpose = ask_choice("What is this CPython for?", [
+        ("general", "general use (the toolkit's step 5): the latest CPython in <opt>/cpython-<ver>, cpython-current"),
+        ("scraper", "claude_scraper: <opt>/cpython-<ver>-<dir>, proved by running the scraper's smoke test")],
+        args.purpose)
+    general = args.purpose == "general"
+    if not general:
+        args.scraper = ask("the scraper's directory", args.scraper)
+    args.version = ask("CPython version: latest, auto (%s), X.Y or X.Y.Z" % (
+        "= latest in general mode" if general else "waits for a new series' X.Y.1"),
+        args.version or ("latest" if general else "auto"))
+    args.opt_root = ask("where prefixes and cpython-current live (--opt-root)", args.opt_root)
+    machine = detect(args.opt_root)
+    opt = expand(args.opt_root)
+    t_cc, t_bin = toolkit_pair(opt)
+
+    out("\n" + _c("1", "The compiler that builds it (--cc)"))
+    comps = machine["compilers"]
+    for i, c in enumerate(comps, 1):
+        out("  %2d) %-5s %-10s %s%s" % (i, c["kind"], vstr(c["version"]), tilde(c["path"]),
+                                       "  = " + tilde(c["real"]) if c["real"] != c["path"] else ""))
+    out("   s) the system's gcc (%s)" % (machine.get("system_cc") or "none found"))
+    pick = args.cc or (t_cc if general else "")
+    default = next((str(i) for i, c in enumerate(comps, 1) if pick and same_path(c["real"], pick)), pick or "s")
+    while True:
+        ans = ask("compiler: a number, s, or a path", default)
+        if ans.lower() in ("s", "system"):
+            args.cc = ""
+            break
+        if ans.isdigit() and 1 <= int(ans) <= len(comps):
+            args.cc = comps[int(ans) - 1]["real"]
+            break
+        if os.sep in ans and compiler_info(os.path.expanduser(ans)):
+            args.cc = real_tool_path(ans)
+            break
+        out("  a number from the list, s, or the path of a gcc")
+
+    # The C++ compiler is asked only when there is something to decide: no partner beside
+    # the chosen compiler (general mode refuses that for a chosen --cc), or a --cxx given.
+    partner = cxx_partner(args.cc or machine.get("system_cc") or "")
+    if args.cxx or not partner:
+        out("\n" + _c("1", "The C++ compiler that goes with it (--cxx)"))
+        out("   a) the one beside the compiler: %s" % (tilde(partner) if partner else
+                                                      "NONE there%s" % (" -- general mode refuses that: give a path"
+                                                                        if general and args.cc else "")))
+        while True:
+            ans = ask("C++ compiler: a, or a path", args.cxx or "a")
+            if ans.lower() in ("a", "auto"):
+                args.cxx = ""
+                break
+            try:
+                args.cxx = pick_cc(ans, "--cxx")
+                break
+            except ToolError as e:
+                out("  " + str(e))
+
+    out("\n" + _c("1", "The as / ld / ar it builds with (--binutils)"))
+    sets = [b for b in machine["binutils"] if not b["system"]]
+    for i, b in enumerate(sets, 1):
+        out("  %2d) %-8s %s%s" % (i, vstr(b["version"]), tilde(b["dir"]),
+                                 "  = " + tilde(b["prefix"]) if b["prefix"] != os.path.dirname(b["dir"]) else ""))
+    out("   n) none: the system's (whatever the compiler finds on /usr/bin)")
+    pick = args.binutils or (t_bin if general else "")
+    default = next((str(i) for i, b in enumerate(sets, 1) if pick and same_path(b["prefix"], pick)), pick or "n")
+    while True:
+        ans = ask("binutils: a number, n, or a directory", default)
+        if ans.lower() in ("n", "none", "system"):
+            args.binutils = ""
+            break
+        if ans.isdigit() and 1 <= int(ans) <= len(sets):
+            args.binutils = sets[int(ans) - 1]["prefix"]
+            break
+        try:
+            args.binutils = binutils_dir(ans)
+            break
+        except ToolError as e:
+            out("  " + str(e))
+
+    args.no_optimize = not ask_yes("PGO + LTO (10-25 minutes; n = a few minutes, for trying the tool out)",
+                                   not args.no_optimize)
+    args.link_current = ask_yes("point %s at it once it has verified?" % os.path.join(tilde(opt), CURRENT),
+                                general if args.link_current is None else bool(args.link_current))
+    name = ask("save these answers as a profile? (a name, or empty)", getattr(args, "_profile_name", ""))
+    if name:
+        save_profile(name, check_args(args))
+    return args
+
+
+def cmd_wizard(args):
+    if getattr(args, "yes", False):
+        merge_args(args)
+        note("--yes: nothing asked -- %s" % profile_summary(profile_values(args)))
+        return cmd_build(args)
+    if not sys.stdin.isatty():
+        out("Not a terminal: nothing to ask.  Use `build` with flags or --profile (or wizard --yes); see --help.")
+        return 2
+    reuse = choose_profile(list_profiles())
+    if reuse:
+        args.profile = reuse["path"]
+    merge_args(args)
+    if reuse:
+        args._profile_name = reuse["name"]
+    if not (reuse and reuse["as_is"]):
+        wizard(args)
+    check_args(args)
+    return cmd_build(args)
+
+
 # ------------------------------------------------------------------------- main
 
 def add_common(p):
-    p.add_argument("--scraper", default=DEFAULT_SCRAPER, help="the scraper directory (default %(default)s)")
-    p.add_argument("--workdir", default=DEFAULT_WORKDIR, help="downloads, build trees, logs (default %(default)s)")
+    """On EVERY subcommand (the toolkit's child contract): --yes, --opt-root, --for, ..."""
+    g = p.add_argument_group("common")
+    g.add_argument("--for", dest="purpose", choices=FOR_CHOICES,
+                   help="scraper (default): for claude_scraper; general: the toolkit's step 5 (latest CPython, "
+                        "<opt>/cpython-<ver>, cpython-current)")
+    g.add_argument("--opt-root", dest="opt_root", help="where prefixes and cpython-current live (default ~/opt)")
+    g.add_argument("--scraper", help="the scraper directory (default %s)" % DEFAULT_SCRAPER)
+    g.add_argument("--workdir", help="downloads, build trees, logs (default %s)" % DEFAULT_WORKDIR)
+    g.add_argument("--profile", help="load choices from a saved profile (a name, or a path)")
+    g.add_argument("--yes", "-y", action="store_true", help="ask nothing (the wizard takes every default)")
 
 
 def add_build_options(p):
     add_common(p)
     p.add_argument("--version", default=None,
-                   help="auto (default): newest release of the newest series that has had a bugfix release; "
-                        "latest; X.Y; or X.Y.Z")
-    p.add_argument("--prefix", help="install here (default ~/opt/cpython-<version>-<scraper dir name>)")
-    p.add_argument("--cc", default="", help="C compiler (default: the system gcc, /usr/bin/gcc)")
-    p.add_argument("--jobs", type=int, default=0, help="make -j (default: every CPU)")
-    p.add_argument("--no-optimize", dest="no_optimize", action="store_true",
+                   help="auto (default): newest release of the newest series that has had a bugfix release "
+                        "(--for general: auto is latest); latest; X.Y; or X.Y.Z")
+    p.add_argument("--prefix", help="install here (default <opt>/cpython-<version>-<scraper dir name>; "
+                                    "--for general: <opt>/cpython-<version>)")
+    p.add_argument("--cc", default=None, help="C compiler, by name or PATH (default: the system gcc, /usr/bin/gcc); "
+                                              "its directory is taken by its real path")
+    p.add_argument("--cxx", default=None, help="C++ compiler, by name or PATH (default: the one beside --cc, e.g. "
+                                               "g++ beside gcc; --for general refuses a --cc without one)")
+    p.add_argument("--binutils", default=None, help="DIR: a binutils prefix (step 3's, by real path); its bin/ goes "
+                                                    "first on the build's PATH and its ar is named to configure")
+    p.add_argument("--jobs", type=int, default=None, help="make -j (default: every CPU)")
+    p.add_argument("--no-optimize", dest="no_optimize", action="store_true", default=None,
                    help="skip PGO + LTO: a build in minutes instead of ~15, for trying the tool out")
+    p.add_argument("--link-current", "--activate", dest="link_current", action="store_true", default=None,
+                   help="point <opt>/cpython-current at the result once verified (default in --for general)")
+    p.add_argument("--no-link-current", "--no-activate", dest="link_current", action="store_false", default=None,
+                   help="leave cpython-current alone (default in --for scraper)")
     p.add_argument("--install-deps", dest="install_deps", action="store_true",
-                   help="sudo dnf/apt install the missing development packages first")
+                   help="sudo dnf/apt-get/zypper/pacman install the missing development packages first")
     p.add_argument("--offline", action="store_true", help="skip the HTTPS checks")
-    p.add_argument("--constraints", default="", help="pip constraints file for the scraper's packages "
+    p.add_argument("--constraints", default=None, help="pip constraints file for the scraper's packages "
                    "(e.g. `pip freeze` of the old environment, to keep its versions)")
     p.add_argument("--verbose", action="store_true", help="stream configure/make output")
+    p.add_argument("--save-profile", dest="save_profile", help="save this run's choices under a name")
+
+
+def add_build_run_options(sp):
+    sp.add_argument("--rebuild", action="store_true", help="replace an existing prefix (the old one is kept until "
+                                                           "the new one verifies)")
+    sp.add_argument("--no-check", dest="no_check", action="store_true",
+                    help="no smoke test afterwards (the scraper's; --for general: the venv one)")
+    sp.add_argument("--keep", action="store_true", help="keep the smoke test's throwaway copy / venv")
+    sp.add_argument("--dry-run", dest="dry_run", action="store_true", help="the plan; build nothing")
 
 
 def build_parser():
     p = argparse.ArgumentParser(prog=TOOL + ".py", description="Build a CPython 3 for claude_scraper -- its "
-                                "own prefix, its own pip -- and prove it runs the scraper.")
+                                "own prefix, its own pip -- and prove it runs the scraper; or, with --for general, "
+                                "the latest CPython with a given gcc/binutils (the satellite toolkit's step 5).")
     p.add_argument("--tool-version", action="version", version="%s %s" % (TOOL, VERSION))
     sub = p.add_subparsers(dest="command")
-    sp = sub.add_parser("doctor", help="preflight: what is missing, and the command that installs it")
+    sp = sub.add_parser("doctor", help="preflight: what is missing, and the command that installs it ([--json])")
     add_build_options(sp)
+    sp.add_argument("--json", action="store_true", help="the toolkit's doctor contract, as JSON on stdout")
     sp = sub.add_parser("plan", help="resolve the version, paths and configure line; build nothing")
     add_build_options(sp)
-    sp = sub.add_parser("build", help="download, configure, make (PGO+LTO), install, verify, smoke-test the scraper")
+    sp = sub.add_parser("build", help="download, configure, make (PGO+LTO), install, verify, smoke-test "
+                                      "(the scraper's, or --for general a venv's), link cpython-current")
     add_build_options(sp)
-    sp.add_argument("--rebuild", action="store_true", help="replace an existing prefix (the old one is kept until "
-                                                           "the new one verifies)")
-    sp.add_argument("--no-check", dest="no_check", action="store_true", help="do not try the scraper afterwards")
-    sp.add_argument("--keep", action="store_true", help="keep the smoke test's throwaway copy")
+    add_build_run_options(sp)
+    sp = sub.add_parser("wizard", help="ask the questions, then build (what you get with no command on a terminal)")
+    add_build_options(sp)
+    add_build_run_options(sp)
     sp = sub.add_parser("venv", help="(re)make the scraper's .venv from the built interpreter, install its "
                                      "requirements, smoke-test it")
     add_common(sp)
@@ -4012,23 +5568,52 @@ def build_parser():
     sp.add_argument("--venv", help="make it here instead of <scraper>/.venv")
     sp.add_argument("--replace", action="store_true", help="replace an existing venv made from another Python "
                                                            "(it is kept as .venv.replaced-<date>)")
-    sp.add_argument("--constraints", default="", help="pip constraints file (pin the packages' versions)")
+    sp.add_argument("--constraints", default=None, help="pip constraints file (pin the packages' versions)")
     sp.add_argument("--offline", action="store_true", help="skip the HTTPS check")
     sp.add_argument("--keep", action="store_true", help="keep the smoke test's throwaway copy")
-    sp = sub.add_parser("check", help="smoke-test a venv or interpreter against the scraper (read-only for it)")
+    sp = sub.add_parser("check", help="smoke-test a venv or interpreter against the scraper (read-only for it); "
+                                      "--for general: verify + the venv smoke test")
     add_common(sp)
     sp.add_argument("--venv", help="the venv to test (default <scraper>/.venv)")
     sp.add_argument("--python", help="test this interpreter instead of a venv (it needs the packages installed)")
     sp.add_argument("--offline", action="store_true", help="skip the HTTPS check")
     sp.add_argument("--keep", action="store_true", help="keep the throwaway copy")
-    sp = sub.add_parser("status", help="what is built, what the scraper's .venv uses, recent smoke tests")
+    sp = sub.add_parser("verify", help="the post-install checks against a prefix (default <opt>/cpython-current)")
     add_common(sp)
+    sp.add_argument("prefix_arg", metavar="PREFIX", nargs="?", help="an interpreter prefix (holds bin/python3)")
+    sp.add_argument("--offline", action="store_true", help="skip the HTTPS check")
+    sp.add_argument("--json", action="store_true", help="the result as JSON on stdout")
+    sp = sub.add_parser("status", help="what is built where, cpython-current, the builds, recent smoke tests")
+    add_common(sp)
+    sp.add_argument("--json", action="store_true", help="the toolkit's status contract, as JSON on stdout")
     sp = sub.add_parser("versions", help="CPython releases on python.org, and what auto picks")
+    add_common(sp)
     sp.add_argument("--count", type=int, default=6)
+    sp = sub.add_parser("detect", help="what this machine has: OS, compilers, binutils, pythons, headers")
+    add_common(sp)
+    sp.add_argument("--json", action="store_true", help="as JSON on stdout")
+    sp = sub.add_parser("toolchains", help="every compiler, binutils set and python found (<opt>/*-current too); "
+                                           "which would be used")
+    add_common(sp)
+    sp.add_argument("--cc", default=None, help="the compiler a build would be given")
+    sp.add_argument("--cxx", default=None, help="the C++ compiler a build would be given (default: beside --cc)")
+    sp.add_argument("--binutils", default=None, help="the binutils prefix a build would be given")
+    sp.add_argument("--no-check", dest="no_check", action="store_true", help="do not test-compile with each")
+    sp.add_argument("--json", action="store_true", help="as JSON on stdout")
+    sp = sub.add_parser("profiles", help="saved profiles")
+    add_common(sp)
     sp = sub.add_parser("clean", help="remove source/build trees and throwaway copies (never a prefix or venv)")
     add_common(sp)
     sp.add_argument("--all", action="store_true", help="downloads, logs and the record too")
     return p
+
+
+COMMANDS = {"doctor": cmd_doctor, "plan": cmd_plan, "build": cmd_build, "wizard": cmd_wizard, "venv": cmd_venv,
+            "check": cmd_check, "verify": cmd_verify, "status": cmd_status, "versions": cmd_versions,
+            "detect": cmd_detect, "toolchains": cmd_toolchains, "profiles": cmd_profiles, "clean": cmd_clean}
+# These write into your home (the work directory, a prefix, a venv): never as root.  The
+# rest only look; doctor without --json makes the work directory, so it says so itself.
+ROOT_REFUSED = ("build", "plan", "wizard", "venv", "check", "clean")
 
 
 def _as_interrupt(signum, frame):
@@ -4039,24 +5624,41 @@ def main(argv=None):
     # Here or on another machine (--local / --remote / --attach / --sessions): taken out first.
     argv = where_to_run(list(sys.argv[1:] if argv is None else argv), __file__, TOOL)
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if os.geteuid() == 0:
-        out(_c("31", "ERROR:") + " do not run this as root: it builds, installs and makes venvs as you, and "
-            "root-owned files would be left in your home.  Only --install-deps uses sudo, by itself.")
-        return 1
+    if not any(a in COMMANDS for a in argv) and sys.stdin.isatty() and sys.stdout.isatty() \
+            and not any(a in ("-h", "--help", "--tool-version", "--yes", "-y") for a in argv):
+        argv = ["wizard"] + argv                      # no command, a terminal: the wizard
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
     if not args.command:
         parser.print_help()
         out("\nStart with:  %s doctor" % (sys.argv[0] or TOOL + ".py"))
         return 2
+    if os.geteuid() == 0 and args.command in ROOT_REFUSED:
+        out(_c("31", "ERROR:") + " do not run this as root: it builds, installs and makes venvs as you, and "
+            "root-owned files would be left in your home.  Only --install-deps uses sudo, by itself.")
+        return 1
     # SIGTERM / SIGHUP take the ^C path so a finally runs and the record is right;
     # a SIGHUP somebody chose to ignore (`nohup ... &`) stays ignored.
     for sig in (signal.SIGTERM, signal.SIGHUP):
         if signal.getsignal(sig) != signal.SIG_IGN:
             signal.signal(sig, _as_interrupt)
+    saved = (UI.stream, UI.tty, UI.color)
+    if getattr(args, "json", False):
+        json_mode()
     try:
-        return {"doctor": cmd_doctor, "plan": cmd_plan, "build": cmd_build, "venv": cmd_venv,
-                "check": cmd_check, "status": cmd_status, "versions": cmd_versions,
-                "clean": cmd_clean}[args.command](args)
+        return run_command(args)
+    finally:
+        UI.stream, UI.tty, UI.color = saved
+
+
+def run_command(args):
+    try:
+        return COMMANDS[args.command](args)
+    except UsageError as e:
+        out("\n" + _c("31", "ERROR:") + " " + str(e))
+        return 2
     except ToolError as e:
         out("\n" + _c("31", "ERROR:") + " " + str(e))
         return 1

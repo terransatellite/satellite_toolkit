@@ -15,6 +15,8 @@ it without taking over the boot menu.
     ./enterprise_linux_kernel_tool.py build --kernel 6.12 --modules trimmed
     ./enterprise_linux_kernel_tool.py install --source ~/src/linux-7.2.6
     ./enterprise_linux_kernel_tool.py dkms-check --source ~/src/linux-7.2.6
+    ./enterprise_linux_kernel_tool.py dkms-cap         cap amdgpu-dkms (install does it too)
+    ./enterprise_linux_kernel_tool.py status --json    what is installed (doctor --json too)
 
 Standard library only, and the SYNTAX is held to Python 3.6 so RHEL 8's
 platform interpreter can run it: no walrus, no `capture_output=`, no
@@ -1159,6 +1161,7 @@ def where_to_run(argv, tool_file, tool_name, upload=None, entry=None, before=Non
 class UI(object):
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     tty = sys.stdout.isatty()
+    stream = None             # None: stdout.  With --json, stderr: stdout is the JSON alone.
 
 
 def _c(code, text):
@@ -1166,11 +1169,26 @@ def _c(code, text):
 
 
 def out(text=""):
+    s = UI.stream or sys.stdout
     try:
-        print(text)
+        s.write(text + "\n")
     except UnicodeEncodeError:      # a C locale meeting U+FFFD from errors="replace"
-        print(text.encode("ascii", "replace").decode("ascii"))
+        s.write(text.encode("ascii", "replace").decode("ascii") + "\n")
+    s.flush()
+
+
+def emit_json(data, default=None, indent=1):
+    """The one thing --json puts on stdout."""
+    sys.stdout.write(json.dumps(data, indent=indent, sort_keys=True, default=default) + "\n")
     sys.stdout.flush()
+
+
+def json_mode():
+    """--json (the toolkit contract): stdout is the JSON and nothing else; every message,
+    an ERROR included, goes to stderr."""
+    UI.stream = sys.stderr
+    UI.tty = False
+    UI.color = sys.stderr.isatty() and "NO_COLOR" not in os.environ
 
 
 def say(msg):
@@ -1196,7 +1214,7 @@ def bad(msg):
 def warn(msg):
     # stdout, not stderr: with both redirected to one log file the two streams
     # interleave out of order, and a warning that lands three sections late is
-    # worse than no warning.
+    # worse than no warning.  (With --json everything is on stderr, together.)
     out(_c("33", "warning:") + " " + msg)
 
 
@@ -2161,6 +2179,10 @@ TOOL_GLOBS = ("/usr/local/bin", "/opt/*/bin", "/opt/*/*/bin", "~/opt/*/bin", "~/
               "/usr/lib/llvm-*/bin", "/usr/lib64/llvm*/bin", "/opt/rh/*/root/usr/bin",
               "/opt/intel/oneapi/compiler/*/bin", "/opt/rocm/bin", "/opt/rocm/llvm/bin",
               "/opt/AMD/aocc-compiler-*/bin", "/opt/nvidia/hpc_sdk/Linux_*/*/compilers/bin")
+# The satellite toolkit's prefixes, <opt-root>/<name>-<version>/bin and <name>-current: ~/opt
+# (above) unless --opt-root names another, which is then searched as well, ahead of it.  This
+# tool installs nothing there; it only looks.
+OPT_ROOT = ["~/opt"]
 TRIPLE_ARCH = {"ppc64le": "powerpc64le", "ppc64": "powerpc64", "armv7l": "arm", "i686": "i"}
 
 
@@ -2183,14 +2205,20 @@ def vstr(v):
     return ".".join(str(x) for x in v) if v else "?"
 
 
-def tool_search_dirs(root="/", home=None, path_env=None):
+def tool_search_dirs(root="/", home=None, path_env=None, opt_root=None):
     """/usr/bin first, so a system tool is met under its plain name before any
-    alias of it; then the caller's PATH, in their order; then TOOL_GLOBS."""
+    alias of it; then the caller's PATH, in their order; then TOOL_GLOBS, with
+    --opt-root's <dir>/*/bin in front of ~/opt's."""
     home = os.path.expanduser("~") if home is None else home
     path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    opt_root = OPT_ROOT[0] if opt_root is None else opt_root
+    pats = [home + p[1:] if p.startswith("~") else rp(root, p) for p in TOOL_GLOBS]
+    if opt_root and opt_root.rstrip("/") != "~/opt":
+        # A directory named on the command line: a real path, never under a fake `root`.
+        opt = home + opt_root[1:] if opt_root.startswith("~") else os.path.abspath(opt_root)
+        pats.insert(TOOL_GLOBS.index("~/opt/*/bin"), os.path.join(glob.escape(opt), "*", "bin"))
     dirs = [rp(root, "usr/bin")] + [d for d in path_env.split(":") if d]
-    for pat in TOOL_GLOBS:
-        pat = home + pat[1:] if pat.startswith("~") else rp(root, pat)
+    for pat in pats:
         dirs.extend(sorted(glob.glob(pat)))
     seen, res = set(), []
     for d in dirs:
@@ -2313,6 +2341,12 @@ def llvm_companions(clang_path):
     d, name = os.path.split(clang_path)
     m = re.match(r"^clang(-\d+(?:\.\d+)*)$", name)
     suffix = m.group(1) if m else ""
+    if suffix and not all(os.access(os.path.join(d, t + suffix), os.X_OK) for t in LLVM_TOOLS) \
+            and os.path.realpath(os.path.join(d, "clang")) == os.path.realpath(clang_path):
+        # An upstream LLVM install: bin/clang-21 is the file, bin/clang a link to it, and
+        # ld.lld, llvm-ar ... carry no suffix.  The realpath of <opt>/clang-current/bin/clang
+        # (what the satellite toolkit passes) ends in clang-21: it is that prefix's clang.
+        suffix = ""
     if not all(os.access(os.path.join(d, t + suffix), os.X_OK) for t in LLVM_TOOLS):
         return None
     on_path = os.path.realpath(d) in [os.path.realpath(x) for x in SYSTEM_PATH[:4]]
@@ -2370,6 +2404,10 @@ def cxx_partner(cc_path):
     if not m:
         return ""
     cand = os.path.join(d, ("g++" if m.group(1) == "gcc" else "clang++") + (m.group(2) or ""))
+    if m.group(2) and not os.access(cand, os.X_OK) \
+            and os.path.realpath(os.path.join(d, m.group(1))) == os.path.realpath(cc_path):
+        # bin/clang-21 reached through the realpath of bin/clang: the partner is bin/clang++
+        cand = os.path.join(d, "g++" if m.group(1) == "gcc" else "clang++")
     return cand if os.access(cand, os.X_OK) else ""
 
 
@@ -2526,6 +2564,178 @@ def dkms_modules(root="/"):
     return mods
 
 
+# ------------------------------------------------------------- the amdgpu-dkms cap
+
+# fix-amdgpu-dkms.sh, generalised: it capped ONE pinned package (6.19.14-2364437.el10) at
+# "6.18".  Here: every /usr/src/amdgpu-*/dkms.conf, at the series it serves + .999 -- the
+# rule dkms_check() has always printed -- because dkms compares versions so that 6.18.52
+# sorts ABOVE "6.18": the legacy value excluded every point release of the very series the
+# package was installed for.
+AMDGPU_CONFS = "usr/src/amdgpu-*/dkms.conf"
+CAP_KEY = "BUILD_EXCLUSIVE_KERNEL_MAX"
+CAP_BACKUP = ".pre-elkt-dkms-cap"
+CAP_COMMENT = """
+# Added by %s dkms-cap, %s.  Kernels after %s are built with the in-tree
+# amdgpu as a MODULE (CONFIG_DRM_AMDGPU=m), newer than this package, which does not build
+# against them; dkms skips every kernel that sorts ABOVE this cap.  The file as it was
+# before: %s
+"""
+
+
+def amdgpu_cap_for(kernels, running, series=""):
+    """BUILD_EXCLUSIVE_KERNEL_MAX for an amdgpu-dkms package: the series of the newest
+    kernel it is built or installed for (else the running one) + '.999' -- dkms skips a
+    kernel that sorts ABOVE the cap, and 6.12.5 sorts above '6.12'.  SERIES (--max) names
+    the series instead; a full X.Y.Z is taken as it is."""
+    if series:
+        return series if series.count(".") >= 2 else series + ".999"
+    return series_of(max(list(kernels) or [running], key=version_key)) + ".999"
+
+
+def amdgpu_dkms_packages(root="/", dkms=None):
+    """Every amdgpu-dkms here, one per /usr/src/amdgpu-<version>/dkms.conf -> [{version,
+    conf, real, text, limits, kernels, registered}].  `real` is the file behind the name:
+    AMD's packaging makes dkms.conf a SYMLINK into amd/dkms/, and the cap goes into the
+    file, the backup is a copy of the file (build_everything.sh learned that `cp -a`
+    copies the link -- a 'backup' that then shows the modified text)."""
+    dkms = dkms_modules(root) if dkms is None else dkms
+    pkgs = []
+    for conf in sorted(glob.glob(rp(root, AMDGPU_CONFS))):
+        ver = os.path.basename(os.path.dirname(conf))[len("amdgpu-"):]
+        real = os.path.realpath(conf)
+        if not os.path.isfile(real) or not os.access(real, os.R_OK):
+            warn("%s: %s -- left alone" % (conf, "cannot be read" if os.path.isfile(real)
+                                          else "a link to nothing (%s)" % real))
+            continue
+        text = read_text(real)
+        reg = next((m for m in dkms if m["name"] == "amdgpu" and m["version"] == ver), None)
+        pkgs.append({"version": ver, "conf": conf, "real": real, "text": text,
+                     "limits": parse_dkms_conf(text), "kernels": (reg or {}).get("kernels", []),
+                     "registered": reg is not None})
+    return pkgs
+
+
+def cap_amdgpu_dkms(pkgs, running, series="", force=False, dry=False, root="/", before_write=None):
+    """Cap each package: a DEREFERENCED backup <real>.pre-elkt-dkms-cap, once (the first one
+    is what the vendor shipped); BUILD_EXCLUSIVE_KERNEL_MAX="<cap>" appended to the real file
+    -- an existing value is left as it is unless `force`; then the stale build directory a
+    failed DKMS build leaves, /var/lib/dkms/amdgpu/<version>/build, removed (never `dkms
+    remove`: a scoped remove that finds no state is a needless risk to the kernels that use
+    it).  sudo for each write -- `before_write()` once, first; with `dry` the commands are
+    printed instead.  A failed write is said, and the next package still gets its turn.
+    -> [{version, conf, real, backup, max_before, max_after, action, build_removed, error}]"""
+    results, primed = [], [False]
+
+    def write(cmd, **kw):
+        if before_write and not dry and not primed[0]:
+            before_write()
+            primed[0] = True
+        return sudo(cmd, dry=dry, **kw)
+
+    for p in pkgs:
+        label = "amdgpu/%s" % p["version"]
+        have = p["limits"].get(CAP_KEY)
+        cap = amdgpu_cap_for([k for k, _ in p["kernels"]], running, series)
+        backup = p["real"] + CAP_BACKUP
+        res = {"version": p["version"], "conf": p["conf"], "real": p["real"], "backup": backup,
+               "max_before": have, "max_after": have, "action": "", "build_removed": False,
+               "error": ""}
+        results.append(res)
+        lost = [k for k, st in p["kernels"] if st == "installed"
+                and version_key(k)[:3] > version_key(cap)[:3]]
+        try:
+            if have and not force:
+                res["action"] = "kept"
+                ok("%s: already capped, %s=\"%s\" -- left as it is (--force replaces it)"
+                   % (label, CAP_KEY, have))
+            elif lost and not force:
+                res["action"], res["error"] = "refused", "would exclude " + ", ".join(lost)
+                bad("%s: a cap of %s would exclude %s, which it is INSTALLED for -- not capped.  "
+                    "--max a higher series, or --force" % (label, cap, ", ".join(lost)))
+            elif have == cap:
+                res["action"] = "kept"
+                ok("%s: already capped at %s" % (label, cap))
+            else:
+                if os.path.lexists(backup):
+                    note("%s: the backup is already there, %s -- kept (the first one is the "
+                         "vendor's file)" % (label, backup))
+                else:
+                    write(["cp", "-aL", p["real"], backup])
+                    (info if dry else ok)("%s: %s %s" % (label, "backup would go to" if dry
+                                                         else "backup ->", backup))
+                if have:
+                    text = re.sub(r"^%s=.*$" % CAP_KEY, '%s="%s"' % (CAP_KEY, cap), p["text"], flags=re.M)
+                    write(["tee", p["real"]], capture=True, stdin_data=text)
+                    res["action"] = "replaced"
+                else:
+                    block = ("" if p["text"].endswith("\n") or not p["text"] else "\n") + CAP_COMMENT % (
+                        TOOL, time.strftime("%Y-%m-%d"), cap[:-4] if cap.endswith(".999") else cap,
+                        backup) + '%s="%s"\n' % (CAP_KEY, cap)
+                    write(["tee", "-a", p["real"]], capture=True, stdin_data=block)
+                    res["action"] = "capped"
+                    if dry:
+                        for line in block.strip("\n").splitlines():
+                            info("     | " + line)
+                res["max_after"] = cap
+                (info if dry else ok)("%s: %s=\"%s\" %s %s%s" % (
+                    label, CAP_KEY, cap, "would go into" if dry else "is now in", p["real"],
+                    "  (was \"%s\")" % have if have else ""))
+            build = rp(root, "var/lib/dkms/amdgpu/%s/build" % p["version"])
+            if os.path.isdir(build) and not os.path.islink(build):
+                write(["rm", "-rf", build])
+                res["build_removed"] = True
+                (info if dry else ok)("%s: %s the stale %s (what a failed build leaves)"
+                                      % (label, "would remove" if dry else "removed", build))
+        except ToolError as e:
+            res["action"], res["error"] = "failed", str(e).splitlines()[0]
+            bad("%s: %s" % (label, res["error"]))
+    return results
+
+
+def dkms_status_lines():
+    """`dkms status`, as it says it (a non-root caller can read it)."""
+    if not which("dkms", path=":".join(SYSTEM_PATH)):
+        return []
+    try:
+        p = run(["dkms", "status"], check=False, env=scrubbed_env(), timeout=120)
+    except ToolError as e:
+        return ["(dkms status: %s)" % str(e).splitlines()[0]]
+    return [l for l in (p.stdout or "").splitlines() if l.strip()]
+
+
+def cap_before_install(machine, release, dry=False, root="/"):
+    """PLAN.md section 4 and build_everything.sh's stage order: the cap goes on BEFORE the
+    kernel's own `make install`, whose hooks run `dkms autoinstall` for the new release --
+    when a registered amdgpu-dkms would otherwise try (and fail) to build for it.  Inside the
+    install's sudo session.  -> the results of cap_amdgpu_dkms(), [] when nothing needed it."""
+    regs = [m for m in machine.get("dkms") or [] if m["name"] == "amdgpu"
+            and dkms_will_build(m.get("limits") or {}, release)[0]]
+    if not regs:
+        return []
+    todo = []
+    for p in amdgpu_dkms_packages(root, dkms=machine.get("dkms") or []):
+        if not any(m["version"] == p["version"] for m in regs):
+            continue
+        cap = amdgpu_cap_for([k for k, _ in p["kernels"]], machine["running"])
+        if p["limits"].get(CAP_KEY):
+            note("amdgpu/%s has its own cap, %s=\"%s\", and DKMS will build it for %s: left as "
+                 "it is" % (p["version"], CAP_KEY, p["limits"][CAP_KEY], release))
+        elif dkms_will_build(dict(p["limits"], **{CAP_KEY: cap}), release)[0]:
+            note("amdgpu/%s: %s is in the series it serves (%s) -- DKMS builds it for this kernel "
+                 "too; not capped" % (p["version"], release, cap))
+        else:
+            todo.append(p)
+    if not todo:
+        return []
+    say("amdgpu-dkms would try -- and fail -- to build for %s: capping it first (dkms-cap)" % release)
+    results = cap_amdgpu_dkms(todo, machine["running"], dry=dry, root=root)
+    for r in results:
+        for m in machine.get("dkms") or []:
+            if m["name"] == "amdgpu" and m["version"] == r["version"] and r["max_after"]:
+                m["limits"] = dict(m.get("limits") or {}, **{CAP_KEY: r["max_after"]})
+    return results
+
+
 def detect_machine():
     osr = parse_os_release(read_text("/etc/os-release"))
     devs = scan_pci()
@@ -2542,6 +2752,7 @@ def detect_machine():
     return {
         "os": osr.get("PRETTY_NAME", osr.get("ID", "unknown")),
         "os_id": osr.get("ID", ""), "os_like": osr.get("ID_LIKE", ""),
+        "os_version": osr.get("VERSION_ID", ""),
         "arch": os.uname().machine, "running": os.uname().release,
         "pkg_manager": find_pkg_manager(),
         "cpu": {"vendor": cpu["vendor"], "model": cpu["model"],
@@ -3290,9 +3501,13 @@ def resolve_toolchain(opts, machine=None):
     else:
         if binutils != "gnu":
             bdir = os.path.abspath(os.path.expanduser(binutils))
+            if not all(os.access(os.path.join(bdir, t), os.X_OK) for t in ("ld", "as")) \
+                    and all(os.access(os.path.join(bdir, "bin", t), os.X_OK) for t in ("ld", "as")):
+                # A PREFIX (the satellite toolkit's contract: <opt>/binutils-<ver>), not its bin/
+                bdir = os.path.join(bdir, "bin")
             if not all(os.access(os.path.join(bdir, t), os.X_OK) for t in ("ld", "as")):
                 raise ToolError("--binutils %s: no ld and as in that directory (expected "
-                                "auto, gnu, llvm or a binutils bin directory)" % binutils)
+                                "auto, gnu, llvm, a binutils bin directory or its prefix)" % binutils)
             if os.path.realpath(bdir) != os.path.realpath("/usr/bin"):
                 extra.append(bdir)
         sysgcc = ci["real"] == os.path.realpath("/usr/bin/gcc")
@@ -4141,14 +4356,15 @@ def dkms_check(tree, toolchain, machine, release=""):
             warn("%s has no kernel cap: DKMS will try to build it for %s.  Vendor "
                  "amdgpu-dkms targets older enterprise kernels; against a newer one "
                  "it usually fails, noisily but harmlessly -- the in-tree driver is "
-                 "the newer of the two.  To make DKMS skip it:\n"
-                 "      echo 'BUILD_EXCLUSIVE_KERNEL_MAX=\"%s.999\"' | sudo tee -a "
+                 "the newer of the two.  To make DKMS skip it -- `install` does this "
+                 "itself, first; `%s.py dkms-cap` does it now, with a backup:\n"
+                 "      echo 'BUILD_EXCLUSIVE_KERNEL_MAX=\"%s\"' | sudo tee -a "
                  "/usr/src/%s-%s/dkms.conf\n"
                  "  (DKMS skips kernels that sort ABOVE the cap, and 6.12.5 sorts above "
                  "'6.12' -- hence .999, to keep every release of the series it works on.)"
-                 % (label, release,
-                    series_of(max([k for k, _ in m["kernels"]] or [machine["running"]],
-                                  key=version_key)), m["name"], m["version"]))
+                 % (label, release, TOOL,
+                    amdgpu_cap_for([k for k, _ in m["kernels"]], machine["running"]),
+                    m["name"], m["version"]))
         else:
             note("%s: DKMS will rebuild it for %s at install time" % (label, release))
     return dkms_ok or not needed
@@ -4526,11 +4742,16 @@ class SudoKeepalive(object):
         self._stop.set()
 
 
-def sudo(cmd, check=True, capture=False, dry=False):
+def sudo(cmd, check=True, capture=False, dry=False, stdin_data=None):
+    """stdin_data: what `sudo tee` writes -- the password, when sudo asks, comes from the
+    terminal, never from stdin."""
     if dry:
         info("would run: sudo " + " ".join(shlex.quote(c) for c in cmd))
         return None
-    return run(["sudo"] + cmd, check=check, capture=capture, interactive=not capture)
+    if stdin_data is not None:
+        capture = True
+    return run(["sudo"] + cmd, check=check, capture=capture, interactive=not capture,
+               stdin_data=stdin_data)
 
 
 def install_preflight(machine, opts, release="", tree=""):
@@ -4592,6 +4813,298 @@ def set_default(path, dry=False):
     return dry or grubby_default() == path
 
 
+# Debian and Ubuntu have no grubby.  `make install` runs installkernel, whose zz-update-grub
+# hook rewrites grub.cfg -- and with GRUB_DEFAULT=0, the stock setting, entry 0 boots the
+# NEWEST kernel by version: a newer kernel built here becomes the default just by sorting
+# first.  grubby's "read the default, put it back" has no equivalent there: GRUB remembers an
+# entry only with GRUB_DEFAULT=saved.  This tool changes /etc/default/grub for that ONLY when
+# asked to (--keep-boot-default), and otherwise says, before and after, what will happen.
+GRUB_CFGS = ("boot/grub/grub.cfg", "boot/grub2/grub.cfg")
+GRUB_ENVS = ("boot/grub/grubenv", "boot/grub2/grubenv")
+GRUB_MENU_LINE = re.compile(r"^(submenu|menuentry)\s+(['\"])(.*?)\2(.*)\{\s*$")
+GRUB_LINUX_LINE = re.compile(r"^linux(?:efi|16)?\s+\S*?/vmlinu[xz]-(\S+)")
+
+
+def grub_default_setting(root="/"):
+    """-> (GRUB_DEFAULT's value, the file that sets it or '').  update-grub reads
+    /etc/default/grub, then each /etc/default/grub.d/*.cfg: the last assignment wins.
+    Unset or empty is 0 (grub-mkconfig's own rule)."""
+    val, src = "0", ""
+    for f in [rp(root, "etc/default/grub")] + sorted(glob.glob(rp(root, "etc/default/grub.d/*.cfg"))):
+        for line in read_text(f).splitlines():
+            m = re.match(r"^\s*(?:export\s+)?GRUB_DEFAULT=(.*)$", line)
+            if not m:
+                continue
+            try:
+                words = shlex.split(m.group(1), comments=True)
+            except ValueError:
+                words = [m.group(1).strip().strip("\"'")]
+            val, src = (words[0] if words else "") or "0", f
+    return val, src
+
+
+def grub_menu(text):
+    """grub.cfg -> its menu as a tree: [{kind: menuentry|submenu, title, id, release,
+    children}].  Blocks that are neither (`function load_video {`) are followed only so
+    their closing brace closes the right thing."""
+    top = {"kind": "", "children": []}
+    stack = [top]
+    for line in text.splitlines():
+        s = line.strip()
+        m = GRUB_MENU_LINE.match(s)
+        if m:
+            mid = re.search(r"\$menuentry_id_option\s+(['\"])(.*?)\1", m.group(4))
+            node = {"kind": m.group(1), "title": m.group(3), "id": mid.group(2) if mid else m.group(3),
+                    "release": "", "children": []}
+            stack[-1]["children"].append(node)
+            stack.append(node)
+        elif s.endswith("{"):
+            stack.append({"kind": "", "children": []})
+        elif s.startswith("}"):
+            if len(stack) > 1:
+                stack.pop()
+        elif stack[-1]["kind"] == "menuentry" and not stack[-1]["release"]:
+            k = GRUB_LINUX_LINE.match(s)
+            if k:
+                stack[-1]["release"] = k.group(1)
+    return top["children"]
+
+
+def grub_find(items, ref, descend=True):
+    """The menuentry a GRUB_DEFAULT / saved_entry value names: numbers, ids and titles,
+    joined by '>' through submenus.  A submenu boots its first entry (with `descend` False:
+    the submenu itself).  None if absent."""
+    level, node = items, None
+    for part in (ref or "0").split(">"):
+        part = part.strip()
+        if part.isdigit():
+            node = level[int(part)] if int(part) < len(level) else None
+        else:
+            node = next((n for n in level if part in (n["id"], n["title"])), None)
+        if node is None:
+            return None
+        level = node["children"]
+    while descend and node is not None and node["kind"] == "submenu":
+        node = node["children"][0] if node["children"] else None
+    return node
+
+
+def grub_entries(items, parents=()):
+    """-> [(menuentry, ref)], depth first; ref is what grub-set-default takes: the ids of
+    the submenus and the entry, joined by '>'."""
+    res = []
+    for n in items:
+        ids = tuple(parents) + (n["id"],)
+        if n["kind"] == "submenu":
+            res.extend(grub_entries(n["children"], ids))
+        else:
+            res.append((n, ">".join(ids)))
+    return res
+
+
+def grub_env(root="/"):
+    """grubenv's variables (saved_entry ...): a file every user can read on Debian."""
+    for f in GRUB_ENVS:
+        text = read_text(rp(root, f))
+        if text:
+            return dict(l.split("=", 1) for l in text.splitlines() if "=" in l and not l.startswith("#"))
+    return {}
+
+
+def boot_images(root="/"):
+    """The releases that have a kernel image in /boot (rescue images aside), oldest first."""
+    rels = set()
+    for pat in ("boot/vmlinuz-*", "boot/vmlinux-*", "boot/kernel-*"):
+        for p in glob.glob(rp(root, pat)):
+            rel = os.path.basename(p).split("-", 1)[1]
+            if not rel.startswith("0-rescue") and not rel.endswith((".old", ".bak")):
+                rels.add(rel)
+    # 6.8.0-9-generic before 6.8.0-45-generic: the numbers after x.y.z count too, as numbers
+    return sorted(rels, key=lambda r: (version_key(r), [int(x) if x.isdigit() else x
+                                                        for x in re.split(r"(\d+)", r)]))
+
+
+def grub_outlook(release="", root="/", cfg_text=None):
+    """How GRUB picks its default on a machine without grubby, and what installing RELEASE
+    does to that.  -> {setting, source, saved_entry, cfg, readable, current, follows_newest,
+    moves, becomes_default (True / False / None = cannot tell), keep_ref, root}.
+
+    follows_newest: the default is an entry that boots whatever kernel sorts first -- entry 0
+    (GRUB_DEFAULT=0, saved with nothing saved, a saved entry that IS that first entry), the
+    'Advanced options' submenu itself, named by number, id or title (GRUB boots a submenu's
+    first entry), or, counted by number, the first entry inside it.  Counted by number
+    anywhere else in the kernel list the default MOVES when a kernel sorts in above it; named
+    by id or title it stays.  keep_ref: the entry of the kernel booted by default NOW, by its
+    own id (inside 'Advanced options'), for grub-set-default."""
+    setting, source = grub_default_setting(root)
+    saved = grub_env(root).get("saved_entry", "").strip()
+    cfg = next((rp(root, c) for c in GRUB_CFGS if os.path.exists(rp(root, c))), "")
+    text = cfg_text if cfg_text is not None else read_text(cfg)
+    items = grub_menu(text) if text else []
+    ref = (saved or "0") if setting == "saved" else setting
+    # What counts is the LAST part: it picks inside its level ('1>gnulinux-6.8.0-45-...'
+    # names that kernel's own entry, through a submenu counted by number, and stays).
+    numeric = ref.split(">")[-1].strip().isdigit()
+    if items:
+        entry = grub_find(items, ref)
+        named = grub_find(items, ref, descend=False)
+        if entry is None:                    # GRUB's own fallback: entry 0
+            entry, named, numeric = grub_find(items, "0"), items[0], True
+        # A submenu as the default -- '1', 'gnulinux-advanced-UUID', 'Advanced options for
+        # Ubuntu' alike -- boots its FIRST entry: the newest kernel, whichever that is then.
+        submenu = named is not None and named["kind"] == "submenu"
+        firsts = [items[0]] + [n["children"][0] for n in items if n["kind"] == "submenu" and n["children"]]
+        follows = entry is not None and (entry is items[0] or submenu
+                                         or (numeric and any(entry is f for f in firsts)))
+        moves = numeric and not follows and bool(entry and entry["release"])
+        current = entry["release"] if entry else ""
+    else:
+        follows, moves = ref == "0", False   # stock Debian: entry 0 is the newest kernel
+        current = (boot_images(root)[-1:] or [""])[0] if follows else ""
+    others = [r for r in boot_images(root) if r != release]
+
+    def cmp(a, b):
+        a, b = version_key(a)[:3], version_key(b)[:3]
+        return (a > b) - (a < b)
+    if not (follows or moves) or (release and current == release):
+        becomes = False
+    elif not release:
+        becomes = None
+    elif moves:                              # a number into the kernel list: what it counts shifts
+        becomes = None if cmp(release, current) >= 0 else False
+    elif not others or cmp(release, others[-1]) > 0:
+        becomes = True
+    elif cmp(release, others[-1]) == 0:
+        becomes = None                       # 6.8.0-elkt against 6.8.0-45-generic: sort -V decides
+    else:
+        becomes = False
+    first = items[0] if items else None
+    keep = [r for e, r in grub_entries(items) if current and e["release"] == current and e is not first
+            and "recovery" not in (e["id"] + e["title"]).lower()]
+    return {"setting": setting, "source": source, "saved_entry": saved, "cfg": cfg,
+            "readable": bool(text), "current": current, "follows_newest": follows, "moves": moves,
+            "becomes_default": becomes, "keep_ref": keep[0] if keep else "", "root": root}
+
+
+def debian_grub_outlook(machine, release=""):
+    """grub_outlook() where it applies -- no grubby, and Debian's update-grub with an
+    /etc/default/grub to read -- else None."""
+    if (machine.get("boot") or {}).get("grubby") or not os.path.isfile("/etc/default/grub") \
+            or not which("update-grub", path=":".join(SYSTEM_PATH)):
+        return None
+    return grub_outlook(release)
+
+
+def grub_keep_commands(o):
+    """What a person runs to keep the current default: what --keep-boot-default does."""
+    cmds = []
+    if o["setting"] != "saved":
+        f = o["source"] or rp(o["root"], "etc/default/grub")
+        if o["root"] != "/":
+            f = "/" + os.path.relpath(f, o["root"])
+        cmds.append("sudo cp -a %s %s.bak-$(date +%%Y%%m%%d)" % (f, f))
+        # `export GRUB_DEFAULT=0` and an indented line count too, as keep_grub_default() has it
+        cmds.append("sudo sed -i -E 's/^([[:space:]]*(export[[:space:]]+)?)GRUB_DEFAULT=.*/"
+                    "\\1GRUB_DEFAULT=saved/' %s" % f if o["source"]
+                    else "echo GRUB_DEFAULT=saved | sudo tee -a %s" % f)
+    cmds.append("sudo grub-set-default %s" % shlex.quote(o["keep_ref"]) if o["keep_ref"] else
+                "sudo grub-set-default '<the entry of %s: sudo grep -E \"submenu|menuentry\" "
+                "/boot/grub/grub.cfg>'" % (o["current"] or "the kernel you boot now"))
+    cmds.append("sudo update-grub")
+    return cmds
+
+
+def warn_grub_default(o, release, after=False):
+    """Loud, with the exact commands, when RELEASE becomes (or may become) the default."""
+    if not o or o["becomes_default"] is False:
+        return
+    label = "GRUB_DEFAULT=" + (o["setting"] if o["setting"] != "saved" else
+                               "saved, saved_entry=%s" % (o["saved_entry"] or "(nothing)"))
+    if o["moves"]:
+        how = ("%s here COUNTS entries in the kernel list, and %s sorts in above %s: the count "
+               "moves" % (label, release or "the new kernel", o["current"]))
+    else:
+        how = ("%s here: that entry boots the NEWEST kernel, and %s %s" % (
+            label, release or "the new kernel", "sorts first" if o["becomes_default"] else "may sort first"))
+    sure = o["becomes_default"]
+    warn("%s -- %s the DEFAULT boot entry.\n  To keep %s the default%s:\n      %s"
+         % (how, ("it IS now" if sure else "it may now be") if after else
+            ("once installed it becomes" if sure else "once installed it may become"),
+            o["current"] or "the kernel you boot now",
+            "" if after else " -- `install --keep-boot-default` does this -- or after the install, "
+                             "before you reboot",
+            "\n      ".join(grub_keep_commands(o))))
+
+
+def keep_grub_problem(o, entry=True, refusing="installing"):
+    """'' or why --keep-boot-default cannot keep O's default: what keep_grub_default() refuses,
+    asked by `build --install` too, BEFORE the build.  `entry` False: grub.cfg could not be
+    read (0400, with a password in it), so whether it has an entry to pin waits for the
+    install, which reads it with sudo."""
+    cfg = o["cfg"] or "/boot/grub/grub.cfg"
+    if entry and not o["keep_ref"]:
+        return ("--keep-boot-default: %s has no entry of its own for %s, so there is "
+                "nothing to pin -- NOT %s.  Look:  sudo grep -E 'submenu|menuentry' %s"
+                % (cfg, o["current"] or "the kernel booted now", refusing, cfg))
+    dfile = rp(o["root"], "etc/default/grub")
+    if o["setting"] != "saved" and o["source"] and os.path.realpath(o["source"]) != os.path.realpath(dfile):
+        return ("--keep-boot-default: GRUB_DEFAULT=%s is set in %s, which wins over "
+                "/etc/default/grub -- this tool changes only /etc/default/grub.  Set "
+                "GRUB_DEFAULT=saved there, or install without --keep-boot-default"
+                % (o["setting"], o["source"]))
+    return ""
+
+
+def keep_grub_default(o, dry=False):
+    """--keep-boot-default where there is no grubby: GRUB_DEFAULT=saved (a dated backup of
+    /etc/default/grub first), grub-set-default to the entry that boots now, update-grub.
+    BEFORE `make install`: one that dies half way leaves the old default too.  Raises when
+    it cannot -- and then nothing is installed, since keeping the default was asked for."""
+    why = keep_grub_problem(o)
+    if why:
+        raise ToolError(why)
+    dfile = rp(o["root"], "etc/default/grub")
+    if o["setting"] != "saved":
+        text = read_text(dfile)
+        backup = "%s.elkt-%s" % (dfile, time.strftime("%Y%m%d-%H%M%S"))
+        sudo(["cp", "-a", dfile, backup], dry=dry)
+        (info if dry else ok)("backup of /etc/default/grub: %s" % backup)
+        if re.search(r"^\s*(?:export\s+)?GRUB_DEFAULT=", text, re.M):
+            new = re.sub(r"^(\s*(?:export\s+)?)GRUB_DEFAULT=.*$", r"\1GRUB_DEFAULT=saved", text, flags=re.M)
+        else:
+            new = text + ("" if text.endswith("\n") or not text else "\n") + "GRUB_DEFAULT=saved\n"
+        sudo(["tee", dfile], stdin_data=new, dry=dry)
+        (info if dry else ok)("GRUB_DEFAULT=saved in /etc/default/grub (it was %s)" % o["setting"])
+    sudo(["grub-set-default", o["keep_ref"]], dry=dry)
+    sudo(["update-grub"], capture=True, dry=dry)
+    (info if dry else ok)("default boot entry pinned to %s: %s" % (o["current"], o["keep_ref"]))
+
+
+def default_boot_release(root="/", grubby=None):
+    """The release this machine boots by default, as far as an unprivileged look can tell --
+    '' when it cannot (EL keeps grubenv root's).  For `status`: no sudo, quick."""
+    if grubby is None:
+        grubby = root == "/" and bool(which("grubby", path=":".join(SYSTEM_PATH)))
+    if grubby:
+        try:
+            p = run(["grubby", "--default-kernel"], check=False, env=scrubbed_env(), timeout=20)
+        except ToolError:
+            p = None
+        for line in reversed((p.stdout or "").splitlines() if p else []):
+            m = re.match(r"^/boot/vmlinu[xz]-(\S+)$", line.strip())
+            if m and os.path.isfile(rp(root, line.strip())):
+                return m.group(1)
+    saved = grub_env(root).get("saved_entry", "").strip()
+    bls = rp(root, "boot/loader/entries/%s.conf" % saved) if saved and "/" not in saved else ""
+    if bls and os.path.isfile(bls):          # EL / Fedora: saved_entry names a BLS entry
+        m = re.search(r"^version\s+(\S+)", read_text(bls), re.M) or \
+            re.search(r"^linux\s+\S*?/vmlinu[xz]-(\S+)", read_text(bls), re.M)
+        return m.group(1) if m else ""
+    if os.path.isfile(rp(root, "etc/default/grub")) and not grubby:
+        return grub_outlook(root=root)["current"]
+    return ""
+
+
 CHECK_CAVEATS = "/usr/libexec/microcode_ctl/check_caveats"
 
 
@@ -4626,6 +5139,12 @@ def install_kernel(tree, mk, machine, vendors, release, opts, state):
     say("Install preflight")
     install_preflight(machine, opts, release, tree)
     grubby = machine["boot"]["grubby"]
+    deb = None if grubby else debian_grub_outlook(machine, release)
+    if deb and not opts.get("keep_boot_default") and not opts["set_default"]:
+        warn_grub_default(deb, release)             # before anything is written: said, loudly
+    elif opts.get("keep_boot_default") and not grubby and not deb:
+        note("--keep-boot-default: no grubby and no update-grub here -- nothing this tool can pin; "
+             "check which entry your bootloader defaults to before you reboot")
     keep = SudoKeepalive()
     if not dry:
         keep.start()
@@ -4636,6 +5155,35 @@ def install_kernel(tree, mk, machine, vendors, release, opts, state):
         elif grubby and not dry:
             warn("grubby could not name the current default boot entry, so it cannot be put "
                  "back afterwards: installkernel may leave the NEW kernel as the default.")
+        pinned = False
+        if deb and opts.get("keep_boot_default"):
+            if not deb["readable"] and not dry:          # a grub.cfg with a password in it is 0400
+                p = sudo(["cat", deb["cfg"] or "/boot/grub/grub.cfg"], check=False, capture=True)
+                if p is not None and p.returncode == 0:
+                    deb = grub_outlook(release, root=deb["root"], cfg_text=p.stdout or "")
+            if deb["becomes_default"] is False:
+                ok("GRUB_DEFAULT=%s: %s stays the default boot entry -- nothing to pin"
+                   % (deb["setting"], deb["current"] or "the entry booted now"))
+            else:
+                say("Keeping the default boot entry (--keep-boot-default)")
+                keep_grub_default(deb, dry)
+                pinned = True
+        # build_everything.sh's stage order: the amdgpu-dkms cap BEFORE the kernel's own
+        # `make install`, whose hooks run `dkms autoinstall` for the new release.
+        if opts.get("no_dkms_cap"):
+            if any(m["name"] == "amdgpu" and dkms_will_build(m.get("limits") or {}, release)[0]
+                   for m in machine.get("dkms") or []):
+                note("--no-dkms-cap: amdgpu-dkms is left as it is, and DKMS will try to build it "
+                     "for %s" % release)
+        else:
+            try:
+                capped = cap_before_install(machine, release, dry)
+            except ToolError as e:
+                capped = [{"action": "failed", "error": str(e).splitlines()[0]}]
+            if any(r["action"] in ("failed", "refused") for r in capped):
+                warn("the amdgpu-dkms cap did not apply everywhere -- going on: it is a mitigation, "
+                     "not a dependency.  If DKMS then fails against %s, `%s.py dkms-cap` again."
+                     % (release, TOOL))
 
         say("Installing modules and kernel (sudo)")
         if not dry:
@@ -4686,7 +5234,10 @@ def install_kernel(tree, mk, machine, vendors, release, opts, state):
             warn("could not write /boot/config-%s; keep %s/.config safe" % (release, tree))
 
         if opts["set_default"]:
-            if not grubby:
+            if not grubby and deb and deb["becomes_default"]:
+                ok("%s is the default boot entry now, as asked: GRUB_DEFAULT=%s boots the newest "
+                   "kernel" % (release, deb["setting"]))
+            elif not grubby:
                 note("no grubby here: set the default entry with your bootloader's own tool")
             elif set_default("/boot/vmlinuz-" + release, dry):
                 ok("default boot entry is now %s, as asked" % release)
@@ -4697,6 +5248,20 @@ def install_kernel(tree, mk, machine, vendors, release, opts, state):
                 warn("check the default before you reboot:  sudo grubby --default-kernel")
             info("pick %s from the boot menu; once it has proved itself:" % release)
             info("    sudo grubby --set-default=/boot/vmlinuz-%s" % release)
+        elif deb:
+            if pinned and not dry:
+                saved = grub_env(deb["root"]).get("saved_entry", "").strip()
+                if saved == deb["keep_ref"]:
+                    ok("the default boot entry is still %s  (saved_entry=%s)" % (deb["current"], saved))
+                else:
+                    warn("grubenv's saved_entry is '%s', not '%s' -- check `sudo grub-editenv list` "
+                         "before you reboot" % (saved, deb["keep_ref"]))
+            elif not pinned and deb["becomes_default"] is False:
+                ok("GRUB_DEFAULT=%s: the default boot entry is still %s"
+                   % (deb["setting"], deb["current"] or "the one it was"))
+            elif not pinned:
+                warn_grub_default(deb, release, after=True)
+            info("pick %s from the boot menu (Advanced options) to try it" % release)
         else:
             note("no grubby here: check which entry your bootloader now defaults to")
         if not dry:
@@ -4957,10 +5522,12 @@ def merge_options(args):
     # command run on a built tree takes everything else from the tree's record.
     opts["_given"] = set(k for k in DEFAULTS if getattr(args, k, None) is not None or k in prof)
     for k in ("yes", "verbose", "require_pgp", "install", "set_default", "configure_only",
-              "allow_unsigned", "dry_run", "install_deps", "json"):
+              "allow_unsigned", "dry_run", "install_deps", "json", "keep_boot_default", "no_dkms_cap"):
         opts[k] = bool(getattr(args, k, False))
     for k in PROFILE_FLAGS:
         opts[k] = opts[k] or prof.get(k) == "yes"
+    if opts["keep_boot_default"] and opts["set_default"]:
+        raise ToolError("--keep-boot-default and --set-default ask for opposite things: one of them")
     opts["state_dir"] = getattr(args, "state_dir", None)
     opts["save_profile"] = getattr(args, "save_profile", None)
     opts["keep_symbols"] = [s.upper().replace("CONFIG_", "")
@@ -5196,6 +5763,8 @@ def wizard(opts, machine, latest, rels):
     if opts["install"]:
         opts["set_default"] = ask("Make it the default boot entry? (y/n)",
                                   "y" if opts["set_default"] else "n").lower().startswith("y")
+        if opts["set_default"]:
+            opts["keep_boot_default"] = False
     prof = ask("\nSave these answers as a profile (a name; empty = no)",
                opts.get("_profile_name", ""))
     if prof:
@@ -5212,14 +5781,14 @@ def cmd_kernels(args):
         sums, _ = get_series_sums(int(args.series.split(".")[0]))
         vers = sorted([v for v in sums if series_of(v) == args.series], key=version_key)
         if args.json:
-            out(json.dumps(vers))
+            emit_json(vers, indent=None)
             return 0
         say("kernel.org: %d releases in the %s series" % (len(vers), args.series))
         for i in range(0, len(vers), 8):
             out("  " + "  ".join("%-10s" % v for v in vers[i:i + 8]))
         return 0
     if args.json:
-        out(json.dumps({"latest_stable": latest, "releases": rels}, indent=2))
+        emit_json({"latest_stable": latest, "releases": rels}, indent=2)
         return 0
     say("kernel.org right now")
     for r in rels:
@@ -5298,10 +5867,9 @@ def cmd_toolchains(args):
     opts = merge_options(args)
     machine = detect_machine()
     if opts["json"]:
-        out(json.dumps({"compilers": machine["toolchains"], "binutils": machine["binutils"],
-                        "cxx": machine["cxx"], "pythons": machine["pythons"],
-                        "tools": find_misc_tools()},
-                       indent=2, default=list))
+        emit_json({"compilers": machine["toolchains"], "binutils": machine["binutils"],
+                   "cxx": machine["cxx"], "pythons": machine["pythons"],
+                   "tools": find_misc_tools()}, default=list, indent=2)
         return 0
     say("Compilers")
     show_compilers(machine)
@@ -5361,7 +5929,7 @@ def cmd_profiles(args):
 def cmd_detect(args):
     m = detect_machine()
     if args.json:
-        out(json.dumps(m, indent=2, default=list))
+        emit_json(m, default=list, indent=2)
     else:
         show_machine(m)
     return 0
@@ -5393,6 +5961,181 @@ FREE_BOOT = {"dnf": "List the kernels with `rpm -q kernel-core`; remove an old o
              "apt-get": "Remove old kernels: `sudo apt autoremove --purge`.",
              "zypper": "Remove old kernels: `sudo zypper purge-kernels`."}
 NOT_FOR_TREES = ("vfat", "exfat", "msdos", "ntfs", "ntfs3", "fuseblk", "iso9660", "squashfs", "udf")
+# doctor --json: one package per thing that is missing, for the package manager in front of you
+# ("*": every one).  The keys are build_dep_gaps()'s.
+DEP_PKG = {
+    "make": {"*": "make"}, "flex": {"*": "flex"}, "bison": {"*": "bison"}, "bc": {"*": "bc"},
+    "perl": {"*": "perl"}, "tar": {"*": "tar"}, "xz": {"*": "xz", "apt-get": "xz-utils"},
+    "openssl": {"*": "openssl"}, "rsync": {"*": "rsync"}, "cpio": {"*": "cpio"}, "depmod": {"*": "kmod"},
+    "openssl/opensslv.h": {"dnf": "openssl-devel", "yum": "openssl-devel", "apt-get": "libssl-dev",
+                           "zypper": "libopenssl-devel", "pacman": "openssl"},
+    "libelf.h": {"dnf": "elfutils-libelf-devel", "yum": "elfutils-libelf-devel", "apt-get": "libelf-dev",
+                 "zypper": "libelf-devel", "pacman": "libelf"},
+    "pahole": PAHOLE_PKG, "sign": SIGN_DEPS, "menuconfig": MENUCONFIG_PKG,
+    "gcc": {"*": "gcc"}, "clang": {"*": "clang lld llvm"},
+}
+# Fedora and EL 10 split linux-firmware by vendor; Debian keeps GPU firmware in non-free-firmware.
+GPU_FIRMWARE_PKG = {
+    "dnf": {"amd": "amd-gpu-firmware", "intel": "intel-gpu-firmware", "nvidia": "nvidia-gpu-firmware"},
+    "zypper": {"amd": "kernel-firmware-amdgpu", "intel": "kernel-firmware-i915",
+               "nvidia": "kernel-firmware-nvidia"},
+    "debian": {"amd": "firmware-amd-graphics", "intel": "firmware-misc-nonfree",
+               "nvidia": "firmware-misc-nonfree"},
+}
+# None of the kernel's build packages lives in CRB / PowerTools on EL 8-10 (all BaseOS or
+# AppStream); the machinery is the gcc tool's, kept the same, for the day one does.
+CRB_PACKAGES = ()
+
+
+def dep_package(key, pm):
+    t = DEP_PKG.get(key, {})
+    return t.get(pm, t.get("*", "")) if pm else ""
+
+
+def gpu_firmware_package(vendor, machine):
+    pm, osid = machine.get("pkg_manager") or "", machine.get("os_id", "")
+    major = (re.match(r"\d+", machine.get("os_version", "") or "") or re.match(r"", "")).group(0)
+    if pm == "dnf" and (osid == "fedora" or (major and int(major) >= 10)):
+        return GPU_FIRMWARE_PKG["dnf"][vendor]
+    if pm == "zypper":
+        return GPU_FIRMWARE_PKG["zypper"][vendor]
+    if pm == "apt-get" and osid == "debian":
+        return GPU_FIRMWARE_PKG["debian"][vendor]
+    return "linux-firmware" if pm else ""
+
+
+def crb_repo(machine):
+    """The id of the repository with texinfo and some -devel packages on Enterprise Linux:
+    crb (EL 9+ rebuilds), powertools (EL 8), codeready-builder-for-rhel-N-ARCH-rpms (RHEL
+    itself, a subscription-manager channel).  '' elsewhere (Fedora has them in its main
+    repositories).  The gcc tool's, unchanged."""
+    osid, like = machine.get("os_id", ""), machine.get("os_like", "")
+    major = (re.match(r"\d+", machine.get("os_version", "") or "") or re.match(r"", "")).group(0)
+    if osid == "rhel":
+        return "codeready-builder-for-rhel-%s-%s-rpms" % (major or "9", machine.get("arch", "x86_64"))
+    if osid in ("almalinux", "rocky", "centos") or (osid != "fedora" and "rhel" in like.split()):
+        return "powertools" if major == "8" else "crb"
+    return ""
+
+
+def enable_repo_command(repo):
+    """-> the argv that enables it: RHEL's channel through subscription-manager (dnf
+    config-manager cannot: 'No matching repo to modify'), the rebuilds' through dnf."""
+    if not repo:
+        return []
+    if repo.startswith("codeready-builder-for-rhel-"):
+        return ["sudo", "subscription-manager", "repos", "--enable", repo]
+    return ["sudo", "dnf", "config-manager", "--set-enabled", repo]
+
+
+def cc_has_header(cc, header):
+    """Does the compiler find this header -- asked of it, in the build's environment?"""
+    if not os.path.exists(cc):
+        return False
+    p = run([cc, "-E", "-x", "c", "-"], stdin_data="#include <%s>\n" % header,
+            check=False, env=scrubbed_env())
+    return p.returncode == 0
+
+
+def build_dep_gaps(opts, toolchain=None):
+    """What a build needs and this machine lacks -> [(key, label)]: `key` names the package
+    (DEP_PKG), `label` is how doctor says it."""
+    path = ":".join(SYSTEM_PATH)
+    gaps = [(t, t) for t in NEEDED_TOOLS if not which(t, path=path)]
+    if opts.get("debug_info") in ("btf", "on") and not which("pahole", path=path):
+        gaps.append(("pahole", "pahole"))
+    cc = (toolchain or {}).get("path") or "/usr/bin/gcc"
+    for header, pkg in NEEDED_HEADERS:
+        if not cc_has_header(cc, header):
+            gaps.append((header, "%s (%s)" % (header, pkg)))
+    if opts.get("secure_boot", "on") == "on" and not signing_tools():
+        gaps.append(("sign", "a signing tool (sbsigntools, or pesign + nss-tools)"))
+    return gaps
+
+
+def microcode_missing(machine):
+    """'' or the microcode package doctor asks for: none loads here on any kernel.  (On EL,
+    microcode_ctl keeps /lib/firmware/intel-ucode empty ON PURPOSE -- not missing.)"""
+    ucode = {"GenuineIntel": "intel-ucode", "AuthenticAMD": "amd-ucode"}.get(
+        (machine.get("cpu") or {}).get("vendor"))
+    if not ucode or (ucode == "intel-ucode" and os.access(CHECK_CAVEATS, os.X_OK)) \
+            or glob.glob("/lib/firmware/%s/*" % ucode) or os.path.exists("/boot/%s.img" % ucode):
+        return ""
+    return MICROCODE_PKG.get(machine.get("pkg_manager") or "", ("intel-microcode", "amd64-microcode"))[
+        ucode != "intel-ucode"]
+
+
+def build_room(opts):
+    """-> bytes a build in --workdir wants.  Measured: a full 2500-module tree without debug
+    info is 4.7 GB built, plus the tarball.  DWARF multiplies that several times over."""
+    need = (4 if opts.get("modules") == "trimmed" else 10) << 30
+    return need * 4 if opts.get("debug_info") in ("btf", "on") else need
+
+
+def doctor_report(opts, machine, toolchain=None, toolchain_error="", euid=None):
+    """The toolkit's doctor contract (PLAN.md section 3), exactly: {tool, ok, package_manager,
+    missing: [{what, package, level}], enable_repos, install_command}.  doctor()'s checks, as
+    data: a package where one helps, '' for what no package fixes (room on a disk, the path,
+    running as root).  ok is false when anything required is missing -- root included: as
+    JSON this says so instead of refusing to answer.  install_command installs what is
+    required and wanted, nothing else."""
+    pm = machine.get("pkg_manager") or ""
+    euid = os.geteuid() if euid is None else euid
+    path = ":".join(SYSTEM_PATH)
+    missing = []
+
+    def add(what, package, level):
+        missing.append({"what": what, "package": package, "level": level})
+    if euid == 0:
+        add("not root: this runs as root -- build as yourself (only installing uses sudo)", "", "required")
+    if toolchain is None:
+        why = (toolchain_error or "no usable compiler").splitlines()[0]
+        if not opts.get("cc") and opts.get("toolchain", "gcc") == "gcc" and not which("gcc", path=path):
+            add("gcc, the system C compiler", dep_package("gcc", pm), "required")
+        elif not opts.get("cc") and opts.get("toolchain") == "llvm" and not opts.get("llvm_prefix") \
+                and not which("clang", path=path):
+            add("clang, lld and the LLVM tools (--toolchain llvm)", dep_package("clang", pm), "required")
+        else:
+            add("the toolchain: " + why, "", "required")
+    for key, label in build_dep_gaps(opts, toolchain):
+        add(label, dep_package(key, pm), "required")
+    if opts.get("debug_info", "off") == "off" and not which("pahole", path=path):
+        add("pahole (`--debug-info btf` needs it)", dep_package("pahole", pm), "wanted")
+    cc = (toolchain or {}).get("path") or "/usr/bin/gcc"
+    if os.path.exists(cc) and not cc_has_header(cc, "ncurses.h"):
+        add("ncurses headers (`make menuconfig`; the build does not need them)", dep_package("menuconfig", pm),
+            "optional")
+    workdir = opts.get("workdir") or os.path.expanduser("~/src")
+    need, have = build_room(opts), free_bytes(workdir)
+    if have < need:
+        add("room: %s has %s free; this build wants about %s" % (workdir, human(have), human(need)),
+            "", "required")
+    if os.path.isdir("/boot") and free_bytes("/boot") < BOOT_NEED:
+        add("room in /boot: %s free; installing a kernel needs about %s" % (
+            human(free_bytes("/boot")), human(BOOT_NEED)), "", "required" if opts.get("install") else "wanted")
+    if re.search(r"[\s:]", workdir):
+        add("a work directory without spaces or colons (kbuild): %s" % workdir, "", "required")
+    if fs_type(workdir) in NOT_FOR_TREES:
+        add("a work directory on a Linux filesystem: %s is on %s" % (workdir, fs_type(workdir)), "", "required")
+    fwdirs = {"amd": "amdgpu", "intel": "i915", "nvidia": "nvidia"}
+    for vendor in machine.get("gpu_vendors", []):
+        if vendor != "nvidia" and not glob.glob("/lib/firmware/%s/*" % fwdirs[vendor]):
+            add("firmware for the %s GPU (/lib/firmware/%s is empty)" % (vendor.upper(), fwdirs[vendor]),
+                gpu_firmware_package(vendor, machine), "wanted")
+    ucode = microcode_missing(machine)
+    if ucode:
+        add("CPU microcode (none loads here, on any kernel)", ucode if pm else "", "wanted")
+    pk = []
+    for m in missing:
+        if m["level"] in ("required", "wanted"):
+            for p in m["package"].split():
+                if p not in pk:
+                    pk.append(p)
+    repo = crb_repo(machine) if pm in ("dnf", "yum") else ""
+    enable = [repo] if repo and any(p in CRB_PACKAGES for p in pk) else []
+    return {"tool": TOOL, "ok": not any(m["level"] == "required" for m in missing),
+            "package_manager": pm or None, "missing": missing, "enable_repos": enable,
+            "install_command": pkg_line(pm, " ".join(pk)) if pk and pm else ""}
 
 
 def fs_type(path):
@@ -5441,17 +6184,8 @@ def doctor(opts, machine, toolchain=None, quiet_ok=False):
         raise ToolError("do not run this as root.  The build runs as you; only the "
                         "install steps use sudo.")
     path = ":".join(SYSTEM_PATH)
-    missing = [t for t in NEEDED_TOOLS if not which(t, path=path)]
-    if opts.get("debug_info") in ("btf", "on") and not which("pahole", path=path):
-        missing.append("pahole")
+    missing = [label for _, label in build_dep_gaps(opts, toolchain)]
     cc = (toolchain or {}).get("path") or "/usr/bin/gcc"
-    for header, pkg in NEEDED_HEADERS:
-        p = run([cc, "-E", "-x", "c", "-"], stdin_data="#include <%s>\n" % header,
-                check=False, env=scrubbed_env()) if os.path.exists(cc) else None
-        if p is None or p.returncode != 0:
-            missing.append("%s (%s)" % (header, pkg))
-    if opts.get("secure_boot", "on") == "on" and not signing_tools():
-        missing.append("a signing tool (sbsigntools, or pesign + nss-tools)")
     pm = machine["pkg_manager"]
     if missing:
         problems += 1
@@ -5471,11 +6205,7 @@ def doctor(opts, machine, toolchain=None, quiet_ok=False):
         if p is not None and p.returncode != 0:
             note("no ncurses headers: `make menuconfig` will not start -- the build does not need it  (%s)"
                  % (pkg_line(pm, MENUCONFIG_PKG.get(pm, "ncurses")) or "ncurses development files"))
-    # Measured: a full 2500-module tree without debug info is 4.7 GB built, plus
-    # the tarball.  DWARF multiplies that several times over.
-    need = (4 if opts.get("modules") == "trimmed" else 10) << 30
-    if opts.get("debug_info") in ("btf", "on"):
-        need *= 4
+    need = build_room(opts)
     have = free_bytes(opts["workdir"])
     if have < need:
         problems += 1
@@ -5517,8 +6247,8 @@ def doctor(opts, machine, toolchain=None, quiet_ok=False):
     for vendor in machine.get("gpu_vendors", []):
         if not glob.glob("/lib/firmware/%s/*" % fwdirs[vendor]) and vendor != "nvidia":
             warn("a %s GPU is present but /lib/firmware/%s is empty: no kernel, however "
-                 "well configured, can start it.  Install linux-firmware."
-                 % (vendor.upper(), fwdirs[vendor]))
+                 "well configured, can start it.  Install %s."
+                 % (vendor.upper(), fwdirs[vendor], gpu_firmware_package(vendor, machine) or "linux-firmware"))
     # Measured on kernel builds: ~1 GB per job is comfortable, DWARF doubles it.
     per_job = 2 if opts.get("debug_info") in ("btf", "on") else 1
     if machine["memory"] and opts.get("jobs") and \
@@ -5648,9 +6378,23 @@ def show_plan(opts, machine, toolchain, vendors, why, tree):
     if serving:
         note("this tree is the DKMS build directory for installed kernel(s): %s"
              % ", ".join(serving))
+    deb = None if machine["boot"]["grubby"] or opts.get("set_default") else debian_grub_outlook(machine)
+    takes_over = bool(deb and deb["follows_newest"] and not opts.get("keep_boot_default"))
     info("then        : %s" % ("install, %s the default boot entry" % (
-        "and make it" if opts["set_default"] else "WITHOUT changing") if opts["install"]
+        "and make it" if opts["set_default"] else "and on this GRUB it may BECOME" if takes_over
+        else "WITHOUT changing") if opts["install"]
         else "stop after building (install later with the `install` command)"))
+    if deb and deb["follows_newest"]:
+        (info if opts.get("keep_boot_default") or not opts.get("install") else warn)(
+            "boot entry  : GRUB_DEFAULT=%s here boots the NEWEST kernel -- %s" % (
+                deb["setting"], "--keep-boot-default: GRUB_DEFAULT=saved and %s pinned, at install"
+                % (deb["current"] or "the current entry") if opts.get("keep_boot_default") else
+                "a newer kernel installed from here becomes the default; `install "
+                "--keep-boot-default` keeps %s" % (deb["current"] or "the current one")))
+    if opts.get("install") and not opts.get("no_dkms_cap") and any(
+            m["name"] == "amdgpu" and not (m.get("limits") or {}).get(CAP_KEY) for m in machine.get("dkms") or []):
+        info("dkms        : amdgpu-dkms has no kernel cap: `install` caps it first, if it would "
+             "try to build for the new kernel (see `dkms-cap`)")
 
 
 def cmd_plan(args):
@@ -5673,6 +6417,17 @@ def cmd_plan(args):
 
 def cmd_doctor(args):
     opts = merge_options(args)
+    if opts["json"]:
+        # The toolkit's contract: what is missing, as data.  No package manager is run, and
+        # nothing refuses before the answer -- running as root is one of the answers.
+        machine = detect_machine()
+        try:
+            toolchain, why = resolve_toolchain(opts, machine), ""
+        except ToolError as e:
+            toolchain, why = None, str(e)
+        report = doctor_report(opts, machine, toolchain, why)
+        emit_json(report)
+        return 0 if report["ok"] else 1
     if opts["install_deps"]:
         install_deps(find_pkg_manager(), opts["dry_run"], opts["secure_boot"] == "on")
     machine = detect_machine()
@@ -5734,6 +6489,18 @@ def cmd_build(args, interactive=False):
     if opts["install"]:
         say("Install preflight (now, not after the build)")
         install_preflight(machine, opts)
+        sub = re.search(r"^SUBLEVEL\s*=\s*(\d+)", read_text(os.path.join(tree, "Makefile")), re.M)
+        guess = "%d.%d.%s%s" % (tree_version(tree) + (sub.group(1) if sub else "0", opts["localversion"]))
+        deb = None if machine["boot"]["grubby"] else debian_grub_outlook(machine, guess)
+        if deb and not opts.get("keep_boot_default") and not opts["set_default"]:
+            warn_grub_default(deb, guess)
+        elif deb and opts.get("keep_boot_default"):
+            # What the install would refuse after hours of compiling: refused NOW.  An
+            # unreadable grub.cfg leaves 'stays anyway' unknown, so a grub.d override counts.
+            why = keep_grub_problem(deb, entry=deb["readable"], refusing="building") \
+                if deb["becomes_default"] is not False or not deb["readable"] else ""
+            if why:
+                raise ToolError(why + "\n  (checked before the build: nothing has been built)")
     if opts["save_profile"]:
         save_profile(opts["save_profile"], opts)
     if interactive and not ask("\nProceed? (y/n)", "y").lower().startswith("y"):
@@ -6328,8 +7095,143 @@ def cmd_dkms_check(args):
     return 0 if dkms_check(tree, toolchain, machine, release) else 1
 
 
+def cmd_dkms_cap(args):
+    """fix-amdgpu-dkms.sh as a command, for every amdgpu-dkms here (cap_amdgpu_dkms()):
+    `dkms status` before and after, sudo only for the writes, --dry-run prints them.
+    Nothing to do -- no dkms, no amdgpu-dkms -- is a success: exit 0."""
+    dry, force = bool(args.dry_run), bool(args.force)
+    series = (args.max or "").strip()
+    if series and not re.match(r"^\d+\.\d+(\.\d+)?$", series):
+        raise ToolError("--max takes a kernel series, e.g. 6.18 (the cap becomes 6.18.999), or a "
+                        "full version -- got '%s'" % series)
+    report = {"tool": TOOL, "ok": True, "dry_run": dry, "packages": [], "dkms_status_before": [],
+              "dkms_status_after": [], "release": "", "skips_release": None, "error": ""}
+
+    def done(rc):
+        if args.json:
+            report["ok"] = rc == 0
+            emit_json(report)
+        return rc
+    say("amdgpu-dkms cap%s" % ("  (dry run: nothing is written)" if dry else ""))
+    if not which("dkms", path=":".join(SYSTEM_PATH)):
+        info("no dkms on this machine: nothing to cap")
+        return done(0)
+    pkgs = amdgpu_dkms_packages()
+    if not pkgs:
+        info("no amdgpu-dkms here (no /usr/src/amdgpu-*/dkms.conf): nothing to cap")
+        return done(0)
+    if os.geteuid() == 0:
+        report["error"] = "do not run this as root; it calls sudo itself, for the writes only"
+        out("\n" + _c("31", "ERROR:") + " " + report["error"])
+        return done(1)
+    report["dkms_status_before"] = dkms_status_lines()
+    info("dkms status, before:")
+    for line in report["dkms_status_before"] or ["(nothing)"]:
+        info("    " + line)
+    keeper = SudoKeepalive()
+    try:
+        results = cap_amdgpu_dkms(pkgs, os.uname().release, series, force, dry, before_write=keeper.start)
+    finally:
+        keeper.stop()
+    report["packages"] = results
+    if not dry:
+        report["dkms_status_after"] = dkms_status_lines()
+        info("dkms status, after:")
+        for line in report["dkms_status_after"] or ["(nothing)"]:
+            info("    " + line)
+    # What it means for the newest tree this tool built.
+    state = State(os.path.join(state_dir({"state_dir": args.state_dir}), "state.ini"))
+    built = sorted((s.get("finished", ""), s["release"]) for s in (state.get(t) for t in state.trees())
+                   if s.get("release") and s.get("status") in ("built", "installing", "installed"))
+    if built:
+        rel = report["release"] = built[-1][1]
+        skips = []
+        for p, r in zip(pkgs, results):
+            lim = dict(p["limits"], **({CAP_KEY: r["max_after"]} if r["max_after"] else {}))
+            will, why = dkms_will_build(lim, rel)
+            skips.append(not will)
+            (ok if not will else warn)("amdgpu/%s and %s: %s" % (
+                p["version"], rel, "DKMS %s it (%s)" % ("would skip" if dry else "skips", why) if not will
+                else "DKMS still tries to build it"))
+        report["skips_release"] = all(skips)
+    if not dry and any(r["action"] in ("capped", "replaced") for r in results):
+        info("check that a kernel past the cap is skipped cleanly:  sudo dkms autoinstall -k %s"
+             % (report["release"] or "<release>"))
+    return done(1 if any(r["action"] in ("failed", "refused") for r in results) else 0)
+
+
+def tree_lock_held(tree):
+    """Whether a live instance holds the tree's .elkt-lock: a 'building' record nobody
+    holds belongs to a run that was killed."""
+    try:
+        f = open(os.path.join(tree, ".elkt-lock"), "r")
+    except (OSError, IOError):
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        return True
+    finally:
+        f.close()
+    return False
+
+
+def status_data(opts, root="/"):
+    """The toolkit's status contract for this tool (PLAN.md section 3), exactly at the top
+    level: {tool, installed: [{release, modules, build_link, boot_image, built_by_tool,
+    default}], trees: [{tree, status, stage, release, error}]} -- + what `status` shows
+    beyond it.  A kernel counts as built by this tool when a tree on record has that release,
+    when its build link is a tree carrying this tool's GNUmakefile pin, or when the release
+    ends in the default LOCALVERSION (-elkt).  `complete` = modules, build link and image all
+    there (build_everything.sh's rule: modules_install alone is not 'installed').  No sudo,
+    no network."""
+    state = State(os.path.join(state_dir(opts), "state.ini"))
+    ours, trees = set(), []
+    for tree in state.trees():
+        s = state.get(tree)
+        if s.get("release"):
+            ours.add(s["release"])
+        trees.append({"tree": tree, "status": s.get("status", ""), "stage": s.get("stage", ""),
+                      "release": s.get("release", ""), "error": s.get("error") or s.get("last_error") or None,
+                      "exists": os.path.isdir(tree), "started": s.get("started", ""),
+                      "finished": s.get("finished", ""), "toolchain": s.get("toolchain", ""),
+                      "cc": s.get("opt_cc", ""), "running": os.path.isdir(tree) and tree_lock_held(tree),
+                      "in_service": in_service(tree, root)})
+    default = default_boot_release(root)
+    mods = rp(root, "lib/modules")
+    try:
+        rels = set(n for n in os.listdir(mods) if os.path.isdir(os.path.join(mods, n)))
+    except OSError:
+        rels = set()
+    rels.update(boot_images(root))
+    installed = []
+    for rel in sorted(rels, key=version_key):
+        mdir, build = os.path.join(mods, rel), os.path.join(mods, rel, "build")
+        tree = os.path.realpath(build) if os.path.lexists(build) else ""
+        image = next((p for p in (rp(root, "boot/%s-%s" % (n, rel)) for n in ("vmlinuz", "vmlinux", "kernel"))
+                      if os.path.isfile(p)), "")
+        e = {"release": rel,
+             "modules": any(os.path.exists(os.path.join(mdir, x))
+                            for x in ("modules.dep", "modules.order", "modules.builtin", "kernel")),
+             "build_link": os.path.isdir(build), "boot_image": bool(image),
+             "built_by_tool": rel in ours or rel.endswith(DEFAULTS["localversion"]) or
+             bool(tree and read_text(os.path.join(tree, PIN_FILE)).startswith(PIN_MARK)),
+             "default": bool(default) and rel == default, "image": image, "tree": tree,
+             "running": rel == os.uname().release}
+        e["complete"] = e["modules"] and e["build_link"] and e["boot_image"]
+        installed.append(e)
+    caps = [{"version": p["version"], "conf": p["conf"], "max": p["limits"].get(CAP_KEY)}
+            for p in amdgpu_dkms_packages(root, dkms=[])]
+    return {"tool": TOOL, "installed": installed, "trees": trees, "state_file": state.path,
+            "running": os.uname().release, "default": default or None, "default_known": bool(default),
+            "amdgpu_dkms": caps}
+
+
 def cmd_status(args):
     opts = merge_options(args)
+    if opts["json"]:
+        emit_json(status_data(opts))
+        return 0
     state = State(os.path.join(state_dir(opts), "state.ini"))
     say("Known source trees  (%s)" % state.path)
     if not state.trees():
@@ -6346,6 +7248,22 @@ def cmd_status(args):
             info("  in service as the DKMS build dir of: %s" % ", ".join(serving))
         if s.get("error") or s.get("last_error"):
             info("  last error: %s" % (s.get("error") or s.get("last_error")))
+    data = status_data(opts)
+    say("Kernels installed here  (/lib/modules, /boot)")
+    for k in data["installed"]:
+        info("%-40s %s%s%s%s%s" % (
+            k["release"], "modules" if k["modules"] else "NO modules",
+            ", build link" if k["build_link"] else ", no build link",
+            ", image" if k["boot_image"] else ", NO image in /boot",
+            "   [built here]" if k["built_by_tool"] else "",
+            ("   [default]" if k["default"] else "") + ("   [running]" if k["running"] else "")))
+    if not data["installed"]:
+        info("none found")
+    if not data["default_known"]:
+        info("(which one is the default boot entry cannot be read without root here)")
+    for c in data["amdgpu_dkms"]:
+        info("amdgpu-dkms %s: %s" % (c["version"], "capped at %s" % c["max"] if c["max"] else
+                                     "NO kernel cap -- `dkms-cap` (install does it itself)"))
     return 0
 
 
@@ -6353,7 +7271,15 @@ def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--state-dir", help="where state.ini and build logs live "
                         "(default: ~/.local/state/%s)" % TOOL)
-    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument("--json", action="store_true",
+                        help="machine-readable output: stdout is the JSON alone, messages go to stderr")
+    common.add_argument("--opt-root", dest="opt_root",
+                        help="where the satellite toolkit's compilers live, <dir>/<name>-<version>/bin "
+                             "(default ~/opt): searched for toolchains; nothing is installed there")
+    common.add_argument("--yes", action="store_true",
+                        help="do not stop for confirmations -- in THIS tool it also overrides the safety "
+                             "refusals (installing over the running release, an unenrolled MOK key, a CPU "
+                             "level this machine lacks, failed post-build checks)")
 
     b = argparse.ArgumentParser(add_help=False)
     b.add_argument("--kernel", help="stable | longterm | mainline | 6.12 | 6.12.9  (default stable)")
@@ -6396,9 +7322,15 @@ def build_parser():
                    help="stop once the config is verified and written; build nothing")
     b.add_argument("--install", action="store_true", help="install after a successful build")
     b.add_argument("--set-default", action="store_true", help="make the new kernel the default boot entry")
+    b.add_argument("--keep-boot-default", dest="keep_boot_default", action="store_true",
+                   help="Debian/Ubuntu (no grubby): keep the current default boot entry -- sets "
+                        "GRUB_DEFAULT=saved (a dated backup of /etc/default/grub first), grub-set-default "
+                        "to the entry booted now, update-grub.  Without it /etc/default/grub is never touched")
+    b.add_argument("--no-dkms-cap", dest="no_dkms_cap", action="store_true",
+                   help="install: leave amdgpu-dkms uncapped (by default it is capped first when it would "
+                        "try -- and fail -- to build for the new kernel; see dkms-cap)")
     b.add_argument("--allow-unsigned", action="store_true", help="install even though Secure Boot is on")
     b.add_argument("--dry-run", action="store_true", help="install: print the sudo commands, run none")
-    b.add_argument("--yes", action="store_true", help="do not stop for confirmations")
     b.add_argument("--verbose", action="store_true", help="stream the whole build instead of a status line")
 
     p = argparse.ArgumentParser(
@@ -6421,6 +7353,15 @@ def build_parser():
     sub.add_parser("wizard", parents=[common, b], help="ask, then build")
     sub.add_parser("install", parents=[common, b], help="install a built tree")
     sub.add_parser("dkms-check", parents=[common, b], help="will out-of-tree modules compile?")
+    dc = sub.add_parser("dkms-cap", parents=[common],
+                        help="cap every amdgpu-dkms (BUILD_EXCLUSIVE_KERNEL_MAX) so DKMS skips newer kernels")
+    dc.add_argument("--max", metavar="SERIES",
+                    help="the series to cap at, e.g. 6.18 -> 6.18.999 (default: the newest series each "
+                         "package is built or installed for -- the rule dkms-check prints)")
+    dc.add_argument("--force", action="store_true",
+                    help="replace a BUILD_EXCLUSIVE_KERNEL_MAX that is already there, and allow a cap "
+                         "below a kernel the package is installed for")
+    dc.add_argument("--dry-run", action="store_true", help="print the sudo commands, run none")
     pk = sub.add_parser("package", parents=[common, b],
                         help="turn a built tree into an RPM / deb / tarball other people can install")
     pk.add_argument("--format", help="rpm | deb | tar  (default: what this machine can build)")
@@ -6442,7 +7383,7 @@ def _as_interrupt(signum, frame):
 
 
 COMMANDS = ("kernels", "detect", "toolchains", "profiles", "sign", "pin", "package", "doctor", "plan", "build", "wizard", "install",
-            "dkms-check", "status")
+            "dkms-check", "dkms-cap", "status")
 
 
 def normalize_argv(argv):
@@ -6477,6 +7418,17 @@ def main(argv=None):
         if signal.getsignal(sig) != signal.SIG_IGN:
             signal.signal(sig, _as_interrupt)
     args = parser.parse_args(argv)
+    saved = (UI.stream, UI.tty, UI.color, OPT_ROOT[0])
+    if getattr(args, "json", False):
+        json_mode()
+    OPT_ROOT[0] = getattr(args, "opt_root", None) or "~/opt"
+    try:
+        return run_command(args)
+    finally:
+        UI.stream, UI.tty, UI.color, OPT_ROOT[0] = saved
+
+
+def run_command(args):
     try:
         if args.command == "wizard":
             if not sys.stdin.isatty():
@@ -6486,7 +7438,7 @@ def main(argv=None):
             return cmd_build(args, interactive=True)
         return {"kernels": cmd_kernels, "detect": cmd_detect, "doctor": cmd_doctor,
                 "plan": cmd_plan, "build": cmd_build, "install": cmd_install,
-                "dkms-check": cmd_dkms_check, "status": cmd_status,
+                "dkms-check": cmd_dkms_check, "dkms-cap": cmd_dkms_cap, "status": cmd_status,
                 "toolchains": cmd_toolchains, "profiles": cmd_profiles,
                 "sign": cmd_sign, "pin": cmd_pin, "package": cmd_package}[args.command](args)
     except ToolError as e:
